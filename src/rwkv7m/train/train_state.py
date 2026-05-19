@@ -27,7 +27,8 @@ def decay_mask_fn(params):
 
 
 def create_optimizer(config, total_steps=10000):
-    warmup_steps = config.get("warmup_steps", 100)
+    total_steps = max(int(total_steps), 1)
+    warmup_steps = min(config.get("warmup_steps", 100), max(total_steps - 1, 0))
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.get("lr_init", 6e-4),

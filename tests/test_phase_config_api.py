@@ -2,7 +2,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from rwkv7m import create_runtime, tiny_config
+from rwkv7m import create_runtime, create_train_runtime, tiny_config, train_batch
+from rwkv7m.train import generate_toy_batch
 from rwkv7m.model.screened_rwkv import (
     ModelConfig,
     create_model_variables,
@@ -163,3 +164,16 @@ def test_top_level_runtime_api_imports_and_runs():
     )
     assert logits.shape == (1, 2, cfg.vocab_size)
     assert isinstance(stats, dict)
+
+
+def test_top_level_train_api_runs_with_short_schedule():
+    cfg = tiny_config(vocab_size=32, d_model=32, n_layers=2, n_heads=2, head_size=16)
+    runtime, state = create_train_runtime(
+        jax.random.PRNGKey(5),
+        cfg,
+        batch_size=1,
+        total_steps=2,
+    )
+    batch = generate_toy_batch(jax.random.PRNGKey(6), 1, 4, cfg.vocab_size)
+    state, metrics = train_batch(state, batch, runtime)
+    assert jnp.isfinite(metrics["loss"])
