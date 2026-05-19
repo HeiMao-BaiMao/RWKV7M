@@ -2,11 +2,10 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from dataclasses import dataclass, field
-from typing import Any
 
 from .screening import ScreeningConfig, StateLevelScreening
-from .state import ModelScreenState, LayerScreenState, init_screen_state, tuple_set
-from .rwkv_core import PlaceholderRWKVCore
+from .state import ModelScreenState, LayerScreenState, init_screen_state
+from .rwkv_core import RWKV7Block
 
 
 @dataclass
@@ -40,10 +39,10 @@ class ScreenedRWKVLayer(nn.Module):
 
     def setup(self):
         cfg = self.config
-        self.rwkv_core = PlaceholderRWKVCore(
-            d_model=cfg.d_model,
-            d_ffn=cfg.d_ffn,
-            name=f"rwkv_core_{self.layer_idx}",
+        self.rwkv_block = RWKV7Block(
+            config=cfg,
+            layer_idx=self.layer_idx,
+            name=f"rwkv_block_{self.layer_idx}",
         )
         if cfg.use_screening and self.layer_idx in cfg.screening.screened_layers:
             self.screening = StateLevelScreening(
@@ -54,23 +53,45 @@ class ScreenedRWKVLayer(nn.Module):
         else:
             self._has_screening = False
 
-    def __call__(self, x_t, rwkv_state_l, screen_state_l, *, phase, deterministic):
-        h_base, new_rwkv_state_l = self.rwkv_core(
-            x_t, rwkv_state_l, deterministic=deterministic
-        )
+    def __call__(self, x, v_first, screen_state, *, phase, deterministic):
+        # RWKV7 core processes full sequence via internal lax.scan
+        h_base, v_first = self.rwkv_block(x, v_first)
+
         if self._has_screening:
-            h, new_screen_state_l, stats = self.screening(
-                x_t,
-                h_base,
-                screen_state_l,
-                phase=phase,
-                deterministic=deterministic,
-            )
+            # Apply screening per-token (lightweight compared to RWKV core)
+            B, T, C = h_base.shape
+            h_list = []
+            stats_list = []
+            new_screen = screen_state
+
+            for t in range(T):
+                x_t = x[:, t, :]
+                h_base_t = h_base[:, t, :]
+                h_t, new_screen, stats_t = self.screening(
+                    x_t,
+                    h_base_t,
+                    new_screen,
+                    phase=phase,
+                    deterministic=deterministic,
+                )
+                h_list.append(h_t)
+                stats_list.append(stats_t)
+
+            h = jnp.stack(h_list, axis=1)
+            # Aggregate stats over time
+            if stats_list:
+                stats = {
+                    k: jnp.mean(jnp.array([s[k] for s in stats_list]))
+                    for k in stats_list[0].keys()
+                }
+            else:
+                stats = {}
         else:
             h = h_base
-            new_screen_state_l = screen_state_l
+            new_screen = screen_state
             stats = {}
-        return h, new_rwkv_state_l, new_screen_state_l, stats
+
+        return h, v_first, new_screen, stats
 
 
 class ScreenedRWKVModel(nn.Module):
@@ -91,7 +112,7 @@ class ScreenedRWKVModel(nn.Module):
             )
             for i in range(cfg.n_layers)
         ]
-        self.final_ln = nn.LayerNorm(dtype=jnp.float32, name="final_ln")
+        self.final_ln = nn.LayerNorm(epsilon=1e-5, name="final_ln")
         self.lm_head = nn.Dense(
             cfg.vocab_size,
             use_bias=False,
@@ -109,77 +130,63 @@ class ScreenedRWKVModel(nn.Module):
     ):
         cfg = self.config
         batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
 
         x = self.token_embedding(input_ids)  # [B, T, d]
         x = x.astype(_get_model_dtype(cfg))
 
         screened_idx = {layer_id: i for i, layer_id in enumerate(cfg.screening.screened_layers)}
 
-        logits_list = []
+        # v_first is the value projection from layer 0, threaded through all layers
+        v_first = jnp.empty_like(x)
+
         all_stats = []
-        rwkv_state_cur = rwkv_state
-        screen_state_cur = screen_state
+        new_screen_layers = list(screen_state.layers)
 
-        for t in range(seq_len):
-            token_x = x[:, t, :]
-            layer_stats = []
-            h = token_x
-            new_rwkv_layers = list(rwkv_state_cur)
-            new_screen_layers = list(screen_state_cur.layers)
-
-            for l_idx in range(cfg.n_layers):
-                rwkv_s = rwkv_state_cur[l_idx]
-                if l_idx in screened_idx:
-                    scr_s = screen_state_cur.layers[screened_idx[l_idx]]
-                else:
-                    scr_s = LayerScreenState(
-                        slots=jnp.zeros((batch_size, 1, 1), dtype=jnp.float32),
-                        ages=jnp.zeros((batch_size, 1), dtype=jnp.float32),
-                        usage_ema=jnp.zeros((batch_size, 1), dtype=jnp.float32),
-                    )
-
-                h, new_rwkv_s, new_scr_s, stats = self.layers[l_idx](
-                    h, rwkv_s, scr_s,
-                    phase=phase, deterministic=deterministic,
+        for l_idx in range(cfg.n_layers):
+            if l_idx in screened_idx:
+                scr_s = screen_state.layers[screened_idx[l_idx]]
+            else:
+                # Dummy state for non-screened layers
+                scr_s = LayerScreenState(
+                    slots=jnp.zeros((batch_size, 1, 1), dtype=jnp.float32),
+                    ages=jnp.zeros((batch_size, 1), dtype=jnp.float32),
+                    usage_ema=jnp.zeros((batch_size, 1), dtype=jnp.float32),
                 )
-                new_rwkv_layers[l_idx] = new_rwkv_s
-                if l_idx in screened_idx:
-                    new_screen_layers[screened_idx[l_idx]] = new_scr_s
-                layer_stats.append(stats)
 
-            h_final = self.final_ln(h.astype(jnp.float32))
-            logits_t = self.lm_head(h_final)
-            logits_list.append(logits_t)
-            rwkv_state_cur = tuple(new_rwkv_layers)
-            screen_state_cur = ModelScreenState(layers=tuple(new_screen_layers))
-            all_stats.append(layer_stats)
+            x, v_first, new_scr_s, stats = self.layers[l_idx](
+                x,
+                v_first,
+                scr_s,
+                phase=phase,
+                deterministic=deterministic,
+            )
 
-        logits = jnp.stack(logits_list, axis=1)  # [B, T, V]
+            if l_idx in screened_idx:
+                new_screen_layers[screened_idx[l_idx]] = new_scr_s
+            all_stats.append(stats)
 
-        # Aggregate stats: average over layers and time
+        x = self.final_ln(x.astype(jnp.float32))
+        logits = self.lm_head(x)
+
+        new_screen_state = ModelScreenState(layers=tuple(new_screen_layers))
+
+        # Aggregate stats across layers
         agg_stats = {}
-        if len(all_stats) > 0:
-            # Find first non-empty dict across all layers and time steps to get keys
-            keys = set()
-            for t_step in all_stats:
-                for l_stats in t_step:
-                    if l_stats:
-                        keys.update(l_stats.keys())
-            for key in keys:
-                vals = []
-                for t_step in all_stats:
-                    for l_stats in t_step:
-                        if l_stats and key in l_stats:
-                            vals.append(l_stats[key])
-                if vals:
-                    agg_stats[key] = jnp.mean(jnp.array(vals))
+        keys = set()
+        for s in all_stats:
+            if s:
+                keys.update(s.keys())
+        for key in keys:
+            vals = [s[key] for s in all_stats if s and key in s]
+            if vals:
+                agg_stats[key] = jnp.mean(jnp.array(vals))
 
-        return logits, rwkv_state_cur, screen_state_cur, agg_stats
+        # rwkv_state is kept as dummy for backward compatibility
+        return logits, rwkv_state, new_screen_state, agg_stats
 
 
 def init_rwkv_state(batch_size, config: ModelConfig):
-    """Initialize RWKV state as a tuple of placeholders (None per layer)."""
+    """Dummy state for backward compatibility. RWKV-7 core manages recurrence internally."""
     return tuple(
         jnp.zeros((batch_size, 1), dtype=jnp.float32)
         for _ in range(config.n_layers)
@@ -201,7 +208,8 @@ def create_model_variables(rng, config: ModelConfig, batch_size: int):
     rwkv_state = init_rwkv_state(batch_size, config)
     screen_state = init_screen_state(batch_size, config.screening)
 
-    dummy_ids = jnp.zeros((batch_size, config.max_seq_len), dtype=jnp.int32)
+    # Use a short sequence for init to save memory
+    dummy_ids = jnp.zeros((batch_size, 4), dtype=jnp.int32)
 
     variables = model.init(
         rng,
