@@ -9,6 +9,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from dataclasses import dataclass
 
+from .state import LayerRWKVState
+
 
 @dataclass
 class RWKV7Config:
@@ -30,10 +32,12 @@ def _get_dtype(cfg: RWKV7Config):
     return jnp.float32
 
 
-def _time_shift(x):
-    """x: [B, T, C] -> shift by 1 in time dimension, pad with zeros."""
-    shifted = jnp.pad(x, ((0, 0), (1, 0), (0, 0)))[:, :-1, :]
-    return shifted
+def _time_shift(x, prev_x=None):
+    """x: [B, T, C] -> shift by 1 in time, using prev_x for chunked decode."""
+    if prev_x is None:
+        prev_x = jnp.zeros((x.shape[0], x.shape[-1]), dtype=x.dtype)
+    first = prev_x.astype(x.dtype)[:, None, :]
+    return jnp.concatenate([first, x[:, :-1, :]], axis=1)
 
 
 def wkv_step(state, r_t, w_t, k_t, v_t, neg_kk_t, kka_t):
@@ -66,12 +70,18 @@ class RWKV7TimeMix(nn.Module):
     layer_idx: int
 
     @nn.compact
-    def __call__(self, x, v_first):
+    def __call__(self, x, v_first, state=None):
         B, T, _ = x.shape
         C = self.config.d_model
         H = self.config.n_heads
         N = self.config.head_size
         assert x.shape[-1] == H * N, f"d_model={x.shape[-1]} must equal n_heads*head_size={H*N}"
+        if state is None:
+            prev_x = jnp.zeros((B, C), dtype=x.dtype)
+            initial_state = jnp.zeros((B, H, N, N), dtype=jnp.float32)
+        else:
+            prev_x = state.time_mix_x
+            initial_state = state.wkv.astype(jnp.float32)
 
         # --- Layer-dependent init helpers ---
         ratio_0_to_1 = self.layer_idx / max(1, self.config.n_layers - 1)
@@ -84,7 +94,7 @@ class RWKV7TimeMix(nn.Module):
             return init_fn
 
         # --- Time-shift ---
-        xx = _time_shift(x) - x  # [B, T, C]
+        xx = _time_shift(x, prev_x) - x  # [B, T, C]
 
         x_r = x + xx * self.param("x_r", mix_init(0.2), (1, 1, C))
         x_w = x + xx * self.param("x_w", mix_init(0.9), (1, 1, C))
@@ -182,8 +192,6 @@ class RWKV7TimeMix(nn.Module):
         kka_h = kka.reshape(B, T, H, N)
 
         # --- WKV recurrence via lax.scan ---
-        initial_state = jnp.zeros((B, H, N, N), dtype=jnp.float32)
-
         inputs = (
             jnp.swapaxes(r_h, 0, 1),
             jnp.swapaxes(w_h, 0, 1),
@@ -220,7 +228,7 @@ class RWKV7TimeMix(nn.Module):
         y = nn.Dense(C, use_bias=False, name="output",
                      kernel_init=nn.initializers.zeros)(y)
 
-        return y, v_first
+        return y, v_first, x[:, -1, :].astype(jnp.float32), final_state
 
 
 class RWKV7ChannelMix(nn.Module):
@@ -228,9 +236,11 @@ class RWKV7ChannelMix(nn.Module):
     layer_idx: int
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, prev_x=None):
         B, T, _ = x.shape
         C = self.config.d_model
+        if prev_x is None:
+            prev_x = jnp.zeros((B, C), dtype=x.dtype)
 
         ratio_1_to_almost0 = 1.0 - (self.layer_idx / max(1, self.config.n_layers))
 
@@ -239,7 +249,7 @@ class RWKV7ChannelMix(nn.Module):
             return 1.0 - jnp.power(ddd, ratio_1_to_almost0 ** 4)
 
         # Time-shift
-        xx = _time_shift(x) - x
+        xx = _time_shift(x, prev_x) - x
         x_k = x + xx * self.param("x_k", mix_init, (1, 1, C))
 
         # FFN
@@ -249,7 +259,7 @@ class RWKV7ChannelMix(nn.Module):
         v = nn.Dense(C, use_bias=False, name="value",
                      kernel_init=nn.initializers.zeros)(k)
 
-        return v
+        return v, x[:, -1, :].astype(jnp.float32)
 
 
 class RWKV7Block(nn.Module):
@@ -257,20 +267,43 @@ class RWKV7Block(nn.Module):
     layer_idx: int
 
     @nn.compact
-    def __call__(self, x, v_first):
+    def __call__(self, x, v_first, rwkv_state=None):
         cfg = self.config
+        B = x.shape[0]
+        if rwkv_state is None:
+            rwkv_state = LayerRWKVState(
+                time_mix_x=jnp.zeros((B, cfg.d_model), dtype=jnp.float32),
+                channel_mix_x=jnp.zeros((B, cfg.d_model), dtype=jnp.float32),
+                wkv=jnp.zeros(
+                    (B, cfg.n_heads, cfg.head_size, cfg.head_size),
+                    dtype=jnp.float32,
+                ),
+            )
 
         if self.layer_idx == 0:
             x = nn.LayerNorm(epsilon=1e-5, name="ln0")(x)
 
         # Time mixing
         x_ln = nn.LayerNorm(epsilon=1e-5, name="ln1")(x)
-        x_attn, v_first = RWKV7TimeMix(config=cfg, layer_idx=self.layer_idx, name="att")(x_ln, v_first)
+        x_attn, v_first, time_mix_x, wkv = RWKV7TimeMix(
+            config=cfg,
+            layer_idx=self.layer_idx,
+            name="att",
+        )(x_ln, v_first, rwkv_state)
         x = x + x_attn
 
         # Channel mixing
         x_ln = nn.LayerNorm(epsilon=1e-5, name="ln2")(x)
-        x_ffn = RWKV7ChannelMix(config=cfg, layer_idx=self.layer_idx, name="ffn")(x_ln)
+        x_ffn, channel_mix_x = RWKV7ChannelMix(
+            config=cfg,
+            layer_idx=self.layer_idx,
+            name="ffn",
+        )(x_ln, rwkv_state.channel_mix_x)
         x = x + x_ffn
 
-        return x, v_first
+        new_state = LayerRWKVState(
+            time_mix_x=time_mix_x,
+            channel_mix_x=channel_mix_x,
+            wkv=wkv,
+        )
+        return x, v_first, new_state

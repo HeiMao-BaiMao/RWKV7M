@@ -4,6 +4,20 @@ from flax import linen as nn
 from dataclasses import dataclass
 
 
+_PHASE_ALIASES = {"read_only": "read_screening_only"}
+_VALID_PHASES = {"read_screening_only", "read_write"}
+
+
+def normalize_phase(phase: str) -> str:
+    phase = _PHASE_ALIASES.get(phase, phase)
+    if phase not in _VALID_PHASES:
+        raise ValueError(
+            f"Unknown phase {phase!r}. Expected one of {sorted(_VALID_PHASES)} "
+            "or compatibility alias 'read_only'."
+        )
+    return phase
+
+
 def unit_norm(x, axis=-1, eps=1e-6):
     sq_sum = jnp.sum(x * x, axis=axis, keepdims=True)
     norm = jnp.sqrt(sq_sum + eps * eps)
@@ -64,6 +78,15 @@ class ScreeningConfig:
     age_ref: float = 32.0
     age_sigma: float = 8.0
 
+    def __post_init__(self):
+        self.screened_layers = tuple(self.screened_layers)
+        self.bank_ids = tuple(self.bank_ids)
+        if self.bank_ids and len(self.bank_ids) != self.n_slots:
+            raise ValueError("bank_ids must have length n_slots when provided")
+        invalid_banks = [bank_id for bank_id in self.bank_ids if bank_id not in (0, 1, 2)]
+        if invalid_banks:
+            raise ValueError("bank_ids values must be only 0, 1, or 2")
+
 
 class StateLevelScreening(nn.Module):
     """Screening module that can process full sequences via lax.scan."""
@@ -101,7 +124,7 @@ class StateLevelScreening(nn.Module):
         _ = self.param("lambda_raw", nn.initializers.constant(jnp.log(jnp.exp(cfg.lambda_screen_init) - 1)), ())
         _ = self.param("slot_embed", nn.initializers.normal(0.02), (cfg.n_slots, cfg.d_slot))
         _ = self.param("mu_by_bank_raw", nn.initializers.constant(0.0), (3,))
-        if phase != "read_only" and cfg.use_write_screening:
+        if cfg.use_write_screening:
             q_w_in = jnp.concatenate([x_ln, h_t.astype(jnp.float32)], axis=-1)
             _ = self.q_proj_w(q_w_in)
             _ = self.k_proj_w(slots)
@@ -121,6 +144,7 @@ class StateLevelScreening(nn.Module):
         from .state import LayerScreenState
 
         cfg = self.config
+        phase = normalize_phase(phase)
         B, T, C = x_seq.shape
 
         # During init, create all params via dummy call
@@ -157,7 +181,8 @@ class StateLevelScreening(nn.Module):
         mu = self._compute_mu(p, cfg)
 
         # Pre-compute write query if needed
-        if phase != "read_only" and cfg.use_write_screening:
+        write_enabled = phase == "read_write" and cfg.use_write_screening
+        if write_enabled:
             q_w_w = p["q_proj_w"]["kernel"]  # [2*C, d_k]
             k_w_w = p["k_proj_w"]["kernel"]  # [d_s, d_k]
             tau_w_raw = p["tau_w_raw"]
@@ -178,7 +203,7 @@ class StateLevelScreening(nn.Module):
 
         def step(carry, t):
             """Pure function - no Flax modules called here."""
-            slots_t = carry
+            slots_t, ages_t = carry
 
             # Read branch
             k_r = jnp.einsum("bms,sk->bmk", slots_t, k_w)
@@ -197,7 +222,7 @@ class StateLevelScreening(nn.Module):
                 rel_r = trim_square(sim_r, tau_r, eps=cfg.eps)
 
             if cfg.use_age_mask:
-                age_scores = (cfg.age_ref - ages) / (cfg.age_sigma + cfg.eps)
+                age_scores = (cfg.age_ref - ages_t) / (cfg.age_sigma + cfg.eps)
                 rel_r = rel_r * jax.nn.sigmoid(age_scores)
 
             z = jnp.einsum("bm,bmv->bv", rel_r, v)
@@ -208,10 +233,10 @@ class StateLevelScreening(nn.Module):
             h_t = h_base_seq[:, t, :] + lambda_screen * gate * read_out.astype(h_base_seq.dtype)
 
             # Slot update
-            if phase == "read_only" or not cfg.use_write_screening:
+            if not write_enabled:
                 update_strength = mu[None, :, None]
                 new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
-                new_ages = ages
+                new_ages = ages_t
                 rel_w = jnp.zeros_like(rel_r)
             else:
                 k_w_t = jnp.einsum("bms,sk->bmk", slots_t, k_w_w)
@@ -220,7 +245,7 @@ class StateLevelScreening(nn.Module):
                 rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
                 update_strength = mu[None, :, None] * rel_w[:, :, None]
                 new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
-                new_ages = jnp.where(rel_w > 1e-3, 0.0, ages + 1.0)
+                new_ages = jnp.where(rel_w > 1e-3, 0.0, ages_t + 1.0)
 
             # Stats
             eta_active = 1e-3
@@ -236,21 +261,20 @@ class StateLevelScreening(nn.Module):
                 "tau_w": tau_w,
             }
 
-            return new_slots, (h_t, stats_t, new_ages)
+            return (new_slots, new_ages), (h_t, stats_t)
 
         # lax.scan over time
-        final_slots, (h_seq, stats_seq, ages_seq) = jax.lax.scan(
+        (final_slots, final_ages), (h_seq, stats_seq) = jax.lax.scan(
             step,
-            slots,
+            (slots, ages),
             jnp.arange(T),
         )
 
-        h = jnp.stack(h_seq, axis=1)
-        ages_final = ages_seq[-1]
+        h = jnp.swapaxes(h_seq, 0, 1)
 
         new_state = LayerScreenState(
             slots=final_slots.astype(state.slots.dtype),
-            ages=ages_final,
+            ages=final_ages,
             usage_ema=state.usage_ema,
         )
 

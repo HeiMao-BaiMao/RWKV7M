@@ -3,8 +3,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 from dataclasses import dataclass, field
 
-from .screening import ScreeningConfig, StateLevelScreening
-from .state import ModelScreenState, LayerScreenState, init_screen_state
+from .screening import ScreeningConfig, StateLevelScreening, normalize_phase
+from .state import (
+    ModelScreenState,
+    LayerScreenState,
+    init_screen_state,
+    init_rwkv_state as init_model_rwkv_state,
+)
 from .rwkv_core import RWKV7Block
 
 
@@ -22,6 +27,30 @@ class ModelConfig:
     # Screening config
     use_screening: bool = True
     screening: ScreeningConfig = field(default_factory=ScreeningConfig)
+
+    def __post_init__(self):
+        if self.d_model != self.n_heads * self.head_size:
+            raise ValueError("d_model must equal n_heads * head_size")
+        self.screening.screened_layers = tuple(self.screening.screened_layers)
+        self.screening.bank_ids = tuple(self.screening.bank_ids)
+        if not self.use_screening or not self.screening.screened_layers:
+            return
+        if self.screening.d_model != self.d_model:
+            raise ValueError("screening.d_model must equal model.d_model")
+        if len(self.screening.bank_ids) != self.screening.n_slots:
+            raise ValueError("screening.bank_ids must have length screening.n_slots")
+        invalid_banks = [
+            bank_id for bank_id in self.screening.bank_ids if bank_id not in (0, 1, 2)
+        ]
+        if invalid_banks:
+            raise ValueError("screening.bank_ids values must be only 0, 1, or 2")
+        invalid_layers = [
+            layer_id
+            for layer_id in self.screening.screened_layers
+            if layer_id < 0 or layer_id >= self.n_layers
+        ]
+        if invalid_layers:
+            raise ValueError("screening.screened_layers must be within [0, n_layers)")
 
 
 def _get_model_dtype(cfg: ModelConfig):
@@ -53,9 +82,9 @@ class ScreenedRWKVLayer(nn.Module):
         else:
             self._has_screening = False
 
-    def __call__(self, x, v_first, screen_state, *, phase, deterministic):
+    def __call__(self, x, v_first, rwkv_state, screen_state, *, phase, deterministic):
         # RWKV7 core processes full sequence via internal lax.scan
-        h_base, v_first = self.rwkv_block(x, v_first)
+        h_base, v_first, new_rwkv_state = self.rwkv_block(x, v_first, rwkv_state)
 
         if self._has_screening:
             h, new_screen, stats = self.screening(
@@ -70,7 +99,7 @@ class ScreenedRWKVLayer(nn.Module):
             new_screen = screen_state
             stats = {}
 
-        return h, v_first, new_screen, stats
+        return h, v_first, new_rwkv_state, new_screen, stats
 
 
 class ScreenedRWKVModel(nn.Module):
@@ -109,6 +138,7 @@ class ScreenedRWKVModel(nn.Module):
     ):
         cfg = self.config
         batch_size = input_ids.shape[0]
+        phase = normalize_phase(phase)
 
         x = self.token_embedding(input_ids)  # [B, T, d]
         x = x.astype(_get_model_dtype(cfg))
@@ -116,9 +146,10 @@ class ScreenedRWKVModel(nn.Module):
         screened_idx = {layer_id: i for i, layer_id in enumerate(cfg.screening.screened_layers)}
 
         # v_first is the value projection from layer 0, threaded through all layers
-        v_first = jnp.empty_like(x)
+        v_first = jnp.zeros_like(x)
 
         all_stats = []
+        new_rwkv_layers = list(rwkv_state)
         new_screen_layers = list(screen_state.layers)
 
         for l_idx in range(cfg.n_layers):
@@ -132,14 +163,16 @@ class ScreenedRWKVModel(nn.Module):
                     usage_ema=jnp.zeros((batch_size, 1), dtype=jnp.float32),
                 )
 
-            x, v_first, new_scr_s, stats = self.layers[l_idx](
+            x, v_first, new_rwkv_s, new_scr_s, stats = self.layers[l_idx](
                 x,
                 v_first,
+                rwkv_state[l_idx],
                 scr_s,
                 phase=phase,
                 deterministic=deterministic,
             )
 
+            new_rwkv_layers[l_idx] = new_rwkv_s
             if l_idx in screened_idx:
                 new_screen_layers[screened_idx[l_idx]] = new_scr_s
             all_stats.append(stats)
@@ -148,6 +181,7 @@ class ScreenedRWKVModel(nn.Module):
         logits = self.lm_head(x)
 
         new_screen_state = ModelScreenState(layers=tuple(new_screen_layers))
+        new_rwkv_state = tuple(new_rwkv_layers)
 
         # Aggregate stats across layers
         agg_stats = {}
@@ -160,16 +194,11 @@ class ScreenedRWKVModel(nn.Module):
             if vals:
                 agg_stats[key] = jnp.mean(jnp.array(vals))
 
-        # rwkv_state is kept as dummy for backward compatibility
-        return logits, rwkv_state, new_screen_state, agg_stats
+        return logits, new_rwkv_state, new_screen_state, agg_stats
 
 
 def init_rwkv_state(batch_size, config: ModelConfig):
-    """Dummy state for backward compatibility. RWKV-7 core manages recurrence internally."""
-    return tuple(
-        jnp.zeros((batch_size, 1), dtype=jnp.float32)
-        for _ in range(config.n_layers)
-    )
+    return init_model_rwkv_state(batch_size, config)
 
 
 def cross_entropy_loss(logits, targets, mask=None):
@@ -195,7 +224,7 @@ def create_model_variables(rng, config: ModelConfig, batch_size: int):
         dummy_ids,
         rwkv_state,
         screen_state,
-        phase="read_only",
+        phase="read_screening_only",
         deterministic=True,
     )
     return variables, model

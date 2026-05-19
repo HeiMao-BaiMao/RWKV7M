@@ -1,4 +1,5 @@
 __pycache__
-/.cocoindex_code
 /.venv
 /sample
+# CocoIndex Code (ccc)
+/.cocoindex_code/
