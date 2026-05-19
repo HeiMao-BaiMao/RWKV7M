@@ -10,7 +10,7 @@ def prefill(
     rwkv_state,
     screen_state,
     *,
-    phase="read_only",
+    phase="read_screening_only",
 ):
     logits, new_rwkv_state, new_screen_state, stats = model.apply(
         variables,
@@ -30,11 +30,15 @@ def decode_one(
     rwkv_state,
     screen_state,
     *,
-    phase="read_only",
+    phase="read_screening_only",
 ):
+    if token_id.ndim == 2 and token_id.shape[1] == 1:
+        input_ids = token_id
+    else:
+        input_ids = token_id[:, None]
     logits, new_rwkv_state, new_screen_state, stats = model.apply(
         variables,
-        token_id[:, None],
+        input_ids,
         rwkv_state,
         screen_state,
         phase=phase,
@@ -55,7 +59,7 @@ def generate(
     temperature=1.0,
     top_p=0.9,
     rng_key=None,
-    phase="read_only",
+    phase="read_screening_only",
 ):
     if rng_key is None:
         rng_key = jax.random.PRNGKey(0)

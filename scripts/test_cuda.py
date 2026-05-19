@@ -13,12 +13,12 @@ import jax
 import jax.numpy as jnp
 import time
 
-from src.model.screening import ScreeningConfig
-from src.model.screened_rwkv import ModelConfig, ScreenedRWKVModel, init_rwkv_state, create_model_variables
-from src.model.state import init_screen_state
-from src.train.train_loop import generate_toy_batch
-from src.train.train_step import train_step
-from src.train.train_state import TrainState, create_optimizer
+from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.screened_rwkv import ModelConfig, ScreenedRWKVModel, init_rwkv_state, create_model_variables
+from rwkv7m.model.state import init_screen_state
+from rwkv7m.train.train_loop import generate_toy_batch
+from rwkv7m.train.train_step import train_step
+from rwkv7m.train.train_state import TrainState, create_optimizer
 
 
 def check_gpu_available():
@@ -66,7 +66,7 @@ def test_forward_gpu():
 
     # JIT compile and warm up
     apply_fn = jax.jit(lambda ids, rs, ss: model.apply(
-        variables, ids, rs, ss, phase="read_only", deterministic=True
+        variables, ids, rs, ss, phase="read_screening_only", deterministic=True
     ))
     jax.block_until_ready(apply_fn(input_ids, rwkv_state, screen_state))
 
@@ -133,12 +133,12 @@ def test_backward_gpu():
     screen_state = init_screen_state(2, cfg.screening)
 
     # Time training step (train_step is already JITted with static_argnames)
-    jax.block_until_ready(train_step(train_state, batch, rwkv_state, screen_state, "read_only"))
+    jax.block_until_ready(train_step(train_state, batch, rwkv_state, screen_state, "read_screening_only"))
 
     times = []
     for _ in range(5):
         start = time.perf_counter()
-        out = train_step(train_state, batch, rwkv_state, screen_state, "read_only")
+        out = train_step(train_state, batch, rwkv_state, screen_state, "read_screening_only")
         jax.block_until_ready(out)
         times.append(time.perf_counter() - start)
 
@@ -181,7 +181,7 @@ def test_large_batch_gpu():
     input_ids = jax.random.randint(subkey, (8, 256), 0, cfg.vocab_size)
 
     apply_fn = jax.jit(lambda ids, rs, ss: model.apply(
-        variables, ids, rs, ss, phase="read_only", deterministic=True
+        variables, ids, rs, ss, phase="read_screening_only", deterministic=True
     ))
     jax.block_until_ready(apply_fn(input_ids, rwkv_state, screen_state))
 

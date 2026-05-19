@@ -3,9 +3,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from src.model.screening import ScreeningConfig
-from src.model.screened_rwkv import ModelConfig, ScreenedRWKVModel, init_rwkv_state, create_model_variables
-from src.model.state import init_screen_state
+from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.screened_rwkv import ModelConfig, ScreenedRWKVModel, init_rwkv_state, create_model_variables
+from rwkv7m.model.state import init_screen_state
 
 
 def make_benchmark_config():
@@ -56,7 +56,7 @@ class TestBenchmark:
         # JIT compile
         apply_fn = jax.jit(
             lambda ids, rs, ss: model.apply(
-                variables, ids, rs, ss, phase="read_only", deterministic=True
+                variables, ids, rs, ss, phase="read_screening_only", deterministic=True
             )
         )
 
@@ -100,7 +100,7 @@ class TestBenchmark:
                 input_ids,
                 rwkv_state,
                 screen_state,
-                phase="read_only",
+                phase="read_screening_only",
                 deterministic=True,
             )
             log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -157,7 +157,7 @@ class TestBenchmark:
             input_ids,
             rwkv_state,
             screen_state,
-            phase="read_only",
+            phase="read_screening_only",
             deterministic=True,
         )
 

@@ -16,7 +16,7 @@ class TrainMetrics:
 
 
 @jax.jit(static_argnames=["phase"])
-def train_step(train_state, batch, rwkv_state, screen_state, phase="read_only"):
+def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
     def loss_fn(params):
         logits, new_rwkv_state, new_screen_state, stats = train_state.apply_fn(
             {"params": params},
@@ -50,6 +50,6 @@ def train_step(train_state, batch, rwkv_state, screen_state, phase="read_only"):
     return train_state, new_rwkv_state, new_screen_state, metrics
 
 
-def compute_aux_losses(stats, phase="read_only"):
+def compute_aux_losses(stats, phase="read_screening_only"):
     aux = {"dead_slot": jnp.zeros(()), "diversity": jnp.zeros(()), "total": jnp.zeros(())}
     return aux

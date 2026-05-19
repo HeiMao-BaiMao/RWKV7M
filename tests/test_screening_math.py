@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
-from src.model.screening import (
+from rwkv7m.model.screening import (
     unit_norm,
     bounded_tau,
     theta_from_tau,

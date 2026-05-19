@@ -2,9 +2,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from src.model.screening import ScreeningConfig
-from src.model.screened_rwkv import ModelConfig
-from src.train.train_loop import run_toy_training, generate_toy_batch
+from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.screened_rwkv import ModelConfig
+from rwkv7m.train.train_loop import run_toy_training, generate_toy_batch
 
 
 def make_train_config():
@@ -79,14 +79,14 @@ class TestTraining:
 
     def test_jit_train_step(self):
         """Train step must be JIT-compilable."""
-        from src.model.screened_rwkv import (
+        from rwkv7m.model.screened_rwkv import (
             ScreenedRWKVModel,
             init_rwkv_state,
             create_model_variables,
         )
-        from src.model.state import init_screen_state
-        from src.train.train_loop import build_train_state
-        from src.train.train_step import train_step
+        from rwkv7m.model.state import init_screen_state
+        from rwkv7m.train.train_loop import build_train_state
+        from rwkv7m.train.train_step import train_step
 
         key, subkey = jax.random.split(self.key)
         model = ScreenedRWKVModel(config=self.cfg)
@@ -109,7 +109,7 @@ class TestTraining:
         screen_state = init_screen_state(batch_size, self.cfg.screening)
 
         train_state, rwkv_state, screen_state, metrics = train_step(
-            train_state, batch, rwkv_state, screen_state, phase="read_only"
+            train_state, batch, rwkv_state, screen_state, phase="read_screening_only"
         )
 
         assert jnp.isfinite(metrics["loss"])

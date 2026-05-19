@@ -1,9 +1,9 @@
 """Toy training script for quick smoke testing."""
 
 import jax
-from src.model.screening import ScreeningConfig
-from src.model.screened_rwkv import ModelConfig
-from src.train.train_loop import run_toy_training
+from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.screened_rwkv import ModelConfig
+from rwkv7m.train.train_loop import run_toy_training
 
 
 def main():

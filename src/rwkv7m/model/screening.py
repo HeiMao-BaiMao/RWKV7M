@@ -138,7 +138,7 @@ class StateLevelScreening(nn.Module):
         h_base_seq: jnp.ndarray,   # [B, T, d]
         state,
         *,
-        phase="read_only",
+        phase="read_screening_only",
         deterministic=True,
     ):
         from .state import LayerScreenState

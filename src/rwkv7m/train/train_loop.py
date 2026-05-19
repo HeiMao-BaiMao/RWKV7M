@@ -3,15 +3,15 @@ import jax.numpy as jnp
 from flax.training import train_state as flax_train_state
 import optax
 
-from src.model.screened_rwkv import (
+from ..model.screened_rwkv import (
     ModelConfig,
     ScreenedRWKVModel,
     init_rwkv_state,
     create_model_variables,
 )
-from src.model.state import init_screen_state
-from src.train.train_state import TrainState, create_optimizer
-from src.train.train_step import train_step
+from ..model.state import init_screen_state
+from .train_state import TrainState, create_optimizer
+from .train_step import train_step
 
 
 def build_train_state(key, model, variables, config, total_steps=10000):
@@ -74,7 +74,7 @@ def run_toy_training(
         screen_state = init_screen_state(batch_size, model_cfg.screening)
 
         train_state, rwkv_state, screen_state, metrics = train_step(
-            train_state, batch, rwkv_state, screen_state, phase="read_only"
+            train_state, batch, rwkv_state, screen_state, phase="read_screening_only"
         )
 
         loss = float(metrics["loss"])

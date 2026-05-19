@@ -133,7 +133,7 @@ class ScreenedRWKVModel(nn.Module):
         rwkv_state,
         screen_state,
         *,
-        phase="read_only",
+        phase="read_screening_only",
         deterministic=True,
     ):
         cfg = self.config

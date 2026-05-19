@@ -1,9 +1,9 @@
 import jax
 import jax.numpy as jnp
 import pytest
-from src.model.screening import ScreeningConfig
-from src.model.state import init_screen_state, tuple_set
-from src.model.screened_rwkv import (
+from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.state import init_screen_state, tuple_set
+from rwkv7m.model.screened_rwkv import (
     ModelConfig,
     ScreenedRWKVModel,
     init_rwkv_state,
@@ -55,7 +55,7 @@ class TestShapes:
             input_ids,
             rwkv_state,
             screen_state,
-            phase="read_only",
+            phase="read_screening_only",
             deterministic=True,
         )
         assert logits.shape == (self.batch_size, self.seq_len, self.cfg.vocab_size)
@@ -80,7 +80,7 @@ class TestShapes:
             input_ids,
             rwkv_state,
             screen_state,
-            phase="read_only",
+            phase="read_screening_only",
             deterministic=True,
         )
         assert new_screen_state is not None
@@ -102,7 +102,7 @@ class TestShapes:
         screen_state = init_screen_state(self.batch_size, self.cfg.screening)
         logits_prefill, _, _, _ = model.apply(
             variables, input_ids, rwkv_state, screen_state,
-            phase="read_only", deterministic=True,
+            phase="read_screening_only", deterministic=True,
         )
 
         # Decode one step at a time
@@ -113,7 +113,7 @@ class TestShapes:
             tok = input_ids[:, t : t + 1]
             logits_t, rwkv_state, screen_state, _ = model.apply(
                 variables, tok, rwkv_state, screen_state,
-                phase="read_only", deterministic=True,
+                phase="read_screening_only", deterministic=True,
             )
             logits_steps.append(logits_t)
 
@@ -140,7 +140,7 @@ class TestShapes:
 
         _, _, _, stats = model.apply(
             variables, input_ids, rwkv_state, screen_state,
-            phase="read_only", deterministic=True,
+            phase="read_screening_only", deterministic=True,
         )
         assert "u_norm_mean" in stats
         assert "rel_read_mean" in stats

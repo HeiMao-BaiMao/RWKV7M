@@ -6,12 +6,12 @@ Expected: all assertions pass and loss remains finite.
 
 import jax
 import jax.numpy as jnp
-from src.model.screening import ScreeningConfig
-from src.model.screened_rwkv import ModelConfig, ScreenedRWKVModel, init_rwkv_state, create_model_variables
-from src.model.state import init_screen_state
-from src.train.train_loop import generate_toy_batch
-from src.train.train_step import train_step
-from src.train.train_state import TrainState, create_optimizer
+from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.screened_rwkv import ModelConfig, ScreenedRWKVModel, init_rwkv_state, create_model_variables
+from rwkv7m.model.state import init_screen_state
+from rwkv7m.train.train_loop import generate_toy_batch
+from rwkv7m.train.train_step import train_step
+from rwkv7m.train.train_state import TrainState, create_optimizer
 
 
 def test_forward_bf16():
@@ -49,7 +49,7 @@ def test_forward_bf16():
         input_ids,
         rwkv_state,
         screen_state,
-        phase="read_only",
+        phase="read_screening_only",
         deterministic=True,
     )
 
@@ -108,7 +108,7 @@ def test_backward_bf16():
     screen_state = init_screen_state(2, cfg.screening)
 
     train_state, rwkv_state, screen_state, metrics = train_step(
-        train_state, batch, rwkv_state, screen_state, phase="read_only"
+        train_state, batch, rwkv_state, screen_state, phase="read_screening_only"
     )
 
     assert jnp.isfinite(metrics["loss"]), f"Loss is not finite: {metrics['loss']}"
@@ -175,7 +175,7 @@ def test_scan_consistency_bf16():
     # Prefill all T tokens
     logits_prefill, _, _, _ = model.apply(
         variables, input_ids, rwkv_state, screen_state,
-        phase="read_only", deterministic=True,
+        phase="read_screening_only", deterministic=True,
     )
 
     # Decode one step at a time
@@ -186,7 +186,7 @@ def test_scan_consistency_bf16():
         tok = input_ids[:, t:t + 1]
         logits_t, rwkv_state, screen_state, _ = model.apply(
             variables, tok, rwkv_state, screen_state,
-            phase="read_only", deterministic=True,
+            phase="read_screening_only", deterministic=True,
         )
         logits_steps.append(logits_t)
 
