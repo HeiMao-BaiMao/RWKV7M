@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
+from .data import BinIdxBatchDataset, create_binidx_dataset
 from .infer.generate import decode_one, generate, prefill
 from .model.screened_rwkv import (
     ModelConfig,
@@ -132,6 +133,50 @@ def train_batch(
     return train_state, metrics
 
 
+def train_binidx(
+    rng_key,
+    config: ModelConfig,
+    data_file,
+    *,
+    ctx_len: int,
+    batch_size: int,
+    num_steps: int,
+    magic_prime: int | None = None,
+    phase="read_screening_only",
+    print_every: int | None = None,
+):
+    dataset = create_binidx_dataset(
+        data_file,
+        ctx_len=ctx_len,
+        batch_size=batch_size,
+        magic_prime=magic_prime,
+        epoch_steps=num_steps,
+    )
+    runtime, train_state = create_train_runtime(
+        rng_key,
+        config,
+        batch_size=batch_size,
+        total_steps=num_steps,
+    )
+    losses = []
+    try:
+        for step in range(num_steps):
+            batch = dataset.get_batch(step)
+            train_state, metrics = train_batch(
+                train_state,
+                batch,
+                runtime,
+                phase=phase,
+            )
+            loss = float(metrics["loss"])
+            losses.append(loss)
+            if print_every and (step % print_every == 0 or step == num_steps - 1):
+                print(f"step={step} loss={loss:.6f}")
+    finally:
+        dataset.close()
+    return losses, runtime, train_state
+
+
 def reset_runtime_state(runtime: RWKV7MRuntime, config: ModelConfig, *, batch_size: int):
     runtime.rwkv_state = init_rwkv_state(batch_size, config)
     runtime.screen_state = init_screen_state(batch_size, config.screening)
@@ -180,6 +225,9 @@ __all__ = [
     "infer_next",
     "generate_ids",
     "train_batch",
+    "train_binidx",
     "reset_runtime_state",
     "tiny_config",
+    "BinIdxBatchDataset",
+    "create_binidx_dataset",
 ]

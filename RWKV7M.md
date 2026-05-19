@@ -38,6 +38,11 @@ The current code is a pure JAX/Flax reference path. It is full-sequence-training
 src/rwkv7m/
   __init__.py
   api.py
+  data/
+    binidx.py
+    dataset.py
+  cli/
+    train_binidx.py
   model/
     rwkv_core.py
     screened_rwkv.py
@@ -65,6 +70,7 @@ Top-level imports:
 
 ```python
 from rwkv7m import (
+    create_binidx_dataset,
     ModelConfig,
     ScreeningConfig,
     ScreenedRWKVModel,
@@ -73,6 +79,7 @@ from rwkv7m import (
     create_train_runtime,
     generate_ids,
     train_batch,
+    train_binidx,
     tiny_config,
 )
 ```
@@ -93,6 +100,19 @@ runtime, train_state = create_train_runtime(
     total_steps=100,
 )
 train_state, metrics = train_batch(train_state, batch, runtime)
+```
+
+Binidx training helper:
+
+```python
+losses, runtime, train_state = train_binidx(
+    rng_key,
+    config,
+    "data/minipile",
+    ctx_len=512,
+    batch_size=1,
+    num_steps=100,
+)
 ```
 
 ## 5. Model Config Validation
@@ -232,6 +252,56 @@ Optimizer:
 - no weight decay on bias, norm, tau, lambda, and slot embeddings.
 
 The optimizer clamps warmup steps for very short schedules so library smoke tests such as `total_steps=2` remain valid.
+
+## 11.1 RWKV-LM-V7 Binidx Training
+
+The package includes a torch-free reader for RWKV-LM-V7 `.bin/.idx` files.
+
+Reader:
+
+```python
+from rwkv7m.data import MMapIndexedDataset
+
+data = MMapIndexedDataset("data/minipile")  # no extension
+tokens = data.get(idx=0, offset=0, length=513)
+```
+
+Batch sampler:
+
+```python
+from rwkv7m import create_binidx_dataset
+
+dataset = create_binidx_dataset(
+    "data/minipile",
+    ctx_len=512,
+    batch_size=2,
+)
+batch = dataset.get_batch(0)
+```
+
+The batch has the same shape expected by `train_step`:
+
+```text
+input_ids:  int32[B, T]
+target_ids: int32[B, T]
+mask:       float32[B, T]
+```
+
+Sampling follows the RWKV-LM-V7 cubic shuffle:
+
+```text
+ii = 1 + epoch * samples_per_epoch + sample_index * world_size + rank
+factor = int(magic_prime * ((sqrt(5) - 1) / 2))
+offset = ((factor * ii^3) % magic_prime) * ctx_len
+```
+
+`magic_prime` is automatically computed as the largest `3n+2` prime not greater than `data_size // ctx_len`, and can also be supplied explicitly.
+
+CLI:
+
+```powershell
+uv run rwkv7m-train-binidx --data-file data/minipile --ctx-len 512 --batch-size 1 --steps 100 --vocab-size 65536
+```
 
 ## 12. Inference
 

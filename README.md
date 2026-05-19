@@ -55,12 +55,53 @@ state, metrics = train_batch(state, batch, runtime)
 print(float(metrics["loss"]))
 ```
 
+## Training From RWKV-LM-V7 `.bin/.idx`
+
+`rwkv7m` can read the same binidx dataset format used by `sample/RWKV-LM-V7`.
+Prepare data with `sample/RWKV-LM-V7/data/make_data.py` or any compatible tool, then pass the prefix path without `.bin` / `.idx`.
+
+CLI smoke run:
+
+```powershell
+uv run rwkv7m-train-binidx `
+  --data-file sample/RWKV-LM-V7/data/demo `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 100 `
+  --vocab-size 65536 `
+  --d-model 128 `
+  --n-layers 4 `
+  --n-heads 4 `
+  --head-size 32
+```
+
+`magic_prime` is computed automatically from dataset size and `ctx_len`; pass `--magic-prime` to force the exact value produced by `sample/RWKV-LM-V7/data/compute_magic_prime.py`.
+
+Python API:
+
+```python
+import jax
+from rwkv7m import tiny_config, train_binidx
+
+cfg = tiny_config(vocab_size=65536, d_model=128, n_layers=4, n_heads=4, head_size=32)
+losses, runtime, state = train_binidx(
+    jax.random.PRNGKey(0),
+    cfg,
+    "sample/RWKV-LM-V7/data/demo",
+    ctx_len=512,
+    batch_size=1,
+    num_steps=100,
+)
+print(losses[-1])
+```
+
 ## Public API
 
 Common imports:
 
 ```python
 from rwkv7m import (
+    create_binidx_dataset,
     ModelConfig,
     ScreeningConfig,
     ScreenedRWKVModel,
@@ -69,6 +110,7 @@ from rwkv7m import (
     create_train_runtime,
     generate_ids,
     train_batch,
+    train_binidx,
     tiny_config,
 )
 ```
@@ -76,6 +118,7 @@ from rwkv7m import (
 Lower-level modules:
 
 - `rwkv7m.model`: RWKV core, screening module, config, state helpers.
+- `rwkv7m.data`: RWKV-LM-V7 compatible `.bin/.idx` reader and batch sampler.
 - `rwkv7m.infer`: `prefill`, `decode_one`, `generate`.
 - `rwkv7m.train`: optimizer, train state, toy batch, train step.
 
@@ -83,6 +126,7 @@ Lower-level modules:
 
 - Flax Linen implementation.
 - Full-sequence training path with `jax.lax.scan` inside recurrent components.
+- RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
 - State-level screening with `read_screening_only` and `read_write` phases.
 - Installable package layout for `from rwkv7m import ...`.
@@ -101,4 +145,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, and public API training.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, and binidx data loading.

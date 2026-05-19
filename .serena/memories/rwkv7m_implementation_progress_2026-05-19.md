@@ -33,3 +33,11 @@
   - `README.md`: install, minimal inference/training, API, scope.
   - `RWKV7M.md`: implementation spec rebuilt around actual package and current limitations.
   - `RWKV7M.paper.md`: optimized research draft.
+- 2026-05-20 binidx training support:
+  - Added torch-free RWKV-LM-V7 compatible `.bin/.idx` reader in `src/rwkv7m/data/binidx.py`.
+  - Added cubic-shuffle batch sampler in `src/rwkv7m/data/dataset.py`; it returns `input_ids`, `target_ids`, `mask` for existing `train_step`.
+  - Added `train_binidx` / `create_binidx_dataset` top-level APIs.
+  - Added CLI script `rwkv7m-train-binidx`.
+  - Added tests in `tests/test_binidx_data.py`.
+  - Verified `uv run pytest -q`: 35 passed.
+  - CCC index refreshed after changes.

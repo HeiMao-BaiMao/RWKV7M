@@ -165,6 +165,7 @@ mu_long_max  = 0.005
 - JAX/Flax Linen
 - Optax train step
 - installable package: `rwkv7m`
+- RWKV-LM-V7 compatible `.bin/.idx` data reader and batch sampler
 - `read_screening_only` / `read_write` phase
 - invalid phase rejection
 - config validation

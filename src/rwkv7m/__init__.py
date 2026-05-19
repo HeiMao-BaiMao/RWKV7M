@@ -8,7 +8,9 @@ from .api import (
     reset_runtime_state,
     tiny_config,
     train_batch,
+    train_binidx,
 )
+from .data import BinIdxBatchDataset, BinIdxConfig, create_binidx_dataset
 from .model import (
     LayerRWKVState,
     LayerScreenState,
@@ -36,8 +38,12 @@ __all__ = [
     "infer_next",
     "generate_ids",
     "train_batch",
+    "train_binidx",
     "reset_runtime_state",
     "tiny_config",
+    "BinIdxBatchDataset",
+    "BinIdxConfig",
+    "create_binidx_dataset",
     "LayerRWKVState",
     "LayerScreenState",
     "ModelScreenState",
