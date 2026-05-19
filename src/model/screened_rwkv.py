@@ -58,34 +58,13 @@ class ScreenedRWKVLayer(nn.Module):
         h_base, v_first = self.rwkv_block(x, v_first)
 
         if self._has_screening:
-            # Apply screening per-token (lightweight compared to RWKV core)
-            B, T, C = h_base.shape
-            h_list = []
-            stats_list = []
-            new_screen = screen_state
-
-            for t in range(T):
-                x_t = x[:, t, :]
-                h_base_t = h_base[:, t, :]
-                h_t, new_screen, stats_t = self.screening(
-                    x_t,
-                    h_base_t,
-                    new_screen,
-                    phase=phase,
-                    deterministic=deterministic,
-                )
-                h_list.append(h_t)
-                stats_list.append(stats_t)
-
-            h = jnp.stack(h_list, axis=1)
-            # Aggregate stats over time
-            if stats_list:
-                stats = {
-                    k: jnp.mean(jnp.array([s[k] for s in stats_list]))
-                    for k in stats_list[0].keys()
-                }
-            else:
-                stats = {}
+            h, new_screen, stats = self.screening(
+                x,
+                h_base,
+                screen_state,
+                phase=phase,
+                deterministic=deterministic,
+            )
         else:
             h = h_base
             new_screen = screen_state

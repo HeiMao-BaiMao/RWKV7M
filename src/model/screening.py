@@ -46,7 +46,7 @@ class ScreeningConfig:
     d_v: int = 128
     n_slots: int = 16
     screened_layers: tuple[int, ...] = ()
-    bank_ids: tuple[int, ...] = ()  # 0=short, 1=mid, 2=long; length M
+    bank_ids: tuple[int, ...] = ()
     tau_init: float = 0.0
     tanh_norm_cap: float = 1.0
     lambda_screen_init: float = 0.01
@@ -65,15 +65,9 @@ class ScreeningConfig:
     age_sigma: float = 8.0
 
 
-def make_mu_by_slot(cfg, mu_short_raw, mu_mid_raw, mu_long_raw):
-    mu_max = jnp.array([cfg.mu_short_max, cfg.mu_mid_max, cfg.mu_long_max])
-    mu_raw = jnp.array([mu_short_raw, mu_mid_raw, mu_long_raw])
-    mu_by_bank = mu_max * jax.nn.sigmoid(mu_raw)
-    bank_ids = jnp.array(cfg.bank_ids)
-    return mu_by_bank[bank_ids]
-
-
 class StateLevelScreening(nn.Module):
+    """Screening module that can process full sequences via lax.scan."""
+
     config: ScreeningConfig
 
     def setup(self):
@@ -84,145 +78,193 @@ class StateLevelScreening(nn.Module):
         self.out_proj = nn.Dense(cfg.d_model, use_bias=False, name="out_proj")
         self.gate_proj = nn.Dense(cfg.d_model, name="gate_proj")
         self.delta_proj = nn.Dense(cfg.d_slot, name="delta_proj")
+        self.screen_ln = nn.LayerNorm(dtype=jnp.float32, name="screen_ln")
         if cfg.use_write_screening:
             self.q_proj_w = nn.Dense(cfg.d_k, use_bias=False, name="q_proj_w")
             self.k_proj_w = nn.Dense(cfg.d_k, use_bias=False, name="k_proj_w")
 
+    def _init_params(self, cfg, x_seq, h_base_seq, state, phase):
+        """During init, call all submodules once to create their params."""
+        from .state import LayerScreenState
+        x_t = x_seq[:, 0, :]
+        h_t = h_base_seq[:, 0, :]
+        x_ln = self.screen_ln(x_t.astype(jnp.float32))
+        _ = self.q_proj_r(x_ln)
+        slots = state.slots.astype(jnp.float32)
+        _ = self.k_proj_r(slots)
+        _ = self.v_proj(slots)
+        _ = self.gate_proj(x_ln)
+        _ = self.out_proj(jnp.zeros((x_ln.shape[0], cfg.d_v)))
+        delta_in = jnp.concatenate([x_ln, h_t, slots[:, 0, :]], axis=-1)
+        _ = self.delta_proj(delta_in)
+        _ = self.param("tau_r_raw", lambda rng, shape: theta_from_tau(cfg.tau_init), ())
+        _ = self.param("lambda_raw", nn.initializers.constant(jnp.log(jnp.exp(cfg.lambda_screen_init) - 1)), ())
+        _ = self.param("slot_embed", nn.initializers.normal(0.02), (cfg.n_slots, cfg.d_slot))
+        _ = self.param("mu_by_bank_raw", nn.initializers.constant(0.0), (3,))
+        if phase != "read_only" and cfg.use_write_screening:
+            q_w_in = jnp.concatenate([x_ln, h_t.astype(jnp.float32)], axis=-1)
+            _ = self.q_proj_w(q_w_in)
+            _ = self.k_proj_w(slots)
+            _ = self.param("tau_w_raw", lambda rng, shape: theta_from_tau(cfg.tau_init), ())
+        return h_base_seq, state, {}
+
     @nn.compact
     def __call__(
         self,
-        x_t,
-        h_base,
+        x_seq: jnp.ndarray,        # [B, T, d]
+        h_base_seq: jnp.ndarray,   # [B, T, d]
         state,
         *,
         phase="read_only",
         deterministic=True,
-        intervention=None,
     ):
         from .state import LayerScreenState
 
         cfg = self.config
-        slots = state.slots
+        B, T, C = x_seq.shape
+
+        # During init, create all params via dummy call
+        if self.is_initializing():
+            return self._init_params(cfg, x_seq, h_base_seq, state, phase)
+
+        slots = state.slots.astype(jnp.float32)
         ages = state.ages
 
-        x_t_f32 = x_t.astype(jnp.float32)
-        x_ln = nn.LayerNorm(dtype=jnp.float32, name="screen_ln")(x_t_f32)
-        slots_f32 = slots.astype(jnp.float32)
-        h_base_f32 = h_base.astype(jnp.float32)
+        # --- Pre-compute projections and params for all time steps ---
+        x_ln_seq = self.screen_ln(x_seq.astype(jnp.float32))  # [B, T, C]
 
-        # Read branch
-        q_r = self.q_proj_r(x_ln)
-        k_r = self.k_proj_r(slots_f32)
-        v = self.v_proj(slots_f32)
+        # Read query for all time steps
+        q_r_seq = self.q_proj_r(x_ln_seq)  # [B, T, d_k]
+        q_r_seq = unit_norm(q_r_seq, eps=cfg.eps)
 
-        q_r = unit_norm(q_r, eps=cfg.eps)
-        k_r = unit_norm(k_r, eps=cfg.eps)
-        if cfg.use_value_unit_norm:
-            v = unit_norm(v, eps=cfg.eps)
+        # Extract projection weights
+        p = self.variables["params"]
+        k_w = p["k_proj_r"]["kernel"]     # [d_s, d_k]
+        v_w = p["v_proj"]["kernel"]       # [d_s, d_v]
+        gate_w = p["gate_proj"]["kernel"]  # [C, C]
+        gate_b = p["gate_proj"]["bias"]    # [C]
+        out_w = p["out_proj"]["kernel"]   # [d_v, C]
+        delta_w = p["delta_proj"]["kernel"]  # [2*C + d_s, d_slot]
+        delta_b = p["delta_proj"]["bias"]    # [d_slot]
 
-        sim_r = jnp.einsum("bd,bmd->bm", q_r, k_r)
-
-        tau_r_raw = self.param(
-            "tau_r_raw",
-            lambda rng, shape: theta_from_tau(cfg.tau_init),
-            (),
-        )
+        # Scalar params
+        tau_r_raw = p["tau_r_raw"]
         tau_r = bounded_tau(tau_r_raw)
-
-        if cfg.use_leaky_warmup:
-            rel_r = relevance_with_warmup(sim_r, tau_r, cfg.leaky_alpha, cfg.leaky_gamma)
-        else:
-            rel_r = trim_square(sim_r, tau_r, eps=cfg.eps)
-
-        if cfg.use_age_mask:
-            rel_r = rel_r * compute_age_mask(ages, cfg)
-
-        z = jnp.einsum("bm,bmd->bd", rel_r, v)
-        u = tanh_norm(z, cap=cfg.tanh_norm_cap, eps=cfg.eps)
-
-        gate = jax.nn.sigmoid(self.gate_proj(x_ln))
-        read_out = self.out_proj(u)
-
-        lambda_raw = self.param(
-            "lambda_raw",
-            nn.initializers.constant(jnp.log(jnp.exp(cfg.lambda_screen_init) - 1)),
-            (),
-        )
+        lambda_raw = p["lambda_raw"]
         lambda_screen = jax.nn.softplus(lambda_raw)
 
-        h = h_base + lambda_screen * gate * read_out.astype(h_base.dtype)
+        slot_embed = p["slot_embed"]  # [M, d_s]
+        mu = self._compute_mu(p, cfg)
 
-        # Candidate update
-        slot_embed = self.param(
-            "slot_embed",
-            nn.initializers.normal(0.02),
-            (cfg.n_slots, cfg.d_slot),
-        )
-        slot_embed_b = jnp.broadcast_to(slot_embed[None, :, :], slots_f32.shape)
-        x_rep = jnp.broadcast_to(x_ln[:, None, :], (x_ln.shape[0], cfg.n_slots, cfg.d_model))
-        h_rep = jnp.broadcast_to(
-            h.astype(jnp.float32)[:, None, :],
-            (x_ln.shape[0], cfg.n_slots, cfg.d_model),
-        )
-        delta_in = jnp.concatenate([x_rep, h_rep, slot_embed_b], axis=-1)
-        delta_s = jnp.tanh(self.delta_proj(delta_in))
-
-        # Update rates
-        bank_ids = jnp.array(cfg.bank_ids)
-        mu_by_bank = self.param(
-            "mu_by_bank_raw",
-            nn.initializers.constant(0.0),
-            (3,),
-        )
-        mu_max = jnp.array([cfg.mu_short_max, cfg.mu_mid_max, cfg.mu_long_max])
-        mu_per_bank = mu_max * jax.nn.sigmoid(mu_by_bank)
-        mu = mu_per_bank[bank_ids]  # [M]
-
-        if phase == "read_only" or not cfg.use_write_screening:
-            update_strength = mu[None, :, None]
-            new_slots = slots_f32 + update_strength * (delta_s - slots_f32)
-            new_ages = ages
-            rel_w = jnp.zeros_like(rel_r)
-            tau_w = jnp.zeros(())
-        else:
-            q_w_in = jnp.concatenate([x_ln, h_base_f32], axis=-1)
-            q_w = self.q_proj_w(q_w_in)
-            k_w = self.k_proj_w(slots_f32)
-            q_w = unit_norm(q_w, eps=cfg.eps)
-            k_w = unit_norm(k_w, eps=cfg.eps)
-            sim_w = jnp.einsum("bd,bmd->bm", q_w, k_w)
-            tau_w_raw = self.param(
-                "tau_w_raw",
-                lambda rng, shape: theta_from_tau(cfg.tau_init),
-                (),
-            )
+        # Pre-compute write query if needed
+        if phase != "read_only" and cfg.use_write_screening:
+            q_w_w = p["q_proj_w"]["kernel"]  # [2*C, d_k]
+            k_w_w = p["k_proj_w"]["kernel"]  # [d_s, d_k]
+            tau_w_raw = p["tau_w_raw"]
             tau_w = bounded_tau(tau_w_raw)
-            rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
-            update_strength = mu[None, :, None] * rel_w[:, :, None]
-            new_slots = slots_f32 + update_strength * (delta_s - slots_f32)
-            new_ages = jnp.where(rel_w > 1e-3, 0.0, ages + 1.0)
+            q_w_in = jnp.concatenate([x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1)
+            q_w_seq = jnp.einsum("btc,ck->btk", q_w_in, q_w_w)
+            q_w_seq = unit_norm(q_w_seq, eps=cfg.eps)
+        else:
+            q_w_seq = None
+            tau_w = jnp.zeros(())
+
+        # Broadcast slot embed for delta computation
+        slot_embed_b = jnp.broadcast_to(slot_embed[None, None, :, :], (B, T, cfg.n_slots, cfg.d_slot))
+        x_rep = jnp.broadcast_to(x_ln_seq[:, :, None, :], (B, T, cfg.n_slots, C))
+        h_rep = jnp.broadcast_to(h_base_seq.astype(jnp.float32)[:, :, None, :], (B, T, cfg.n_slots, C))
+        delta_in_all = jnp.concatenate([x_rep, h_rep, slot_embed_b], axis=-1)
+        delta_s_all = jnp.tanh(jnp.einsum("btmi,io->btmo", delta_in_all, delta_w) + delta_b)
+
+        def step(carry, t):
+            """Pure function - no Flax modules called here."""
+            slots_t = carry
+
+            # Read branch
+            k_r = jnp.einsum("bms,sk->bmk", slots_t, k_w)
+            v = jnp.einsum("bms,sv->bmv", slots_t, v_w)
+            k_r = unit_norm(k_r, eps=cfg.eps)
+            if cfg.use_value_unit_norm:
+                v = unit_norm(v, eps=cfg.eps)
+
+            sim_r = jnp.einsum("bk,bmk->bm", q_r_seq[:, t, :], k_r)
+
+            if cfg.use_leaky_warmup:
+                hard = trim_square(sim_r, tau_r)
+                soft = jax.nn.sigmoid(cfg.leaky_gamma * (sim_r - tau_r))
+                rel_r = (1.0 - cfg.leaky_alpha) * hard + cfg.leaky_alpha * soft
+            else:
+                rel_r = trim_square(sim_r, tau_r, eps=cfg.eps)
+
+            if cfg.use_age_mask:
+                age_scores = (cfg.age_ref - ages) / (cfg.age_sigma + cfg.eps)
+                rel_r = rel_r * jax.nn.sigmoid(age_scores)
+
+            z = jnp.einsum("bm,bmv->bv", rel_r, v)
+            u = tanh_norm(z, cap=cfg.tanh_norm_cap, eps=cfg.eps)
+
+            gate = jax.nn.sigmoid(jnp.einsum("bc,cg->bg", x_ln_seq[:, t, :], gate_w) + gate_b)
+            read_out = jnp.einsum("bv,vc->bc", u, out_w)
+            h_t = h_base_seq[:, t, :] + lambda_screen * gate * read_out.astype(h_base_seq.dtype)
+
+            # Slot update
+            if phase == "read_only" or not cfg.use_write_screening:
+                update_strength = mu[None, :, None]
+                new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
+                new_ages = ages
+                rel_w = jnp.zeros_like(rel_r)
+            else:
+                k_w_t = jnp.einsum("bms,sk->bmk", slots_t, k_w_w)
+                k_w_t = unit_norm(k_w_t, eps=cfg.eps)
+                sim_w = jnp.einsum("bk,bmk->bm", q_w_seq[:, t, :], k_w_t)
+                rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
+                update_strength = mu[None, :, None] * rel_w[:, :, None]
+                new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
+                new_ages = jnp.where(rel_w > 1e-3, 0.0, ages + 1.0)
+
+            # Stats
+            eta_active = 1e-3
+            stats_t = {
+                "rel_read_mean": jnp.mean(rel_r),
+                "rel_read_max": jnp.max(rel_r),
+                "active_slots_mean": jnp.mean(jnp.sum(rel_r > eta_active, axis=-1)),
+                "z_norm_mean": jnp.mean(jnp.linalg.norm(z, axis=-1)),
+                "u_norm_mean": jnp.mean(jnp.linalg.norm(u, axis=-1)),
+                "tau_r": tau_r,
+                "lambda_screen": lambda_screen,
+                "rel_write_mean": jnp.mean(rel_w),
+                "tau_w": tau_w,
+            }
+
+            return new_slots, (h_t, stats_t, new_ages)
+
+        # lax.scan over time
+        final_slots, (h_seq, stats_seq, ages_seq) = jax.lax.scan(
+            step,
+            slots,
+            jnp.arange(T),
+        )
+
+        h = jnp.stack(h_seq, axis=1)
+        ages_final = ages_seq[-1]
 
         new_state = LayerScreenState(
-            slots=new_slots.astype(slots.dtype),
-            ages=new_ages,
+            slots=final_slots.astype(state.slots.dtype),
+            ages=ages_final,
             usage_ema=state.usage_ema,
         )
 
-        # Active slot threshold
-        eta_active = 1e-3
+        # Aggregate stats over time (scan stacks dict values into arrays)
+        agg_stats = {k: jnp.mean(v) for k, v in stats_seq.items()}
 
-        stats = {
-            "rel_read_mean": jnp.mean(rel_r),
-            "rel_read_max": jnp.max(rel_r),
-            "active_slots_mean": jnp.mean(jnp.sum(rel_r > eta_active, axis=-1)),
-            "z_norm_mean": jnp.mean(jnp.linalg.norm(z, axis=-1)),
-            "u_norm_mean": jnp.mean(jnp.linalg.norm(u, axis=-1)),
-            "tau_r": tau_r,
-            "lambda_screen": lambda_screen,
-            "rel_write_mean": jnp.mean(rel_w),
-            "tau_w": tau_w,
-        }
-        return h, new_state, stats
+        return h, new_state, agg_stats
+
+    def _compute_mu(self, p, cfg):
+        mu_by_bank_raw = p["mu_by_bank_raw"]
+        mu_max = jnp.array([cfg.mu_short_max, cfg.mu_mid_max, cfg.mu_long_max])
+        mu_per_bank = mu_max * jax.nn.sigmoid(mu_by_bank_raw)
+        bank_ids = jnp.array(cfg.bank_ids)
+        return mu_per_bank[bank_ids]  # [M]
 
 
 def compute_age_mask(ages, cfg):
