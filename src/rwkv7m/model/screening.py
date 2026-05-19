@@ -69,6 +69,7 @@ class ScreeningConfig:
     use_age_mask: bool = False
     use_bank_bias: bool = False
     use_write_screening: bool = False
+    write_rel_floor: float = 1e-3
     use_leaky_warmup: bool = False
     leaky_alpha: float = 0.0
     leaky_gamma: float = 8.0
@@ -86,6 +87,8 @@ class ScreeningConfig:
         invalid_banks = [bank_id for bank_id in self.bank_ids if bank_id not in (0, 1, 2)]
         if invalid_banks:
             raise ValueError("bank_ids values must be only 0, 1, or 2")
+        if self.write_rel_floor < 0.0:
+            raise ValueError("write_rel_floor must be non-negative")
 
 
 class StateLevelScreening(nn.Module):
@@ -239,11 +242,13 @@ class StateLevelScreening(nn.Module):
                 new_ages = ages_t
                 rel_w = jnp.zeros_like(rel_r)
             else:
-                k_w_t = jnp.einsum("bms,sk->bmk", slots_t, k_w_w)
+                slots_for_write_key = slots_t + slot_embed[None, :, :]
+                k_w_t = jnp.einsum("bms,sk->bmk", slots_for_write_key, k_w_w)
                 k_w_t = unit_norm(k_w_t, eps=cfg.eps)
                 sim_w = jnp.einsum("bk,bmk->bm", q_w_seq[:, t, :], k_w_t)
                 rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
-                update_strength = mu[None, :, None] * rel_w[:, :, None]
+                rel_w_effective = jnp.maximum(rel_w, cfg.write_rel_floor)
+                update_strength = mu[None, :, None] * rel_w_effective[:, :, None]
                 new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
                 new_ages = jnp.where(rel_w > 1e-3, 0.0, ages_t + 1.0)
 
@@ -258,6 +263,9 @@ class StateLevelScreening(nn.Module):
                 "tau_r": tau_r,
                 "lambda_screen": lambda_screen,
                 "rel_write_mean": jnp.mean(rel_w),
+                "rel_write_effective_mean": jnp.mean(
+                    jnp.maximum(rel_w, cfg.write_rel_floor)
+                ) if write_enabled else jnp.mean(rel_w),
                 "tau_w": tau_w,
             }
 

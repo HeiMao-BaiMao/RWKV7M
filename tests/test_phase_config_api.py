@@ -179,6 +179,20 @@ def test_top_level_train_api_runs_with_short_schedule():
     assert jnp.isfinite(metrics["loss"])
 
 
+def test_read_write_training_uses_effective_write_updates():
+    cfg = write_config()
+    runtime, state = create_train_runtime(
+        jax.random.PRNGKey(13),
+        cfg,
+        batch_size=1,
+        total_steps=2,
+    )
+    batch = generate_toy_batch(jax.random.PRNGKey(14), 1, 4, cfg.vocab_size)
+    state, metrics = train_batch(state, batch, runtime, phase="read_write")
+    assert jnp.isfinite(metrics["loss"])
+    assert metrics["rel_write_effective_mean"] > 0.0
+
+
 def test_train_batch_resets_recurrent_state_by_default():
     cfg = tiny_config(vocab_size=32, d_model=32, n_layers=2, n_heads=2, head_size=16)
     runtime, state = create_train_runtime(

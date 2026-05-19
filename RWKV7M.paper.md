@@ -171,6 +171,7 @@ mu_long_max  = 0.005
 - config validation
 - chunked recurrent state carry in the reference RWKV path
 - write branch parameters initialized whenever `use_write_screening=True`
+- write screening warm-up via slot identity and a tiny update floor to avoid zero-slot dead starts
 
 現在の実装は研究用 reference path であり、production fused kernels や upstream RWKV-7 checkpoint compatibility は未実装である。
 

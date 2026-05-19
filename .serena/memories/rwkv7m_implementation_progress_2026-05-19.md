@@ -46,3 +46,9 @@
   - Runtime now stores reusable immutable initial zero states for the configured batch size, avoiding per-step zero-state reconstruction on the default training path.
   - `find_magic_prime` now uses `(data_size - 1) // ctx_len` and validates `magic_prime * ctx_len + 1 <= data_size` to prevent `ctx_len + 1` read overrun at dataset tail.
   - Verified `uv run pytest -q`: 38 passed.
+- 2026-05-20 state-level screening training check:
+  - Confirmed `read_screening_only` screening training smoke passes.
+  - Found `read_write` from scratch could begin with `rel_write_mean=0.0` because zero slots made write keys zero.
+  - Fixed by using `slots + slot_embed` for write keys and `max(rel_write, write_rel_floor)` for update strength.
+  - Verified `read_write` smoke produced finite loss and nonzero write metrics.
+  - Verified `uv run pytest -q`: 39 passed.

@@ -37,6 +37,10 @@ def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screeni
             "active_slots_mean": stats.get("active_slots_mean", jnp.zeros(())),
             "u_norm_mean": stats.get("u_norm_mean", jnp.zeros(())),
             "rel_write_mean": stats.get("rel_write_mean", jnp.zeros(())),
+            "rel_write_effective_mean": stats.get(
+                "rel_write_effective_mean",
+                jnp.zeros(()),
+            ),
         }
         return loss, (metrics, new_rwkv_state, new_screen_state)
 

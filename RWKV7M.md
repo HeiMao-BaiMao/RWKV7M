@@ -236,6 +236,8 @@ This is intentionally not softmax attention. If all slots are irrelevant, read-o
 - write relevance modulates slot update,
 - ages accumulate through the scan and reset only for active writes.
 
+To keep from-scratch `read_write` training alive, write keys use `slots + slot_embed`, and update strength uses `max(rel_write, write_rel_floor)`. The default `write_rel_floor` is intentionally tiny and acts as a warm-up path when slots are initially zero.
+
 Initialization creates write branch parameters whenever `cfg.use_write_screening=True`, even if variables are initialized through `read_screening_only`. This allows later `read_write` apply calls without missing parameters.
 
 ## 11. Training
