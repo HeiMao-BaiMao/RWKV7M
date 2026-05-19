@@ -13,8 +13,23 @@
   - `src/model/screened_rwkv.py`: added `ModelConfig` validation; `v_first` now uses `zeros_like`; model returns updated RWKV state.
   - `src/model/__init__.py`: exports new state and phase helpers.
 - Current remaining work:
-  - Package restructure so `from rwkv7m import ...` works after `uv install --git` / `uv pip install git+...`; likely create `src/rwkv7m` and compatibility wrappers or move modules.
-  - Add explicit tests requested by user: invalid phase, write-age accumulation, read_screening_only init then read_write apply, config validation, v_first safety.
-  - Add library inference/training interface.
-  - Update README, rebuild `RWKV7M.md`, optimize/replace `RWKV7M.paper.md`.
-  - Run full `uv run pytest` and refresh CCC index after significant edits.
+  - Refresh CCC index after final docs/code edits.
+  - Commit/push docs update.
+- Commits pushed:
+  - `05d32d2 Stabilize uv lock and recurrent state handling`
+  - `c3aff04 Expose installable rwkv7m package API`
+  - `a0c6469 Harden short training schedules`
+- Library restructure completed:
+  - package root is `src/rwkv7m`
+  - hatch wheel package is `src/rwkv7m`
+  - `from rwkv7m import ...` works under `uv run`
+  - top-level runtime, inference, and train APIs are in `src/rwkv7m/api.py`
+- Added tests in `tests/test_phase_config_api.py` for invalid phases, write-age carry, read init then write apply, config validation, top-level inference API, and top-level training API.
+- Verification:
+  - `uv run pytest tests\test_screening_math.py tests\test_shapes.py tests\test_phase_config_api.py -q`: 23 passed.
+  - `uv run pytest -q`: 30 passed.
+  - public API smoke: `generate_ids` produced shape `(1, 2)` and `train_batch` produced finite loss.
+- Docs rewritten:
+  - `README.md`: install, minimal inference/training, API, scope.
+  - `RWKV7M.md`: implementation spec rebuilt around actual package and current limitations.
+  - `RWKV7M.paper.md`: optimized research draft.
