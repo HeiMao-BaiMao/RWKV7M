@@ -38,6 +38,12 @@ def test_find_magic_prime_matches_rwkv_constraints():
     assert magic_prime % 3 == 2
 
 
+def test_find_magic_prime_avoids_exact_multiple_overrun():
+    magic_prime = find_magic_prime(data_size=240, ctx_len=4)
+    assert magic_prime == 59
+    assert magic_prime * 4 + 1 <= 240
+
+
 def test_binidx_batch_dataset_returns_train_step_batch(tmp_path):
     prefix = write_demo_binidx(tmp_path)
     dataset = create_binidx_dataset(prefix, ctx_len=4, batch_size=2)

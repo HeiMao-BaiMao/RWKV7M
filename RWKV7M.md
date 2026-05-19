@@ -102,6 +102,10 @@ runtime, train_state = create_train_runtime(
 train_state, metrics = train_batch(train_state, batch, runtime)
 ```
 
+`train_batch` resets recurrent state by default. This is intentional: normal RWKV-LM-V7 style binidx training samples shuffled independent chunks. Pass `carry_state=True` only for contiguous streaming/stateful training.
+
+For JAX efficiency, `RWKV7MRuntime` keeps reusable initial zero states for the configured batch size. The default stateless training path reuses those immutable JAX arrays instead of rebuilding zero states every step.
+
 Binidx training helper:
 
 ```python
@@ -295,7 +299,7 @@ factor = int(magic_prime * ((sqrt(5) - 1) / 2))
 offset = ((factor * ii^3) % magic_prime) * ctx_len
 ```
 
-`magic_prime` is automatically computed as the largest `3n+2` prime not greater than `data_size // ctx_len`, and can also be supplied explicitly.
+`magic_prime` is automatically computed as the largest `3n+2` prime not greater than `(data_size - 1) // ctx_len`, and can also be supplied explicitly. The extra `-1` ensures that every sampled `ctx_len + 1` span remains inside the `.bin` file.
 
 CLI:
 

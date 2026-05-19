@@ -177,3 +177,33 @@ def test_top_level_train_api_runs_with_short_schedule():
     batch = generate_toy_batch(jax.random.PRNGKey(6), 1, 4, cfg.vocab_size)
     state, metrics = train_batch(state, batch, runtime)
     assert jnp.isfinite(metrics["loss"])
+
+
+def test_train_batch_resets_recurrent_state_by_default():
+    cfg = tiny_config(vocab_size=32, d_model=32, n_layers=2, n_heads=2, head_size=16)
+    runtime, state = create_train_runtime(
+        jax.random.PRNGKey(7),
+        cfg,
+        batch_size=1,
+        total_steps=2,
+    )
+    batch = generate_toy_batch(jax.random.PRNGKey(8), 1, 4, cfg.vocab_size)
+    original_wkv = runtime.rwkv_state[0].wkv
+    state, metrics = train_batch(state, batch, runtime)
+    assert jnp.isfinite(metrics["loss"])
+    assert jnp.allclose(runtime.rwkv_state[0].wkv, original_wkv)
+
+
+def test_train_batch_can_carry_state_explicitly():
+    cfg = tiny_config(vocab_size=32, d_model=32, n_layers=2, n_heads=2, head_size=16)
+    runtime, state = create_train_runtime(
+        jax.random.PRNGKey(9),
+        cfg,
+        batch_size=1,
+        total_steps=2,
+    )
+    batch = generate_toy_batch(jax.random.PRNGKey(10), 1, 4, cfg.vocab_size)
+    original_wkv = runtime.rwkv_state[0].wkv
+    state, metrics = train_batch(state, batch, runtime, carry_state=True)
+    assert jnp.isfinite(metrics["loss"])
+    assert not jnp.allclose(runtime.rwkv_state[0].wkv, original_wkv)

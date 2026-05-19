@@ -55,6 +55,8 @@ state, metrics = train_batch(state, batch, runtime)
 print(float(metrics["loss"]))
 ```
 
+`train_batch` resets recurrent state by default, which is the correct mode for independently sampled training chunks. Use `carry_state=True` only for deliberate streaming/stateful training. The default path reuses immutable initial zero states in the runtime, so it does not rebuild zero states every step for the configured batch size.
+
 ## Training From RWKV-LM-V7 `.bin/.idx`
 
 `rwkv7m` can read the same binidx dataset format used by `sample/RWKV-LM-V7`.
@@ -75,7 +77,7 @@ uv run rwkv7m-train-binidx `
   --head-size 32
 ```
 
-`magic_prime` is computed automatically from dataset size and `ctx_len`; pass `--magic-prime` to force the exact value produced by `sample/RWKV-LM-V7/data/compute_magic_prime.py`.
+`magic_prime` is computed automatically from dataset size and `ctx_len`; pass `--magic-prime` to force a specific value. The automatic value is constrained so every sampled `ctx_len + 1` span stays inside the `.bin` file.
 
 Python API:
 

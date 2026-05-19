@@ -22,6 +22,10 @@ class RWKV7MRuntime:
     variables: dict
     rwkv_state: tuple
     screen_state: object
+    config: ModelConfig
+    batch_size: int
+    initial_rwkv_state: tuple
+    initial_screen_state: object
 
 
 def create_runtime(
@@ -31,11 +35,17 @@ def create_runtime(
     batch_size: int = 1,
 ) -> RWKV7MRuntime:
     variables, model = create_model_variables(rng_key, config, batch_size)
+    rwkv_state = init_rwkv_state(batch_size, config)
+    screen_state = init_screen_state(batch_size, config.screening)
     return RWKV7MRuntime(
         model=model,
         variables=variables,
-        rwkv_state=init_rwkv_state(batch_size, config),
-        screen_state=init_screen_state(batch_size, config.screening),
+        rwkv_state=rwkv_state,
+        screen_state=screen_state,
+        config=config,
+        batch_size=batch_size,
+        initial_rwkv_state=rwkv_state,
+        initial_screen_state=screen_state,
     )
 
 
@@ -119,16 +129,30 @@ def train_batch(
     runtime: RWKV7MRuntime,
     *,
     phase="read_screening_only",
+    carry_state: bool = False,
 ):
+    if carry_state:
+        rwkv_state = runtime.rwkv_state
+        screen_state = runtime.screen_state
+    else:
+        batch_size = int(batch["input_ids"].shape[0])
+        if batch_size == runtime.batch_size:
+            rwkv_state = runtime.initial_rwkv_state
+            screen_state = runtime.initial_screen_state
+        else:
+            rwkv_state = init_rwkv_state(batch_size, runtime.config)
+            screen_state = init_screen_state(batch_size, runtime.config.screening)
+
     train_state, rwkv_state, screen_state, metrics = train_step(
         train_state,
         batch,
-        runtime.rwkv_state,
-        runtime.screen_state,
+        rwkv_state,
+        screen_state,
         phase=phase,
     )
-    runtime.rwkv_state = rwkv_state
-    runtime.screen_state = screen_state
+    if carry_state:
+        runtime.rwkv_state = rwkv_state
+        runtime.screen_state = screen_state
     runtime.variables = {"params": train_state.params}
     return train_state, metrics
 
@@ -167,6 +191,7 @@ def train_binidx(
                 batch,
                 runtime,
                 phase=phase,
+                carry_state=False,
             )
             loss = float(metrics["loss"])
             losses.append(loss)
@@ -177,9 +202,20 @@ def train_binidx(
     return losses, runtime, train_state
 
 
-def reset_runtime_state(runtime: RWKV7MRuntime, config: ModelConfig, *, batch_size: int):
+def reset_runtime_state(
+    runtime: RWKV7MRuntime,
+    config: ModelConfig | None = None,
+    *,
+    batch_size: int | None = None,
+):
+    config = config or runtime.config
+    batch_size = batch_size or runtime.batch_size
     runtime.rwkv_state = init_rwkv_state(batch_size, config)
     runtime.screen_state = init_screen_state(batch_size, config.screening)
+    runtime.config = config
+    runtime.batch_size = batch_size
+    runtime.initial_rwkv_state = runtime.rwkv_state
+    runtime.initial_screen_state = runtime.screen_state
     return runtime
 
 

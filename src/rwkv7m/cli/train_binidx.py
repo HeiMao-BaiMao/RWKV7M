@@ -103,7 +103,13 @@ def main(argv=None):
         )
         for step in range(args.steps):
             batch = dataset.get_batch(step)
-            train_state, metrics = train_batch(train_state, batch, runtime, phase=args.phase)
+            train_state, metrics = train_batch(
+                train_state,
+                batch,
+                runtime,
+                phase=args.phase,
+                carry_state=False,
+            )
             if step % args.print_every == 0 or step == args.steps - 1:
                 print(f"step={step} loss={float(metrics['loss']):.6f}")
     finally:

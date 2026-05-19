@@ -23,7 +23,7 @@ def is_prime(n):
 
 
 def find_magic_prime(data_size, ctx_len):
-    dataset_slot = int(data_size) // int(ctx_len)
+    dataset_slot = (int(data_size) - 1) // int(ctx_len)
     for candidate in range(dataset_slot, 1, -1):
         if candidate % 3 == 2 and is_prime(candidate):
             return candidate
@@ -56,7 +56,7 @@ class BinIdxBatchDataset:
         self.config = config
         self.data = MMapIndexedDataset(config.data_file)
         self.data_size = self.data.data_size
-        self.dataset_slot = self.data_size // config.ctx_len
+        self.dataset_slot = (self.data_size - 1) // config.ctx_len
         self.magic_prime = config.magic_prime or find_magic_prime(self.data_size, config.ctx_len)
         self._validate_magic_prime()
 
@@ -82,6 +82,8 @@ class BinIdxBatchDataset:
             )
         if self.data_size < self.config.ctx_len + 1:
             raise ValueError("binidx dataset is smaller than ctx_len + 1")
+        if self.magic_prime * self.config.ctx_len + 1 > self.data_size:
+            raise ValueError("magic_prime can sample beyond the end of the dataset")
 
     @property
     def samples_per_epoch(self):

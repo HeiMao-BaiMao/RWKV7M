@@ -41,3 +41,8 @@
   - Added tests in `tests/test_binidx_data.py`.
   - Verified `uv run pytest -q`: 35 passed.
   - CCC index refreshed after changes.
+- 2026-05-20 training correctness follow-up:
+  - Found and fixed a correctness issue: top-level `train_batch` carried recurrent state across shuffled training chunks. Default is now stateless/reset per batch; `carry_state=True` is explicit for streaming training.
+  - Runtime now stores reusable immutable initial zero states for the configured batch size, avoiding per-step zero-state reconstruction on the default training path.
+  - `find_magic_prime` now uses `(data_size - 1) // ctx_len` and validates `magic_prime * ctx_len + 1 <= data_size` to prevent `ctx_len + 1` read overrun at dataset tail.
+  - Verified `uv run pytest -q`: 38 passed.
