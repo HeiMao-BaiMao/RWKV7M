@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "flax>=0.12.7",
+    "jax>=0.10.0",
+    "optax>=0.2.4",
 ]
 
 [project.optional-dependencies]
@@ -13,4 +15,18 @@ cuda12 = ["jax[cuda12]>=0.10.0"]
 cuda13 = ["jax[cuda13]>=0.10.0"]
 rocm = ["jax[rocm7-local]>=0.10.0"]
 tpu = ["jax[tpu]>=0.10.0"]
-cpu = ["jax>=0.10.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
