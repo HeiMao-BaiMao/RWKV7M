@@ -1,5 +1,9 @@
 from dataclasses import dataclass
 
+import jax
+
+from ..data import create_binidx_dataset
+
 
 @dataclass(frozen=True)
 class BatchLayout:
@@ -8,6 +12,31 @@ class BatchLayout:
     per_device_batch_size: int
     process_count: int
     local_device_count: int
+
+
+@dataclass
+class HostBinIdxDataset:
+    dataset: object
+    layout: BatchLayout
+    process_index: int
+    process_count: int
+
+    @property
+    def data_size(self):
+        return self.dataset.data_size
+
+    @property
+    def magic_prime(self):
+        return self.dataset.magic_prime
+
+    def get_batch(self, step, *, epoch=0):
+        return self.dataset.get_batch(step, epoch=epoch)
+
+    def iter_batches(self, *, epoch=0, steps=None):
+        return self.dataset.iter_batches(epoch=epoch, steps=steps)
+
+    def close(self):
+        self.dataset.close()
 
 
 def compute_batch_layout(global_batch_size, *, process_count, local_device_count):
@@ -30,4 +59,45 @@ def compute_batch_layout(global_batch_size, *, process_count, local_device_count
         per_device_batch_size=process_batch_size // local_device_count,
         process_count=process_count,
         local_device_count=local_device_count,
+    )
+
+
+def create_host_binidx_dataset(
+    data_file,
+    *,
+    ctx_len,
+    global_batch_size,
+    magic_prime=None,
+    epoch_steps=None,
+    process_index=None,
+    process_count=None,
+    local_device_count=None,
+):
+    process_index = jax.process_index() if process_index is None else int(process_index)
+    process_count = jax.process_count() if process_count is None else int(process_count)
+    local_device_count = (
+        jax.local_device_count() if local_device_count is None else int(local_device_count)
+    )
+    if process_index < 0 or process_index >= process_count:
+        raise ValueError("process_index must satisfy 0 <= process_index < process_count")
+
+    layout = compute_batch_layout(
+        global_batch_size,
+        process_count=process_count,
+        local_device_count=local_device_count,
+    )
+    dataset = create_binidx_dataset(
+        data_file,
+        ctx_len=ctx_len,
+        batch_size=layout.process_batch_size,
+        magic_prime=magic_prime,
+        epoch_steps=epoch_steps,
+        rank=process_index,
+        world_size=process_count,
+    )
+    return HostBinIdxDataset(
+        dataset=dataset,
+        layout=layout,
+        process_index=process_index,
+        process_count=process_count,
     )

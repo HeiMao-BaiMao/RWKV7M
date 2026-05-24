@@ -214,10 +214,15 @@ state, config, metadata = load_train_checkpoint("out/ckpt-000001", state)
 TPU/distributed skeleton:
 
 ```python
-from rwkv7m.distributed import compute_batch_layout, make_1d_mesh
+from rwkv7m.distributed import compute_batch_layout, create_host_binidx_dataset, make_1d_mesh
 
 mesh = make_1d_mesh("data")
 layout = compute_batch_layout(128, process_count=1, local_device_count=mesh.devices.size)
+dataset = create_host_binidx_dataset(
+    "data/minipile",
+    ctx_len=512,
+    global_batch_size=128,
+)
 ```
 
 これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。完全な sharded training はまだ未実装です。
