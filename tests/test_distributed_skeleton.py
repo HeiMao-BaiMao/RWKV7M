@@ -8,6 +8,7 @@ from rwkv7m.distributed import (
     compute_batch_layout,
     create_host_binidx_dataset,
     data_parallel_sharding,
+    host_batch_to_global_arrays,
     make_1d_mesh,
     process_info,
     put_to_devices,
@@ -84,3 +85,25 @@ def test_create_host_binidx_dataset_uses_process_rank_for_sampling(tmp_path):
     finally:
         host0.close()
         host1.close()
+
+
+def test_host_batch_to_global_arrays_on_single_process(tmp_path):
+    prefix = write_distributed_binidx(tmp_path)
+    host = create_host_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        global_batch_size=2,
+        process_index=0,
+        process_count=1,
+        local_device_count=1,
+    )
+    try:
+        mesh = make_1d_mesh()
+        sharding = data_parallel_sharding(mesh)
+        batch = host.get_batch(0)
+        global_batch = host_batch_to_global_arrays(batch, sharding, host.layout)
+        assert global_batch["input_ids"].shape == (2, 4)
+        assert global_batch["target_ids"].shape == (2, 4)
+        assert global_batch["mask"].shape == (2, 4)
+    finally:
+        host.close()
