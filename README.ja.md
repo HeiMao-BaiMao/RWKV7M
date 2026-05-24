@@ -260,7 +260,9 @@ uv run rwkv7m-train-binidx-dp `
   --ctx-len 512 `
   --global-batch-size 128 `
   --steps 10 `
-  --vocab-size 65536
+  --vocab-size 65536 `
+  --output-dir out/minipile-dp `
+  --save-every 10
 ```
 
 これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。完全な sharded training はまだ未実装です。

@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import jax
 
@@ -10,6 +11,7 @@ from ..distributed import (
     replicate_train_objects,
     train_batch_data_parallel,
 )
+from ..io import load_train_checkpoint, load_train_checkpoint_metadata, save_train_checkpoint
 from .config import parse_args_with_config
 from .train_binidx import build_config
 
@@ -41,12 +43,49 @@ def parse_args(argv=None):
     parser.add_argument("--bank-ids", type=int, nargs="+", default=None)
     parser.add_argument("--screened-layers", type=int, nargs="*", default=[])
     parser.add_argument("--print-every", type=int, default=10)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--resume", default=None)
     return parse_args_with_config(parser, argv)
+
+
+def _checkpoint_path(output_dir, step):
+    return Path(output_dir) / f"ckpt-{int(step):08d}"
+
+
+def _save_checkpoint(args, dist, config, step, info):
+    if args.output_dir is None or info["process_index"] != 0:
+        return None
+    checkpoint_dir = _checkpoint_path(args.output_dir, step)
+    save_train_checkpoint(
+        checkpoint_dir,
+        jax.device_get(dist.train_state),
+        config,
+        rng_key=jax.random.PRNGKey(args.seed),
+        dataset_position={"step": int(step)},
+        metadata={
+            "data_file": args.data_file,
+            "ctx_len": args.ctx_len,
+            "global_batch_size": args.global_batch_size,
+            "process_count": info["process_count"],
+            "phase": args.phase,
+            "distributed": True,
+        },
+    )
+    print(f"saved checkpoint {checkpoint_dir}")
+    return checkpoint_dir
 
 
 def run_distributed_training(args):
     info = initialize_jax_distributed()
     mesh = make_1d_mesh("data")
+    if args.resume:
+        config, payload = load_train_checkpoint_metadata(args.resume)
+        start_step = int(payload.get("step", 0))
+    else:
+        config = build_config(args)
+        start_step = 0
+
     dataset = create_host_binidx_dataset(
         args.data_file,
         ctx_len=args.ctx_len,
@@ -57,32 +96,51 @@ def run_distributed_training(args):
         process_count=info["process_count"],
         local_device_count=info["local_device_count"],
     )
-    config = build_config(args)
     runtime, train_state = create_train_runtime(
         jax.random.PRNGKey(args.seed),
         config,
         batch_size=args.global_batch_size,
-        total_steps=args.steps,
+        total_steps=max(start_step + args.steps, 1),
     )
+    if args.resume:
+        train_state, config, _ = load_train_checkpoint(args.resume, train_state)
+        runtime.variables = {"params": train_state.params}
     dist = replicate_train_objects(runtime, train_state, mesh=mesh)
+    last_checkpoint = None
     try:
         print(
             f"process={info['process_index']}/{info['process_count']} "
             f"devices={info['local_device_count']} global_batch={args.global_batch_size} "
-            f"process_batch={dataset.layout.process_batch_size}"
+            f"process_batch={dataset.layout.process_batch_size} start_step={start_step}"
         )
-        for step in range(args.steps):
+        for local_step in range(args.steps):
+            global_step = start_step + local_step
             dist, metrics = train_batch_data_parallel(
                 dist,
-                dataset.get_batch(step),
+                dataset.get_batch(global_step),
                 dataset.layout,
                 phase=args.phase,
             )
-            if args.print_every and (step % args.print_every == 0 or step == args.steps - 1):
-                print(f"step={int(dist.train_state.step)} loss={float(metrics['loss']):.6f}")
+            completed_step = int(dist.train_state.step)
+            if args.print_every and (
+                local_step % args.print_every == 0 or local_step == args.steps - 1
+            ):
+                print(f"step={completed_step} loss={float(metrics['loss']):.6f}")
+            if (
+                args.output_dir is not None
+                and args.save_every > 0
+                and completed_step % args.save_every == 0
+            ):
+                last_checkpoint = _save_checkpoint(args, dist, config, completed_step, info)
+
+        if args.output_dir is not None:
+            final_step = int(dist.train_state.step)
+            final_path = _checkpoint_path(args.output_dir, final_step)
+            if last_checkpoint != final_path:
+                last_checkpoint = _save_checkpoint(args, dist, config, final_step, info)
     finally:
         dataset.close()
-    return dist
+    return dist, last_checkpoint
 
 
 def main(argv=None):
