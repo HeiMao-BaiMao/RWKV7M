@@ -272,6 +272,17 @@ from rwkv7m.distributed import train_batch_data_parallel
 dist, metrics = train_batch_data_parallel(dist, dataset.get_batch(0), dataset.layout)
 ```
 
+The same skeleton is available as a CLI:
+
+```powershell
+uv run rwkv7m-train-binidx-dp `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --global-batch-size 128 `
+  --steps 10 `
+  --vocab-size 65536
+```
+
 This is the first local-testable layer for TPU Research Cloud work. Full sharded training is still pending.
 
 ## Public API
