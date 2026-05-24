@@ -192,6 +192,16 @@ save_model_safetensors("out/model.safetensors", runtime.variables["params"], run
 params, config, metadata = load_model_safetensors("out/model.safetensors")
 ```
 
+Optional PyTorch checkpoint loading boundary:
+
+```python
+from rwkv7m.backends.torch import load_torch_safetensors
+
+state_dict, config, metadata = load_torch_safetensors("out/model.safetensors")
+```
+
+これは backend 境界だけです。完全な PyTorch RWKV7M runtime はまだ未実装です。
+
 Reference training checkpoint:
 
 ```python
@@ -261,7 +271,7 @@ from rwkv7m import (
 
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
-- PyTorch/non-JAX runtime backend。
+- 完全な PyTorch/non-JAX runtime backend。
 - sharded TPU checkpoint save/resume。
 - distributed training utilities。
 - long-context evaluation harnesses。
