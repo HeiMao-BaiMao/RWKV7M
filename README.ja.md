@@ -225,6 +225,14 @@ dataset = create_host_binidx_dataset(
 )
 ```
 
+reference train object は data-parallel skeleton 用に mesh 上へ配置できます:
+
+```python
+from rwkv7m.distributed import replicate_train_objects
+
+dist = replicate_train_objects(runtime, train_state, mesh=mesh)
+```
+
 これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。完全な sharded training はまだ未実装です。
 
 ## Python API
