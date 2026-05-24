@@ -23,6 +23,7 @@ tpu = ["jax[tpu]>=0.10.0,<0.11"]
 rwkv7m-train-binidx = "rwkv7m.cli.train_binidx:main"
 rwkv7m-make-binidx = "rwkv7m.cli.make_binidx:main"
 rwkv7m-bench-binidx = "rwkv7m.cli.bench_binidx:main"
+rwkv7m-eval-binidx = "rwkv7m.cli.eval_binidx:main"
 
 [build-system]
 requires = ["hatchling"]

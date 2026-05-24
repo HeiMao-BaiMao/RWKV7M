@@ -98,6 +98,17 @@ uv run rwkv7m-bench-binidx `
   --vocab-size 65536
 ```
 
+binidx data 上で validation loss/perplexity を測るには:
+
+```powershell
+uv run rwkv7m-eval-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 10 `
+  --vocab-size 65536
+```
+
 リポジトリ内の RWKV tokenizer vocabulary を使って JSONL text を binidx に変換するには:
 
 ```powershell
@@ -185,6 +196,7 @@ from rwkv7m import (
 - RWKV tokenizer API と JSONL-to-binidx 変換。
 - Flax params と model config metadata の safetensors export/import。
 - 単一プロセス用 reference training checkpoint save/load。
+- binidx validation loss/perplexity CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:

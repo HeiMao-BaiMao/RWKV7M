@@ -118,6 +118,17 @@ uv run rwkv7m-bench-binidx `
   --vocab-size 65536
 ```
 
+Validation loss/perplexity on binidx data:
+
+```powershell
+uv run rwkv7m-eval-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 10 `
+  --vocab-size 65536
+```
+
 To convert JSONL text with the repository copy of the RWKV tokenizer vocabulary:
 
 ```powershell
@@ -189,6 +200,7 @@ Lower-level modules:
 - RWKV tokenizer API and JSONL-to-binidx conversion.
 - Safetensors export/import for Flax params plus model config metadata.
 - Single-process reference training checkpoint save/load.
+- Binidx validation loss/perplexity CLI.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
