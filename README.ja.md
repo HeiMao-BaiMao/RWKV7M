@@ -100,6 +100,26 @@ uv run rwkv7m-train-binidx `
   --eval-steps 10
 ```
 
+同じ CLI は JSON config file も受け取れます。明示した CLI option は config の値を上書きします:
+
+```json
+{
+  "data_file": "data/minipile",
+  "ctx_len": 512,
+  "batch_size": 1,
+  "steps": 1000,
+  "vocab_size": 65536,
+  "output_dir": "out/minipile-smoke",
+  "save_every": 100,
+  "eval_every": 100,
+  "eval_steps": 10
+}
+```
+
+```powershell
+uv run rwkv7m-train-binidx --config configs/minipile-smoke.json --steps 2000
+```
+
 resume 時の `--steps` は、checkpoint から追加で実行する optimizer update 数です:
 
 ```powershell

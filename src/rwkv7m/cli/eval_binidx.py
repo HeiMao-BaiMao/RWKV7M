@@ -10,6 +10,7 @@ from ..data import create_binidx_dataset
 from ..io import load_model_safetensors
 from ..model import ModelConfig, ScreeningConfig
 from ..model.screened_rwkv import cross_entropy_loss
+from .config import parse_args_with_config
 
 
 def default_bank_ids(n_slots):
@@ -147,7 +148,7 @@ def parse_args(argv=None):
     parser.add_argument("--n-slots", type=int, default=4)
     parser.add_argument("--screened-layers", type=int, nargs="*", default=[])
     parser.add_argument("--print-every", type=int, default=1)
-    return parser.parse_args(argv)
+    return parse_args_with_config(parser, argv)
 
 
 def main(argv=None):

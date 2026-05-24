@@ -11,6 +11,7 @@ from ..io import (
     save_train_checkpoint,
 )
 from ..model import ModelConfig, ScreeningConfig
+from .config import parse_args_with_config
 from .eval_binidx import evaluate_binidx, parse_args as parse_eval_args
 
 
@@ -89,7 +90,7 @@ def parse_args(argv=None):
     parser.add_argument("--resume", default=None, help="Checkpoint directory to resume from")
     parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-steps", type=int, default=1)
-    return parser.parse_args(argv)
+    return parse_args_with_config(parser, argv)
 
 
 def _checkpoint_path(output_dir, step):
