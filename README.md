@@ -231,6 +231,17 @@ save_train_checkpoint("out/ckpt-000001", state, runtime.config)
 state, config, metadata = load_train_checkpoint("out/ckpt-000001", state)
 ```
 
+TPU/distributed skeleton:
+
+```python
+from rwkv7m.distributed import compute_batch_layout, make_1d_mesh
+
+mesh = make_1d_mesh("data")
+layout = compute_batch_layout(128, process_count=1, local_device_count=mesh.devices.size)
+```
+
+This is the first local-testable layer for TPU Research Cloud work. Full sharded training is still pending.
+
 ## Public API
 
 Common imports:
@@ -269,6 +280,7 @@ Lower-level modules:
 - Safetensors export/import for Flax params plus model config metadata.
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
+- Local-testable distributed mesh/sharding helpers for TPU work.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
@@ -278,7 +290,7 @@ Not yet included:
 - high-level text generation API,
 - full PyTorch/non-JAX runtime backend,
 - sharded TPU checkpoint save/resume,
-- distributed training utilities,
+- full distributed TPU trainer,
 - long-context evaluation harnesses.
 
 ## Tests

@@ -211,6 +211,17 @@ save_train_checkpoint("out/ckpt-000001", state, runtime.config)
 state, config, metadata = load_train_checkpoint("out/ckpt-000001", state)
 ```
 
+TPU/distributed skeleton:
+
+```python
+from rwkv7m.distributed import compute_batch_layout, make_1d_mesh
+
+mesh = make_1d_mesh("data")
+layout = compute_batch_layout(128, process_count=1, local_device_count=mesh.devices.size)
+```
+
+これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。完全な sharded training はまだ未実装です。
+
 ## Python API
 
 ```python
@@ -265,6 +276,7 @@ from rwkv7m import (
 - Flax params と model config metadata の safetensors export/import。
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
+- TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -273,7 +285,7 @@ from rwkv7m import (
 - pretrained RWKV checkpoint conversion。
 - 完全な PyTorch/non-JAX runtime backend。
 - sharded TPU checkpoint save/resume。
-- distributed training utilities。
+- 完全な distributed TPU trainer。
 - long-context evaluation harnesses。
 
 ## テスト
