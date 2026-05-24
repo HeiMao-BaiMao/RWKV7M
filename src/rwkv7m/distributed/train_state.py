@@ -20,8 +20,8 @@ def replicate_train_objects(runtime, train_state, *, mesh=None, axis_name="data"
     batch_sharding = data_parallel_sharding(mesh, axis_name=axis_name)
     return DistributedTrainObjects(
         train_state=put_to_devices(train_state, state_sharding),
-        rwkv_state=put_to_devices(runtime.initial_rwkv_state, state_sharding),
-        screen_state=put_to_devices(runtime.initial_screen_state, state_sharding),
+        rwkv_state=put_to_devices(runtime.initial_rwkv_state, batch_sharding),
+        screen_state=put_to_devices(runtime.initial_screen_state, batch_sharding),
         mesh=mesh,
         batch_sharding=batch_sharding,
         state_sharding=state_sharding,

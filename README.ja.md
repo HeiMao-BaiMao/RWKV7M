@@ -244,6 +244,14 @@ from rwkv7m.distributed import replicate_train_objects
 dist = replicate_train_objects(runtime, train_state, mesh=mesh)
 ```
 
+ローカルテスト可能な data-parallel train step 境界は次です:
+
+```python
+from rwkv7m.distributed import train_batch_data_parallel
+
+dist, metrics = train_batch_data_parallel(dist, dataset.get_batch(0), dataset.layout)
+```
+
 これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。完全な sharded training はまだ未実装です。
 
 ## Python API

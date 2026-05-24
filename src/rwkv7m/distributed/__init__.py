@@ -13,6 +13,7 @@ from .sharding import (
     replicated_sharding,
 )
 from .train_state import DistributedTrainObjects, replicate_train_objects
+from .trainer import train_batch_data_parallel
 
 __all__ = [
     "BatchLayout",
@@ -29,4 +30,5 @@ __all__ = [
     "host_batch_to_global_arrays",
     "DistributedTrainObjects",
     "replicate_train_objects",
+    "train_batch_data_parallel",
 ]
