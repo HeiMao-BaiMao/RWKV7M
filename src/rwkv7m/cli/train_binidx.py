@@ -1,10 +1,17 @@
 import argparse
+from pathlib import Path
 
 import jax
 
 from ..api import create_train_runtime, train_batch
 from ..data import create_binidx_dataset
+from ..io import (
+    load_train_checkpoint,
+    load_train_checkpoint_metadata,
+    save_train_checkpoint,
+)
 from ..model import ModelConfig, ScreeningConfig
+from .eval_binidx import evaluate_binidx, parse_args as parse_eval_args
 
 
 def build_config(args):
@@ -77,32 +84,107 @@ def parse_args(argv=None):
     parser.add_argument("--bank-ids", type=int, nargs="+", default=None)
     parser.add_argument("--screened-layers", type=int, nargs="*", default=[])
     parser.add_argument("--print-every", type=int, default=10)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--resume", default=None, help="Checkpoint directory to resume from")
+    parser.add_argument("--eval-every", type=int, default=0)
+    parser.add_argument("--eval-steps", type=int, default=1)
     return parser.parse_args(argv)
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    cfg = build_config(args)
+def _checkpoint_path(output_dir, step):
+    return Path(output_dir) / f"ckpt-{int(step):08d}"
+
+
+def _save_checkpoint(args, train_state, cfg, step):
+    if args.output_dir is None:
+        return None
+    checkpoint_dir = _checkpoint_path(args.output_dir, step)
+    save_train_checkpoint(
+        checkpoint_dir,
+        train_state,
+        cfg,
+        rng_key=jax.random.PRNGKey(args.seed),
+        dataset_position={"step": int(step)},
+        metadata={
+            "data_file": args.data_file,
+            "ctx_len": args.ctx_len,
+            "batch_size": args.batch_size,
+            "phase": args.phase,
+            "total_requested_steps": args.steps,
+        },
+    )
+    print(f"saved checkpoint {checkpoint_dir}")
+    return checkpoint_dir
+
+
+def _run_eval(args, checkpoint_dir, step):
+    if checkpoint_dir is None:
+        return None
+    eval_argv = [
+        "--data-file",
+        args.data_file,
+        "--checkpoint",
+        str(checkpoint_dir),
+        "--ctx-len",
+        str(args.ctx_len),
+        "--batch-size",
+        str(args.batch_size),
+        "--steps",
+        str(args.eval_steps),
+        "--seed",
+        str(args.seed),
+        "--phase",
+        args.phase,
+        "--print-every",
+        "0",
+    ]
+    if args.magic_prime is not None:
+        eval_argv.extend(["--magic-prime", str(args.magic_prime)])
+    eval_args = parse_eval_args(eval_argv)
+    metrics = evaluate_binidx(eval_args)
+    print(
+        f"eval step={step} loss={metrics['loss']:.6f} "
+        f"perplexity={metrics['perplexity']:.6f}"
+    )
+    return metrics
+
+
+def run_training(args):
+    if args.resume:
+        cfg, payload = load_train_checkpoint_metadata(args.resume)
+        start_step = int(payload.get("step", 0))
+    else:
+        cfg = build_config(args)
+        start_step = 0
+
     dataset = create_binidx_dataset(
         args.data_file,
         ctx_len=args.ctx_len,
         batch_size=args.batch_size,
         magic_prime=args.magic_prime,
-        epoch_steps=args.steps,
+        epoch_steps=max(args.steps, 1),
     )
+    total_steps = max(start_step + args.steps, 1)
     runtime, train_state = create_train_runtime(
         jax.random.PRNGKey(args.seed),
         cfg,
         batch_size=args.batch_size,
-        total_steps=args.steps,
+        total_steps=total_steps,
     )
+    if args.resume:
+        train_state, cfg, _ = load_train_checkpoint(args.resume, train_state)
+        runtime.variables = {"params": train_state.params}
+
+    last_checkpoint = None
     try:
         print(
             f"data_tokens={dataset.data_size} magic_prime={dataset.magic_prime} "
-            f"ctx_len={args.ctx_len} batch_size={args.batch_size}"
+            f"ctx_len={args.ctx_len} batch_size={args.batch_size} start_step={start_step}"
         )
-        for step in range(args.steps):
-            batch = dataset.get_batch(step)
+        for local_step in range(args.steps):
+            global_step = start_step + local_step
+            batch = dataset.get_batch(global_step)
             train_state, metrics = train_batch(
                 train_state,
                 batch,
@@ -110,10 +192,43 @@ def main(argv=None):
                 phase=args.phase,
                 carry_state=False,
             )
-            if step % args.print_every == 0 or step == args.steps - 1:
-                print(f"step={step} loss={float(metrics['loss']):.6f}")
+            completed_step = int(train_state.step)
+            if args.print_every and (
+                local_step % args.print_every == 0 or local_step == args.steps - 1
+            ):
+                print(f"step={completed_step} loss={float(metrics['loss']):.6f}")
+
+            should_save = (
+                args.output_dir is not None
+                and args.save_every > 0
+                and completed_step % args.save_every == 0
+            )
+            if should_save:
+                last_checkpoint = _save_checkpoint(args, train_state, cfg, completed_step)
+
+            should_eval = (
+                args.eval_every > 0
+                and completed_step % args.eval_every == 0
+                and args.output_dir is not None
+            )
+            if should_eval:
+                if last_checkpoint is None or last_checkpoint.name != f"ckpt-{completed_step:08d}":
+                    last_checkpoint = _save_checkpoint(args, train_state, cfg, completed_step)
+                _run_eval(args, last_checkpoint, completed_step)
+
+        if args.output_dir is not None:
+            final_step = int(train_state.step)
+            final_path = _checkpoint_path(args.output_dir, final_step)
+            if last_checkpoint != final_path:
+                last_checkpoint = _save_checkpoint(args, train_state, cfg, final_step)
     finally:
         dataset.close()
+    return train_state, runtime, last_checkpoint
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_training(args)
 
 
 if __name__ == "__main__":

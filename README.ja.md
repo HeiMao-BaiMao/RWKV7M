@@ -85,6 +85,33 @@ uv run rwkv7m-train-binidx `
   --head-size 32
 ```
 
+reference checkpoint と periodic eval 付きで長めに回す例:
+
+```powershell
+uv run rwkv7m-train-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 1000 `
+  --vocab-size 65536 `
+  --output-dir out/minipile-smoke `
+  --save-every 100 `
+  --eval-every 100 `
+  --eval-steps 10
+```
+
+resume 時の `--steps` は、checkpoint から追加で実行する optimizer update 数です:
+
+```powershell
+uv run rwkv7m-train-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 1000 `
+  --resume out/minipile-smoke/ckpt-00001000 `
+  --output-dir out/minipile-smoke
+```
+
 `magic_prime` は dataset size と `ctx_len` から自動計算されます。特定の値を強制したい場合は `--magic-prime` を指定してください。自動計算値は、すべての `ctx_len + 1` span が `.bin` ファイル内に収まるよう制約されます。
 
 同じ binidx data 上で baseline / screening / read_write を素早く比較するには:

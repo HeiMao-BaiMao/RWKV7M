@@ -85,6 +85,33 @@ uv run rwkv7m-train-binidx `
   --head-size 32
 ```
 
+Longer run with reference checkpoints and periodic eval:
+
+```powershell
+uv run rwkv7m-train-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 1000 `
+  --vocab-size 65536 `
+  --output-dir out/minipile-smoke `
+  --save-every 100 `
+  --eval-every 100 `
+  --eval-steps 10
+```
+
+Resume runs continue for `--steps` additional optimizer updates:
+
+```powershell
+uv run rwkv7m-train-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 1000 `
+  --resume out/minipile-smoke/ckpt-00001000 `
+  --output-dir out/minipile-smoke
+```
+
 `magic_prime` is computed automatically from dataset size and `ctx_len`; pass `--magic-prime` to force a specific value. The automatic value is constrained so every sampled `ctx_len + 1` span stays inside the `.bin` file.
 
 For read/write screening from scratch, the write branch uses slot identity in its write key and a tiny `write_rel_floor` update floor. This avoids a dead write branch when slots are all zero at initialization.
