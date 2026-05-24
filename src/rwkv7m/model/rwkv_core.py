@@ -1,6 +1,6 @@
 """RWKV-7 core implementation in JAX/Flax.
 
-Reference: sample/RWKV-LM-V7/src/model.py (slow PyTorch paths)
+Reference implementation for RWKV-7 style recurrent blocks.
 """
 
 import math

@@ -104,7 +104,7 @@ class BinIdxBatchDataset:
     def get_sequence(self, sample_index, *, epoch=0):
         offset = self.sample_offset(sample_index, epoch=epoch)
         req_len = self.config.ctx_len + 1
-        return self.data.get(idx=0, offset=offset, length=req_len).astype(np.int32)
+        return self.data.get_global(offset=offset, length=req_len).astype(np.int32)
 
     def get_example(self, sample_index, *, epoch=0):
         tokens = self.get_sequence(sample_index, epoch=epoch)

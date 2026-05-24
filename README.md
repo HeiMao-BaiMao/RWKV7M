@@ -1,5 +1,7 @@
 # rwkv7m
 
+[日本語 README](README.ja.md)
+
 JAX/Flax reference implementation of an RWKV-7 style recurrent language model with optional state-level screening memory.
 
 This repository is research-oriented. The current implementation is optimized for correctness, tests, and API usability before custom kernels or checkpoint compatibility.
@@ -59,14 +61,20 @@ print(float(metrics["loss"]))
 
 ## Training From RWKV-LM-V7 `.bin/.idx`
 
-`rwkv7m` can read the same binidx dataset format used by `sample/RWKV-LM-V7`.
-Prepare data with `sample/RWKV-LM-V7/data/make_data.py` or any compatible tool, then pass the prefix path without `.bin` / `.idx`.
+`rwkv7m` can read the same binidx dataset format used by RWKV-LM-V7.
+Download the tokenized Minipile dataset into `data/`, then pass the prefix path without `.bin` / `.idx`.
+
+```powershell
+New-Item -ItemType Directory -Force data
+wget -O data/minipile.idx https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.idx
+wget -O data/minipile.bin https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.bin
+```
 
 CLI smoke run:
 
 ```powershell
 uv run rwkv7m-train-binidx `
-  --data-file sample/RWKV-LM-V7/data/demo `
+  --data-file data/minipile `
   --ctx-len 512 `
   --batch-size 1 `
   --steps 100 `
@@ -91,12 +99,29 @@ cfg = tiny_config(vocab_size=65536, d_model=128, n_layers=4, n_heads=4, head_siz
 losses, runtime, state = train_binidx(
     jax.random.PRNGKey(0),
     cfg,
-    "sample/RWKV-LM-V7/data/demo",
+    "data/minipile",
     ctx_len=512,
     batch_size=1,
     num_steps=100,
 )
 print(losses[-1])
+```
+
+Quick baseline/screening comparison on the same binidx data:
+
+```powershell
+uv run rwkv7m-bench-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 10 `
+  --vocab-size 65536
+```
+
+To convert JSONL text with the repository copy of the RWKV tokenizer vocabulary:
+
+```powershell
+uv run rwkv7m-make-binidx data/my_corpus.jsonl --output-prefix data/my_corpus --ctx-len 512
 ```
 
 ## Public API

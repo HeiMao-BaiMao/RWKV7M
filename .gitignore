@@ -1,5 +1,7 @@
 __pycache__
 /.venv
 /sample
+/data/*.bin
+/data/*.idx
 # CocoIndex Code (ccc)
 /.cocoindex_code/

@@ -217,6 +217,21 @@ class MMapIndexedDataset:
             offset=ptr,
         )
 
+    def get_global(self, offset=0, length=None):
+        if length is None:
+            length = self.data_size - int(offset)
+        offset = int(offset)
+        length = int(length)
+        if offset < 0 or length < 0 or offset + length > self.data_size:
+            raise IndexError("requested global binidx span is outside data buffer")
+        byte_offset = offset * np.dtype(self._index.dtype).itemsize
+        return np.frombuffer(
+            self._bin_buffer,
+            dtype=self._index.dtype,
+            count=length,
+            offset=byte_offset,
+        )
+
     @property
     def sizes(self):
         return self._index.sizes
