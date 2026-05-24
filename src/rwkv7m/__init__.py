@@ -31,9 +31,12 @@ from .model import (
 from .model.screened_rwkv import cross_entropy_loss, create_model_variables
 from .io import (
     load_model_safetensors,
+    load_train_checkpoint,
+    load_train_checkpoint_metadata,
     model_config_from_dict,
     model_config_to_dict,
     save_model_safetensors,
+    save_train_checkpoint,
 )
 from .tokenizer import RWKVTokenizer
 
@@ -72,5 +75,8 @@ __all__ = [
     "model_config_to_dict",
     "save_model_safetensors",
     "load_model_safetensors",
+    "save_train_checkpoint",
+    "load_train_checkpoint",
+    "load_train_checkpoint_metadata",
     "RWKVTokenizer",
 ]

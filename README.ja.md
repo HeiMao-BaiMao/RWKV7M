@@ -123,6 +123,15 @@ save_model_safetensors("out/model.safetensors", runtime.variables["params"], run
 params, config, metadata = load_model_safetensors("out/model.safetensors")
 ```
 
+Reference training checkpoint:
+
+```python
+from rwkv7m import load_train_checkpoint, save_train_checkpoint
+
+save_train_checkpoint("out/ckpt-000001", state, runtime.config)
+state, config, metadata = load_train_checkpoint("out/ckpt-000001", state)
+```
+
 ## Python API
 
 ```python
@@ -175,6 +184,7 @@ from rwkv7m import (
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
 - RWKV tokenizer API と JSONL-to-binidx 変換。
 - Flax params と model config metadata の safetensors export/import。
+- 単一プロセス用 reference training checkpoint save/load。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -182,7 +192,7 @@ from rwkv7m import (
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
 - 高水準 text generation API。
-- 完全な training checkpoint save/resume。
+- sharded TPU checkpoint save/resume。
 - distributed training utilities。
 - long-context evaluation harnesses。
 

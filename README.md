@@ -143,6 +143,15 @@ save_model_safetensors("out/model.safetensors", runtime.variables["params"], run
 params, config, metadata = load_model_safetensors("out/model.safetensors")
 ```
 
+Reference training checkpoint:
+
+```python
+from rwkv7m import load_train_checkpoint, save_train_checkpoint
+
+save_train_checkpoint("out/ckpt-000001", state, runtime.config)
+state, config, metadata = load_train_checkpoint("out/ckpt-000001", state)
+```
+
 ## Public API
 
 Common imports:
@@ -179,6 +188,7 @@ Lower-level modules:
 - State-level screening with `read_screening_only` and `read_write` phases.
 - RWKV tokenizer API and JSONL-to-binidx conversion.
 - Safetensors export/import for Flax params plus model config metadata.
+- Single-process reference training checkpoint save/load.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
@@ -186,7 +196,7 @@ Not yet included:
 - production fused RWKV kernels,
 - pretrained RWKV checkpoint conversion,
 - high-level text generation API,
-- full training checkpoint save/resume,
+- sharded TPU checkpoint save/resume,
 - distributed training utilities,
 - long-context evaluation harnesses.
 
