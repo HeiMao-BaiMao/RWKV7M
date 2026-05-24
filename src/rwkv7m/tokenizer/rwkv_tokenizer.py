@@ -1,4 +1,5 @@
 import ast
+from importlib.resources import files
 from pathlib import Path
 
 
@@ -38,7 +39,14 @@ class Trie:
 
 
 def default_vocab_path():
-    return Path(__file__).resolve().parents[3] / "data" / "rwkv_vocab_v20230424.txt"
+    repo_copy = Path(__file__).resolve().parents[3] / "data" / "rwkv_vocab_v20230424.txt"
+    if repo_copy.exists():
+        return repo_copy
+
+    asset = files("rwkv7m.assets").joinpath("rwkv_vocab_v20230424.txt")
+    if asset.is_file():
+        return Path(str(asset))
+    return repo_copy
 
 
 class RWKVTokenizer:

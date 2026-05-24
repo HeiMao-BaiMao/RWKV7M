@@ -322,6 +322,7 @@ Lower-level modules:
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
 - State-level screening with `read_screening_only` and `read_write` phases.
 - RWKV tokenizer API and JSONL-to-binidx conversion.
+- Wheel-packaged RWKV tokenizer vocabulary fallback.
 - Safetensors export/import for Flax params plus model config metadata.
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.

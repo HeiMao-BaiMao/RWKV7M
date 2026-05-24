@@ -318,6 +318,7 @@ from rwkv7m import (
 - reference RWKV state の chunked inference state carry。
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
 - RWKV tokenizer API と JSONL-to-binidx 変換。
+- wheel に同梱される RWKV tokenizer vocabulary fallback。
 - Flax params と model config metadata の safetensors export/import。
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
