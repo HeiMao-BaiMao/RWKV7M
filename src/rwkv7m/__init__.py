@@ -29,6 +29,12 @@ from .model import (
     normalize_phase,
 )
 from .model.screened_rwkv import cross_entropy_loss, create_model_variables
+from .io import (
+    load_model_safetensors,
+    model_config_from_dict,
+    model_config_to_dict,
+    save_model_safetensors,
+)
 from .tokenizer import RWKVTokenizer
 
 __all__ = [
@@ -62,5 +68,9 @@ __all__ = [
     "RWKV7Config",
     "create_model_variables",
     "cross_entropy_loss",
+    "model_config_from_dict",
+    "model_config_to_dict",
+    "save_model_safetensors",
+    "load_model_safetensors",
     "RWKVTokenizer",
 ]

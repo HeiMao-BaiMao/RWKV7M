@@ -134,6 +134,15 @@ ids = tokenizer.encode("Hello RWKV", add_eos=True)
 text = tokenizer.decode(ids[:-1])
 ```
 
+Safetensors export/import:
+
+```python
+from rwkv7m import load_model_safetensors, save_model_safetensors
+
+save_model_safetensors("out/model.safetensors", runtime.variables["params"], runtime.config)
+params, config, metadata = load_model_safetensors("out/model.safetensors")
+```
+
 ## Public API
 
 Common imports:
@@ -169,6 +178,7 @@ Lower-level modules:
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
 - State-level screening with `read_screening_only` and `read_write` phases.
 - RWKV tokenizer API and JSONL-to-binidx conversion.
+- Safetensors export/import for Flax params plus model config metadata.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
@@ -176,6 +186,7 @@ Not yet included:
 - production fused RWKV kernels,
 - pretrained RWKV checkpoint conversion,
 - high-level text generation API,
+- full training checkpoint save/resume,
 - distributed training utilities,
 - long-context evaluation harnesses.
 

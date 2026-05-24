@@ -114,6 +114,15 @@ ids = tokenizer.encode("Hello RWKV", add_eos=True)
 text = tokenizer.decode(ids[:-1])
 ```
 
+Safetensors export/import:
+
+```python
+from rwkv7m import load_model_safetensors, save_model_safetensors
+
+save_model_safetensors("out/model.safetensors", runtime.variables["params"], runtime.config)
+params, config, metadata = load_model_safetensors("out/model.safetensors")
+```
+
 ## Python API
 
 ```python
@@ -165,6 +174,7 @@ from rwkv7m import (
 - reference RWKV state の chunked inference state carry。
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
 - RWKV tokenizer API と JSONL-to-binidx 変換。
+- Flax params と model config metadata の safetensors export/import。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -172,6 +182,7 @@ from rwkv7m import (
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
 - 高水準 text generation API。
+- 完全な training checkpoint save/resume。
 - distributed training utilities。
 - long-context evaluation harnesses。
 
