@@ -12,6 +12,7 @@ from .model.screened_rwkv import (
     init_rwkv_state,
 )
 from .model.state import init_screen_state
+from .tokenizer import RWKVTokenizer
 from .train.train_loop import build_train_state
 from .train.train_step import train_step
 
@@ -121,6 +122,37 @@ def generate_ids(
     runtime.rwkv_state = rwkv_state
     runtime.screen_state = screen_state
     return ids
+
+
+def generate_text(
+    runtime: RWKV7MRuntime,
+    prompt: str,
+    *,
+    tokenizer: RWKVTokenizer | None = None,
+    max_new_tokens=50,
+    temperature=1.0,
+    top_p=0.9,
+    rng_key=None,
+    phase="read_screening_only",
+    include_prompt: bool = True,
+):
+    tokenizer = tokenizer or RWKVTokenizer()
+    prompt_ids = tokenizer.encode(prompt)
+    if not prompt_ids:
+        raise ValueError("prompt must encode to at least one token")
+    prompt_array = jnp.asarray([prompt_ids], dtype=jnp.int32)
+    new_ids = generate_ids(
+        runtime,
+        prompt_array,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        rng_key=rng_key,
+        phase=phase,
+    )
+    generated_ids = [int(x) for x in list(new_ids[0])]
+    output_ids = prompt_ids + generated_ids if include_prompt else generated_ids
+    return tokenizer.decode(output_ids)
 
 
 def train_batch(
@@ -260,6 +292,7 @@ __all__ = [
     "infer_prefill",
     "infer_next",
     "generate_ids",
+    "generate_text",
     "train_batch",
     "train_binidx",
     "reset_runtime_state",

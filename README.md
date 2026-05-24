@@ -192,6 +192,17 @@ ids = tokenizer.encode("Hello RWKV", add_eos=True)
 text = tokenizer.decode(ids[:-1])
 ```
 
+Text generation from a safetensors checkpoint:
+
+```powershell
+uv run rwkv7m-generate `
+  --checkpoint out/minipile-smoke/ckpt-00001000 `
+  --prompt "Hello" `
+  --max-new-tokens 64 `
+  --temperature 0.8 `
+  --top-p 0.9
+```
+
 Safetensors export/import:
 
 ```python
@@ -255,6 +266,7 @@ Not yet included:
 - production fused RWKV kernels,
 - pretrained RWKV checkpoint conversion,
 - high-level text generation API,
+- PyTorch/non-JAX runtime backend,
 - sharded TPU checkpoint save/resume,
 - distributed training utilities,
 - long-context evaluation harnesses.
