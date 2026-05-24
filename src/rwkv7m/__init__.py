@@ -29,6 +29,7 @@ from .model import (
     normalize_phase,
 )
 from .model.screened_rwkv import cross_entropy_loss, create_model_variables
+from .tokenizer import RWKVTokenizer
 
 __all__ = [
     "RWKV7MRuntime",
@@ -61,4 +62,5 @@ __all__ = [
     "RWKV7Config",
     "create_model_variables",
     "cross_entropy_loss",
+    "RWKVTokenizer",
 ]

@@ -104,6 +104,16 @@ uv run rwkv7m-bench-binidx `
 uv run rwkv7m-make-binidx data/my_corpus.jsonl --output-prefix data/my_corpus --ctx-len 512
 ```
 
+Tokenizer API:
+
+```python
+from rwkv7m import RWKVTokenizer
+
+tokenizer = RWKVTokenizer()
+ids = tokenizer.encode("Hello RWKV", add_eos=True)
+text = tokenizer.decode(ids[:-1])
+```
+
 ## Python API
 
 ```python
@@ -154,13 +164,14 @@ from rwkv7m import (
 - RWKV-LM-V7 互換 `.bin/.idx` dataset reader と sampler。
 - reference RWKV state の chunked inference state carry。
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
+- RWKV tokenizer API と JSONL-to-binidx 変換。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
 
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
-- tokenizer 統合 API。
+- 高水準 text generation API。
 - distributed training utilities。
 - long-context evaluation harnesses。
 

@@ -124,6 +124,16 @@ To convert JSONL text with the repository copy of the RWKV tokenizer vocabulary:
 uv run rwkv7m-make-binidx data/my_corpus.jsonl --output-prefix data/my_corpus --ctx-len 512
 ```
 
+Tokenizer API:
+
+```python
+from rwkv7m import RWKVTokenizer
+
+tokenizer = RWKVTokenizer()
+ids = tokenizer.encode("Hello RWKV", add_eos=True)
+text = tokenizer.decode(ids[:-1])
+```
+
 ## Public API
 
 Common imports:
@@ -158,13 +168,14 @@ Lower-level modules:
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
 - State-level screening with `read_screening_only` and `read_write` phases.
+- RWKV tokenizer API and JSONL-to-binidx conversion.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
 
 - production fused RWKV kernels,
 - pretrained RWKV checkpoint conversion,
-- tokenizer integration,
+- high-level text generation API,
 - distributed training utilities,
 - long-context evaluation harnesses.
 
