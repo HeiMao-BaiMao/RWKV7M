@@ -265,13 +265,14 @@ uv run rwkv7m-train-binidx-dp `
   --vocab-size 65536 `
   --output-dir out/minipile-dp `
   --save-every 10 `
+  --checkpoint-backend orbax `
   --keep-last-checkpoints 3 `
   --eval-every 10 `
   --eval-steps 2 `
   --prefetch-size 2
 ```
 
-これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。process-aware checkpoint、checkpoint rotation、structured JSONL/CSV metrics、periodic validation、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を含みます。完全に調整された sharded optimizer/parameter checkpointing はまだ未実装です。
+これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。process-aware Flax checkpoint、TPU-scale run 向け Orbax train-state checkpoint、checkpoint rotation、structured JSONL/CSV metrics、periodic validation、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を含みます。実 TPU pod 上での完全な sharded checkpoint policy 検証はまだ未実施です。
 
 TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md) にあります。
 
@@ -333,7 +334,7 @@ from rwkv7m import (
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
-- process-aware checkpoint、checkpoint rotation、structured JSONL/CSV logs、validation hook、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
+- process-aware Flax checkpoint、Orbax train-state checkpoint、checkpoint rotation、structured JSONL/CSV logs、validation hook、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -342,7 +343,7 @@ from rwkv7m import (
 - pretrained RWKV checkpoint conversion。
 - repository 内 PyTorch/non-JAX runtime backend（意図的に対象外）。
 - 完全に調整された per-parameter TPU sharding rules。
-- sharded TPU optimizer/parameter checkpoint save/resume。
+- 実 TPU pod 上での Orbax sharded optimizer/parameter checkpoint save/resume 検証。
 - 実 TPU pod 上で検証済みの production-scale distributed TPU trainer。
 - long-context evaluation harnesses。
 

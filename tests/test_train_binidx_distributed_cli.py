@@ -178,3 +178,59 @@ def test_distributed_binidx_training_cli_logs_eval_and_rotates(tmp_path):
     ]
     assert [record["split"] for record in records].count("train") == 3
     assert any(record["split"] == "eval" for record in records)
+
+
+def test_distributed_binidx_training_cli_orbax_checkpoint_roundtrip(tmp_path):
+    prefix = write_dp_train_data(tmp_path)
+    output_dir = tmp_path / "orbax"
+    base = [
+        "--data-file",
+        prefix,
+        "--ctx-len",
+        "4",
+        "--global-batch-size",
+        "1",
+        "--steps",
+        "1",
+        "--vocab-size",
+        "32",
+        "--d-model",
+        "32",
+        "--d-ffn",
+        "64",
+        "--n-layers",
+        "2",
+        "--n-heads",
+        "2",
+        "--head-size",
+        "16",
+        "--d-slot",
+        "16",
+        "--d-k",
+        "16",
+        "--d-v",
+        "16",
+        "--output-dir",
+        str(output_dir),
+        "--save-every",
+        "1",
+        "--checkpoint-backend",
+        "orbax",
+        "--print-every",
+        "0",
+    ]
+    dist, checkpoint = run_distributed_training(parse_args(base))
+    assert int(dist.train_state.step) == 1
+    assert checkpoint == output_dir / "ckpt-00000001"
+    assert (checkpoint / "checkpoint.json").exists()
+    assert (checkpoint / "orbax_train_state").exists()
+
+    _, payload = load_train_checkpoint_metadata(checkpoint)
+    assert payload["backend"] == "orbax"
+    assert payload["metadata"]["distributed"] is True
+
+    resumed, resumed_checkpoint = run_distributed_training(
+        parse_args([*base, "--resume", str(checkpoint)])
+    )
+    assert int(resumed.train_state.step) == 2
+    assert resumed_checkpoint == output_dir / "ckpt-00000002"

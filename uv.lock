@@ -1005,6 +1005,7 @@ dependencies = [
     { name = "jax" },
     { name = "numpy" },
     { name = "optax" },
+    { name = "orbax-checkpoint" },
     { name = "safetensors" },
     { name = "zipp" },
 ]
@@ -1038,6 +1039,7 @@ requires-dist = [
     { name = "jax", extras = ["tpu"], marker = "extra == 'tpu'", specifier = ">=0.10.0,<0.11" },
     { name = "numpy", specifier = ">=2.2,<2.4" },
     { name = "optax", specifier = ">=0.2.4,<0.3" },
+    { name = "orbax-checkpoint", specifier = ">=0.11.39,<0.12" },
     { name = "safetensors", specifier = ">=0.7.0" },
     { name = "zipp", specifier = ">=3.20,<4.1" },
 ]

@@ -2,7 +2,7 @@
 
 This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 
-Still pending: fully tuned per-parameter sharding rules, sharded optimizer/parameter checkpointing, and production-scale validation on real TPU pods.
+Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy validation on real TPU pods, and production-scale throughput tuning.
 
 ## Install
 
@@ -57,6 +57,7 @@ uv run rwkv7m-train-binidx-dp `
   --steps 1000 `
   --output-dir out/tpu-run `
   --save-every 100 `
+  --checkpoint-backend orbax `
   --keep-last-checkpoints 3 `
   --eval-every 100 `
   --eval-steps 10 `
@@ -94,19 +95,25 @@ Implemented:
 - train/eval step boundaries for local distributed tests.
 - recurrent/screening state reset by default for independent binidx chunks.
 - process 0 checkpoint writing and checkpoint rotation.
+- Orbax train-state checkpoint writing for TPU-scale runs.
 - `run_config.json`, `metrics.jsonl`, and `metrics.csv` output.
 - safetensors artifacts with model and tokenizer metadata for external runtimes.
 
 Pending:
 
 - tuned sharding specs per parameter group.
-- sharded optimizer/parameter checkpointing rather than process 0 materialization.
+- real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
 - TPU pod throughput tuning and failure recovery drills.
 - long-context evaluation harnesses.
 
 ## Resume
 
-Only process 0 writes the current data-parallel checkpoint boundary:
+Two checkpoint backends are available:
+
+- `--checkpoint-backend flax`: process 0 materializes and writes `train_state.msgpack` plus `model.safetensors`; this remains the default and is useful for small/local runs and portable artifact export.
+- `--checkpoint-backend orbax`: all processes write an Orbax train-state checkpoint under `orbax_train_state`, while process 0 writes `checkpoint.json`; use this for TPU-scale runs where materializing the full train state on process 0 is not viable.
+
+Resume works for both backends:
 
 ```powershell
 uv run rwkv7m-train-binidx-dp `

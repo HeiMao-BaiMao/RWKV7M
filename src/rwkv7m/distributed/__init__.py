@@ -10,9 +10,11 @@ from .checkpoint import (
     checkpoint_path,
     list_checkpoint_dirs,
     load_distributed_checkpoint_metadata,
+    load_orbax_train_state,
     restore_distributed_train_state,
     rotate_checkpoints,
     save_data_parallel_checkpoint,
+    save_orbax_train_state,
 )
 from .metrics import aggregate_metrics, mean_metric_dict, metrics_to_host_dict, write_metric_record
 from .partitioning import (
@@ -51,9 +53,11 @@ __all__ = [
     "checkpoint_path",
     "list_checkpoint_dirs",
     "load_distributed_checkpoint_metadata",
+    "load_orbax_train_state",
     "restore_distributed_train_state",
     "rotate_checkpoints",
     "save_data_parallel_checkpoint",
+    "save_orbax_train_state",
     "aggregate_metrics",
     "mean_metric_dict",
     "metrics_to_host_dict",

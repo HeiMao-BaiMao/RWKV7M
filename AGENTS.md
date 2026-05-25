@@ -22,7 +22,7 @@ The current implementation is still a reference path:
 - optional state-level screening memory.
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - small training and benchmark CLIs.
-- local-testable TPU/distributed data-parallel training CLI with process-aware checkpointing, checkpoint rotation, validation hooks, structured metrics, prefetching, and multi-axis mesh hooks.
+- local-testable TPU/distributed data-parallel training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation, validation hooks, structured metrics, prefetching, and multi-axis mesh hooks.
 - repository-local RWKV tokenizer vocabulary at `data/rwkv_vocab_v20230424.txt`.
 
 Do not use ignored `sample/` files as runtime dependencies. If useful material exists under `sample/`, copy the required artifact into tracked project-owned paths and make code depend on that tracked copy.
@@ -31,7 +31,7 @@ Do not use ignored `sample/` files as runtime dependencies. If useful material e
 
 1. Prepare TPU Research Cloud training.
    - Replace the current basic rule-based placement with tuned per-parameter sharding rules validated on TPU.
-   - Add sharded optimizer/parameter checkpointing rather than process 0 materialization.
+   - Validate Orbax train-state checkpointing on real TPU pods and harden sharded checkpoint policy.
    - Validate and tune throughput on real TPU pods.
    - Add failure recovery drills and resume documentation from interrupted TPU runs.
 
@@ -88,7 +88,7 @@ The distributed trainer should own:
 - validation hooks,
 - metric aggregation.
 
-Current distributed code already covers the local-testable data-parallel layer, structured metrics, validation hook, checkpoint rotation, and mesh construction. The remaining TPU work is deeper sharding policy, sharded checkpointing, and real TPU throughput validation.
+Current distributed code already covers the local-testable data-parallel layer, structured metrics, validation hook, checkpoint rotation, Orbax train-state checkpointing, and mesh construction. The remaining TPU work is deeper sharding policy, checkpoint validation on real TPU pods, and throughput tuning.
 
 Keep the existing `train_binidx` API as a smoke/reference path.
 

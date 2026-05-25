@@ -59,6 +59,7 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--keep-last-checkpoints", type=int, default=0)
+    parser.add_argument("--checkpoint-backend", choices=["flax", "orbax"], default="flax")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--prefetch-size", type=int, default=2)
     parser.add_argument("--carry-state", action="store_true")
@@ -145,6 +146,7 @@ def _save_checkpoint(args, dist, config, step, info):
             "phase": args.phase,
             "eval_data_file": args.eval_data_file,
         },
+        backend=args.checkpoint_backend,
     )
     if checkpoint_dir is not None:
         _print_once(info, f"saved checkpoint {checkpoint_dir}")

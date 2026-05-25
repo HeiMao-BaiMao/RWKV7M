@@ -285,13 +285,14 @@ uv run rwkv7m-train-binidx-dp `
   --vocab-size 65536 `
   --output-dir out/minipile-dp `
   --save-every 10 `
+  --checkpoint-backend orbax `
   --keep-last-checkpoints 3 `
   --eval-every 10 `
   --eval-steps 2 `
   --prefetch-size 2
 ```
 
-This is the first local-testable layer for TPU Research Cloud work. It includes process-aware checkpointing, checkpoint rotation, structured JSONL/CSV metrics, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded optimizer/parameter checkpointing is still pending.
+This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, checkpoint rotation, structured JSONL/CSV metrics, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
 
 TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
 
@@ -337,7 +338,7 @@ Lower-level modules:
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
-- Data-parallel distributed binidx training CLI with process-aware checkpointing, checkpoint rotation, structured JSONL/CSV logs, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation, structured JSONL/CSV logs, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
@@ -346,7 +347,7 @@ Not yet included:
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,
-- sharded TPU optimizer/parameter checkpoint save/resume,
+- real TPU pod validation of Orbax sharded optimizer/parameter checkpoint save/resume,
 - production-scale distributed TPU trainer validation on real TPU pods,
 - long-context evaluation harnesses.
 
