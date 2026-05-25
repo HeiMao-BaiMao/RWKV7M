@@ -197,14 +197,27 @@ def save_data_parallel_checkpoint(
     )
 
 
-def rotate_checkpoints(output_dir, keep_last, process_info):
+def rotate_checkpoints(output_dir, keep_last, process_info, *, protected_paths=None):
     if output_dir is None or keep_last is None or keep_last <= 0:
         return []
     if process_info["process_index"] != 0:
         return []
 
+    protected = set()
+    if protected_paths is not None:
+        protected = {
+            Path(path).resolve()
+            for path in protected_paths
+            if path is not None
+        }
     checkpoints = list_checkpoint_dirs(output_dir)
     to_remove = checkpoints[: max(0, len(checkpoints) - int(keep_last))]
+    if protected:
+        to_remove = [
+            path
+            for path in to_remove
+            if path.resolve() not in protected
+        ]
     for path in to_remove:
         shutil.rmtree(path)
     return to_remove

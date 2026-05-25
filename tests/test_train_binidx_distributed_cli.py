@@ -149,11 +149,14 @@ def test_distributed_binidx_training_cli_logs_eval_and_rotates(tmp_path):
             "--save-every",
             "1",
             "--keep-last-checkpoints",
-            "2",
+            "1",
             "--eval-every",
             "2",
             "--eval-steps",
             "1",
+            "--summary-every",
+            "1",
+            "--save-best-checkpoint",
             "--param-axis-name",
             "data",
             "--print-every",
@@ -181,6 +184,21 @@ def test_distributed_binidx_training_cli_logs_eval_and_rotates(tmp_path):
     ]
     assert [record["split"] for record in records].count("train") == 3
     assert any(record["split"] == "eval" for record in records)
+
+    summary = json.loads((output_dir / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "completed"
+    assert summary["current_step"] == 3
+    assert summary["completed_steps"] == 3
+    assert summary["tokens_per_step"] == 4
+    assert summary["tokens_seen"] == 12
+    assert summary["latest_checkpoint"].endswith("ckpt-00000003")
+    assert summary["best_eval"]["step"] == 2
+    assert summary["best_eval"]["metric"] == "loss"
+    assert summary["best_eval"]["checkpoint"].endswith("ckpt-00000002")
+
+    best_eval = json.loads((output_dir / "best_eval.json").read_text(encoding="utf-8"))
+    assert best_eval["step"] == 2
+    assert best_eval["checkpoint"].endswith("ckpt-00000002")
 
 
 def test_distributed_binidx_training_cli_orbax_checkpoint_roundtrip(tmp_path):

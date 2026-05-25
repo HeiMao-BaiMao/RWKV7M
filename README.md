@@ -289,10 +289,12 @@ uv run rwkv7m-train-binidx-dp `
   --keep-last-checkpoints 3 `
   --eval-every 10 `
   --eval-steps 2 `
+  --summary-every 1 `
+  --save-best-checkpoint `
   --prefetch-size 2
 ```
 
-This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, checkpoint rotation, structured JSONL/CSV metrics, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
+This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
 
 TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
 
@@ -338,7 +340,7 @@ Lower-level modules:
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
-- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation, structured JSONL/CSV logs, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:

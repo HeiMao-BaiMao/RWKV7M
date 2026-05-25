@@ -1,6 +1,6 @@
 # TPU Research Cloud Training
 
-This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, run summaries, validation hooks, best-eval checkpoint tracking, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 
 Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy validation on real TPU pods, and production-scale throughput tuning.
 
@@ -62,6 +62,8 @@ uv run rwkv7m-train-binidx-dp `
   --eval-every 100 `
   --eval-steps 10 `
   --eval-data-file data/validation `
+  --summary-every 10 `
+  --save-best-checkpoint `
   --prefetch-size 4
 ```
 
@@ -96,7 +98,8 @@ Implemented:
 - recurrent/screening state reset by default for independent binidx chunks.
 - process 0 checkpoint writing and checkpoint rotation.
 - Orbax train-state checkpoint writing for TPU-scale runs.
-- `run_config.json`, `metrics.jsonl`, and `metrics.csv` output.
+- `run_config.json`, `run_summary.json`, `best_eval.json`, `metrics.jsonl`, and `metrics.csv` output.
+- best validation checkpoint tracking with rotation protection.
 - safetensors artifacts with model and tokenizer metadata for external runtimes.
 
 Pending:
@@ -133,10 +136,14 @@ The resume step is read from `checkpoint.json`; `--steps` means additional optim
 When `--output-dir` is set, the distributed CLI writes:
 
 - `run_config.json`
+- `run_summary.json`
+- `best_eval.json` when validation has produced a best metric
 - `metrics.jsonl`
 - `metrics.csv`
 
-`run_config.json` stores CLI args, model config, process count, device count, and device names. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. Use `--log-jsonl` and `--log-csv` to override metric paths.
+`run_config.json` stores CLI args, model config, process count, device count, and device names. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps.
+
+Use `--log-jsonl`, `--log-csv`, and `--summary-json` to override output paths. `--summary-every` controls periodic summary writes. `--best-metric` and `--best-mode` choose the validation metric to track, and `--save-best-checkpoint` saves a checkpoint when that metric improves. Best checkpoints are protected from checkpoint rotation.
 
 ## State Carry
 

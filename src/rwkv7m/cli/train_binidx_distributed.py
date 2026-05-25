@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import time
@@ -69,6 +70,11 @@ def parse_args(argv=None):
     parser.add_argument("--eval-data-file", default=None)
     parser.add_argument("--log-jsonl", default=None)
     parser.add_argument("--log-csv", default=None)
+    parser.add_argument("--summary-json", default=None)
+    parser.add_argument("--summary-every", type=int, default=10)
+    parser.add_argument("--save-best-checkpoint", action="store_true")
+    parser.add_argument("--best-metric", default="loss")
+    parser.add_argument("--best-mode", choices=["min", "max"], default="min")
     parser.add_argument("--mesh-axis-names", nargs="+", default=["data"])
     parser.add_argument("--mesh-axis-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--param-axis-name", default=None)
@@ -82,6 +88,28 @@ def _log_paths(args):
     jsonl_path = args.log_jsonl if args.log_jsonl is not None else output_dir / "metrics.jsonl"
     csv_path = args.log_csv if args.log_csv is not None else output_dir / "metrics.csv"
     return jsonl_path, csv_path
+
+
+def _summary_path(args):
+    if args.summary_json is not None:
+        return args.summary_json
+    if args.output_dir is None:
+        return None
+    return Path(args.output_dir) / "run_summary.json"
+
+
+def _now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _jsonable(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _print_once(info, message):
@@ -108,6 +136,77 @@ def _metric_record(args, split, step, metrics, *, elapsed=None):
     if elapsed is not None and elapsed > 0:
         record["tokens_per_sec"] = tokens / elapsed
     return record
+
+
+def _initial_run_summary(args, info, start_step):
+    tokens_per_step = int(args.global_batch_size) * int(args.ctx_len)
+    return {
+        "status": "running",
+        "started_at": _now_utc(),
+        "updated_at": _now_utc(),
+        "ended_at": None,
+        "start_step": int(start_step),
+        "current_step": int(start_step),
+        "completed_steps": 0,
+        "requested_steps": int(args.steps),
+        "tokens_per_step": tokens_per_step,
+        "tokens_seen": 0,
+        "checkpoint_backend": args.checkpoint_backend,
+        "latest_checkpoint": None,
+        "best_eval": None,
+        "last_train": None,
+        "last_eval": None,
+        "process_info": {
+            key: value
+            for key, value in info.items()
+            if key != "devices"
+        },
+    }
+
+
+def _write_run_summary(args, info, summary):
+    path = _summary_path(args)
+    if path is None or info["process_index"] != 0:
+        return None
+    summary["updated_at"] = _now_utc()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_jsonable(summary), f, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
+def _write_best_eval(args, info, best_eval):
+    if args.output_dir is None or info["process_index"] != 0 or best_eval is None:
+        return None
+    path = Path(args.output_dir) / "best_eval.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_jsonable(best_eval), f, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
+def _protected_checkpoint_paths(summary):
+    best_eval = summary.get("best_eval")
+    if best_eval is None or best_eval.get("checkpoint") is None:
+        return []
+    return [best_eval["checkpoint"]]
+
+
+def _is_better_eval(metric_value, best_eval, mode):
+    if metric_value is None:
+        return False
+    metric_value = float(metric_value)
+    if not math.isfinite(metric_value):
+        return False
+    if best_eval is None:
+        return True
+    best_value = float(best_eval["value"])
+    if mode == "max":
+        return metric_value > best_value
+    return metric_value < best_value
 
 
 def _write_run_config(args, config, info, *, params=None, mesh=None):
@@ -137,7 +236,16 @@ def _write_run_config(args, config, info, *, params=None, mesh=None):
     return path
 
 
-def _save_checkpoint(args, dist, config, step, info):
+def _save_checkpoint(args, dist, config, step, info, *, protected_paths=None, metadata=None):
+    checkpoint_metadata = {
+        "data_file": args.data_file,
+        "ctx_len": args.ctx_len,
+        "global_batch_size": args.global_batch_size,
+        "phase": args.phase,
+        "eval_data_file": args.eval_data_file,
+    }
+    if metadata:
+        checkpoint_metadata.update(metadata)
     checkpoint_dir = save_data_parallel_checkpoint(
         args.output_dir,
         step,
@@ -146,18 +254,17 @@ def _save_checkpoint(args, dist, config, step, info):
         info,
         rng_key=jax.random.PRNGKey(args.seed),
         dataset_position={"step": int(step)},
-        metadata={
-            "data_file": args.data_file,
-            "ctx_len": args.ctx_len,
-            "global_batch_size": args.global_batch_size,
-            "phase": args.phase,
-            "eval_data_file": args.eval_data_file,
-        },
+        metadata=checkpoint_metadata,
         backend=args.checkpoint_backend,
     )
     if checkpoint_dir is not None:
         _print_once(info, f"saved checkpoint {checkpoint_dir}")
-        removed = rotate_checkpoints(args.output_dir, args.keep_last_checkpoints, info)
+        removed = rotate_checkpoints(
+            args.output_dir,
+            args.keep_last_checkpoints,
+            info,
+            protected_paths=protected_paths,
+        )
         for path in removed:
             _print_once(info, f"removed old checkpoint {path}")
     return checkpoint_dir
@@ -241,6 +348,9 @@ def run_distributed_training(args):
     last_checkpoint = None
     log_jsonl, log_csv = _log_paths(args)
     _write_run_config(args, config, info, params=train_state.params, mesh=mesh)
+    summary = _initial_run_summary(args, info, start_step)
+    best_eval = None
+    _write_run_summary(args, info, summary)
     try:
         _print_once(
             info,
@@ -266,12 +376,26 @@ def run_distributed_training(args):
             elapsed = time.perf_counter() - step_start
             host_metrics = metrics_to_host_dict(metrics)
             completed_step = int(dist.train_state.step)
+            checkpoint_saved_this_step = False
+            train_record = _metric_record(
+                args,
+                "train",
+                completed_step,
+                host_metrics,
+                elapsed=elapsed,
+            )
             write_metric_record(
                 log_jsonl,
                 log_csv,
-                _metric_record(args, "train", completed_step, host_metrics, elapsed=elapsed),
+                train_record,
                 process_info=info,
             )
+            summary["current_step"] = completed_step
+            summary["completed_steps"] = max(0, completed_step - int(start_step))
+            summary["tokens_seen"] = (
+                summary["completed_steps"] * summary["tokens_per_step"]
+            )
+            summary["last_train"] = train_record
             if args.print_every and (
                 local_step % args.print_every == 0 or local_step == args.steps - 1
             ):
@@ -293,30 +417,119 @@ def run_distributed_training(args):
                     completed_step,
                 )
                 if eval_metrics is not None:
+                    eval_record = _metric_record(
+                        args,
+                        "eval",
+                        completed_step,
+                        eval_metrics,
+                    )
                     write_metric_record(
                         log_jsonl,
                         log_csv,
-                        _metric_record(args, "eval", completed_step, eval_metrics),
+                        eval_record,
                         process_info=info,
                     )
+                    summary["last_eval"] = eval_record
                     _print_once(
                         info,
                         f"eval step={completed_step} loss={eval_metrics['loss']:.6f} "
                         f"perplexity={eval_metrics['perplexity']:.6f}",
                     )
+                    metric_value = eval_metrics.get(args.best_metric)
+                    if _is_better_eval(metric_value, best_eval, args.best_mode):
+                        best_eval = {
+                            "step": completed_step,
+                            "metric": args.best_metric,
+                            "mode": args.best_mode,
+                            "value": float(metric_value),
+                            "metrics": eval_metrics,
+                            "checkpoint": None,
+                        }
+                        if args.save_best_checkpoint and args.output_dir is not None:
+                            best_checkpoint = checkpoint_path(args.output_dir, completed_step)
+                            last_checkpoint = _save_checkpoint(
+                                args,
+                                dist,
+                                config,
+                                completed_step,
+                                info,
+                                protected_paths=[best_checkpoint],
+                                metadata={
+                                    "checkpoint_reason": "best_eval",
+                                    "best_metric": args.best_metric,
+                                    "best_metric_value": float(metric_value),
+                                },
+                            )
+                            checkpoint_saved_this_step = True
+                            if last_checkpoint is not None:
+                                best_eval["checkpoint"] = last_checkpoint
+                                summary["latest_checkpoint"] = last_checkpoint
+                        summary["best_eval"] = best_eval
+                        _write_best_eval(args, info, best_eval)
 
             if (
                 args.output_dir is not None
                 and args.save_every > 0
                 and completed_step % args.save_every == 0
+                and not checkpoint_saved_this_step
             ):
-                last_checkpoint = _save_checkpoint(args, dist, config, completed_step, info)
+                last_checkpoint = _save_checkpoint(
+                    args,
+                    dist,
+                    config,
+                    completed_step,
+                    info,
+                    protected_paths=_protected_checkpoint_paths(summary),
+                )
+                if last_checkpoint is not None:
+                    summary["latest_checkpoint"] = last_checkpoint
+                    if (
+                        summary.get("best_eval") is not None
+                        and summary["best_eval"].get("step") == completed_step
+                        and summary["best_eval"].get("checkpoint") is None
+                    ):
+                        summary["best_eval"]["checkpoint"] = last_checkpoint
+                        _write_best_eval(args, info, summary["best_eval"])
+
+            should_write_summary = (
+                args.summary_every > 0
+                and completed_step % args.summary_every == 0
+            ) or local_step == args.steps - 1
+            if should_write_summary:
+                _write_run_summary(args, info, summary)
 
         if args.output_dir is not None:
             final_step = int(dist.train_state.step)
             final_path = checkpoint_path(args.output_dir, final_step)
             if last_checkpoint != final_path:
-                last_checkpoint = _save_checkpoint(args, dist, config, final_step, info)
+                last_checkpoint = _save_checkpoint(
+                    args,
+                    dist,
+                    config,
+                    final_step,
+                    info,
+                    protected_paths=_protected_checkpoint_paths(summary),
+                )
+                if last_checkpoint is not None:
+                    summary["latest_checkpoint"] = last_checkpoint
+                    if (
+                        summary.get("best_eval") is not None
+                        and summary["best_eval"].get("step") == final_step
+                        and summary["best_eval"].get("checkpoint") is None
+                    ):
+                        summary["best_eval"]["checkpoint"] = last_checkpoint
+                        _write_best_eval(args, info, summary["best_eval"])
+        summary["status"] = "completed"
+        summary["ended_at"] = _now_utc()
+        _write_run_summary(args, info, summary)
+    except BaseException as exc:
+        summary["status"] = "failed"
+        summary["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        _write_run_summary(args, info, summary)
+        raise
     finally:
         if eval_dataset is not None:
             eval_dataset.close()
