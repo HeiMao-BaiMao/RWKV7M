@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 
+import jax
+
 from .mesh import make_1d_mesh
+from .partitioning import place_parameter_tree
 from .sharding import (
     data_parallel_sharding,
     mesh_has_axis,
@@ -39,10 +42,18 @@ def place_train_objects(
     if param_axis_name is not None:
         if not mesh_has_axis(mesh, param_axis_name):
             raise ValueError(f"mesh does not contain parameter axis: {param_axis_name}")
-        placed_train_state = put_tree_auto_model_parallel(
-            train_state,
-            mesh,
-            axis_name=param_axis_name,
+        placed_train_state = train_state.replace(
+            step=jax.device_put(train_state.step, state_sharding),
+            params=place_parameter_tree(
+                train_state.params,
+                mesh,
+                axis_name=param_axis_name,
+            ),
+            opt_state=put_tree_auto_model_parallel(
+                train_state.opt_state,
+                mesh,
+                axis_name=param_axis_name,
+            ),
         )
     else:
         placed_train_state = put_to_devices(train_state, state_sharding)

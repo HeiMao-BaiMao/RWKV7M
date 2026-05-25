@@ -271,7 +271,7 @@ uv run rwkv7m-train-binidx-dp `
   --prefetch-size 2
 ```
 
-これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。process-aware checkpoint、checkpoint rotation、structured JSONL/CSV metrics、periodic validation、device prefetching、optional multi-axis mesh / heuristic parameter placement hook を含みます。完全に調整された sharded optimizer/parameter checkpointing はまだ未実装です。
+これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。process-aware checkpoint、checkpoint rotation、structured JSONL/CSV metrics、periodic validation、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を含みます。完全に調整された sharded optimizer/parameter checkpointing はまだ未実装です。
 
 TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md) にあります。
 
@@ -333,7 +333,7 @@ from rwkv7m import (
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
-- process-aware checkpoint、checkpoint rotation、structured JSONL/CSV logs、validation hook、device prefetching、optional multi-axis mesh / heuristic parameter placement hook を持つ data-parallel distributed binidx training CLI。
+- process-aware checkpoint、checkpoint rotation、structured JSONL/CSV logs、validation hook、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:

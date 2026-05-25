@@ -15,6 +15,12 @@ from .checkpoint import (
     save_data_parallel_checkpoint,
 )
 from .metrics import aggregate_metrics, mean_metric_dict, metrics_to_host_dict, write_metric_record
+from .partitioning import (
+    mesh_axis_size,
+    parameter_partition_spec,
+    parameter_sharding,
+    place_parameter_tree,
+)
 from .mesh import initialize_jax_distributed, make_1d_mesh, make_mesh, process_info
 from .sharding import (
     axis_sharding,
@@ -52,6 +58,10 @@ __all__ = [
     "mean_metric_dict",
     "metrics_to_host_dict",
     "write_metric_record",
+    "mesh_axis_size",
+    "parameter_partition_spec",
+    "parameter_sharding",
+    "place_parameter_tree",
     "initialize_jax_distributed",
     "make_1d_mesh",
     "make_mesh",

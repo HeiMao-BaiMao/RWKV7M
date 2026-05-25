@@ -30,7 +30,7 @@ Do not use ignored `sample/` files as runtime dependencies. If useful material e
 ## Near-Term Priorities
 
 1. Prepare TPU Research Cloud training.
-   - Replace heuristic parameter placement with tuned per-parameter sharding rules.
+   - Replace the current basic rule-based placement with tuned per-parameter sharding rules validated on TPU.
    - Add sharded optimizer/parameter checkpointing rather than process 0 materialization.
    - Validate and tune throughput on real TPU pods.
    - Add failure recovery drills and resume documentation from interrupted TPU runs.

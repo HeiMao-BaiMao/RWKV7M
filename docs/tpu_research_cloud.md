@@ -1,6 +1,6 @@
 # TPU Research Cloud Training
 
-This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, validation hooks, device prefetching, and optional multi-axis mesh / heuristic parameter placement hooks.
+This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 
 Still pending: fully tuned per-parameter sharding rules, sharded optimizer/parameter checkpointing, and production-scale validation on real TPU pods.
 
@@ -80,7 +80,7 @@ uv run rwkv7m-train-binidx-dp `
   --param-axis-name model
 ```
 
-The default remains replicated parameters over a 1D `data` mesh. `--param-axis-name` enables heuristic shape-based placement of parameter and optimizer leaves over that mesh axis; full tuned per-parameter sharding rules are still future work.
+The default remains replicated parameters over a 1D `data` mesh. `--param-axis-name` enables rule-based placement for model params and shape-based placement for optimizer leaves over that mesh axis; full tuned per-parameter sharding rules are still future work.
 
 ## Current Implementation Boundary
 
@@ -88,6 +88,7 @@ Implemented:
 
 - `jax.distributed.initialize()` environment-based setup.
 - 1D and multi-axis JAX mesh construction.
+- rule-based parameter placement for embeddings, dense kernels, LM head weights, and fallback array leaves.
 - process-aware host binidx sampling.
 - data-parallel batch placement with `jax.make_array_from_process_local_data`.
 - train/eval step boundaries for local distributed tests.
