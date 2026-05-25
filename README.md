@@ -100,7 +100,7 @@ uv run rwkv7m-train-binidx `
   --eval-steps 10
 ```
 
-The same CLI accepts JSON config files. Explicit CLI options override config values:
+The same CLI accepts JSON config files. Explicit CLI options override config values. Repository examples use `.json.example`; generated or local `.json` files are ignored.
 
 ```json
 {
@@ -117,7 +117,7 @@ The same CLI accepts JSON config files. Explicit CLI options override config val
 ```
 
 ```powershell
-uv run rwkv7m-train-binidx --config configs/minipile-smoke.json --steps 2000
+uv run rwkv7m-train-binidx --config configs/minipile-smoke.json.example --steps 2000
 ```
 
 Resume runs continue for `--steps` additional optimizer updates:
@@ -296,6 +296,12 @@ uv run rwkv7m-train-binidx-dp `
 
 This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
 
+Audit distributed run artifacts locally:
+
+```powershell
+uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-records 10
+```
+
 TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
 
 ## Public API
@@ -340,7 +346,7 @@ Lower-level modules:
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
-- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:

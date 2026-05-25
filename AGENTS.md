@@ -22,7 +22,7 @@ The current implementation is still a reference path:
 - optional state-level screening memory.
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - small training and benchmark CLIs.
-- local-testable TPU/distributed data-parallel training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation with best-eval protection, validation hooks, run summaries, structured metrics, prefetching, and multi-axis mesh hooks.
+- local-testable TPU/distributed data-parallel training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation with best-eval protection, validation hooks, run summaries, run artifact auditing, structured metrics, prefetching, and multi-axis mesh hooks.
 - repository-local RWKV tokenizer vocabulary at `data/rwkv_vocab_v20230424.txt`.
 
 Do not use ignored `sample/` files as runtime dependencies. If useful material exists under `sample/`, copy the required artifact into tracked project-owned paths and make code depend on that tracked copy.
@@ -88,7 +88,7 @@ The distributed trainer should own:
 - validation hooks,
 - metric aggregation.
 
-Current distributed code already covers the local-testable data-parallel layer, structured metrics, run summaries, validation hook, best-eval checkpoint tracking, checkpoint rotation, Orbax train-state checkpointing, and mesh construction. The remaining TPU work is deeper sharding policy, checkpoint validation on real TPU pods, and throughput tuning.
+Current distributed code already covers the local-testable data-parallel layer, structured metrics, run summaries, run artifact audit checks, validation hook, best-eval checkpoint tracking, checkpoint rotation, Orbax train-state checkpointing, and mesh construction. The remaining TPU work is deeper sharding policy, checkpoint validation on real TPU pods, and throughput tuning.
 
 Keep the existing `train_binidx` API as a smoke/reference path.
 
@@ -122,5 +122,6 @@ The repository should not implement a PyTorch RWKV runtime. It may keep lightwei
 - Keep small reference APIs working while adding large-scale infrastructure.
 - Add tests for every format boundary: tokenizer, binidx, safetensors, checkpoint restore, distributed checkpointing, and external-runtime artifact loading.
 - Prefer explicit config files and metadata over implicit assumptions.
+- Keep reusable JSON examples as `.json.example`; do not commit generated or local `.json` run/config artifacts.
 - Do not claim upstream RWKV-7 checkpoint compatibility until conversion tests prove it.
 - Do not treat state-level screening as proven beneficial until benchmark and validation results support it.

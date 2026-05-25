@@ -145,6 +145,21 @@ When `--output-dir` is set, the distributed CLI writes:
 
 Use `--log-jsonl`, `--log-csv`, and `--summary-json` to override output paths. `--summary-every` controls periodic summary writes. `--best-metric` and `--best-mode` choose the validation metric to track, and `--save-best-checkpoint` saves a checkpoint when that metric improves. Best checkpoints are protected from checkpoint rotation.
 
+Generated `.json` files are run artifacts and are ignored by git. Commit reusable config examples as `.json.example`.
+
+## Local Run Audit
+
+Before moving a run to TPU scale, audit the local artifact contract:
+
+```powershell
+uv run rwkv7m-audit-dp-run out/tpu-smoke `
+  --require-complete `
+  --require-best-checkpoint `
+  --min-train-records 10
+```
+
+The audit checks `run_config.json`, `run_summary.json`, `best_eval.json`, `metrics.jsonl`, `ckpt-*` metadata, backend-specific checkpoint artifacts, summary step counts, token counts, monotonic train steps, latest checkpoint references, and best-eval checkpoint references. Use `--json` for machine-readable output.
+
 ## State Carry
 
 The distributed trainer resets recurrent and screening state by default for each sampled binidx chunk, matching the reference `train_batch` behavior. Use `--carry-state` only for deliberate streaming/stateful training.

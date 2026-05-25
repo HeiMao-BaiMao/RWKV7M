@@ -1,6 +1,9 @@
 __pycache__
 /.venv
 /sample
+/out/
+*.json
+!*.json.example
 /data/*.bin
 /data/*.idx
 # CocoIndex Code (ccc)

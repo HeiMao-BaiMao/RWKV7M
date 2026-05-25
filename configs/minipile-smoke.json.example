@@ -1,0 +1,11 @@
+{
+  "data_file": "data/minipile",
+  "ctx_len": 512,
+  "batch_size": 1,
+  "steps": 1000,
+  "vocab_size": 65536,
+  "output_dir": "out/minipile-smoke",
+  "save_every": 100,
+  "eval_every": 100,
+  "eval_steps": 10
+}

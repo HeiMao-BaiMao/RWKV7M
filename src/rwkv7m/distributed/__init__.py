@@ -5,6 +5,12 @@ from .input_pipeline import (
     create_host_binidx_dataset,
     iter_prefetched_global_batches,
 )
+from .audit import (
+    DistributedRunAuditIssue,
+    DistributedRunAuditReport,
+    audit_distributed_run,
+    audit_report_to_dict,
+)
 from .checkpoint import (
     DistributedCheckpointPayload,
     checkpoint_path,
@@ -50,6 +56,10 @@ __all__ = [
     "compute_batch_layout",
     "create_host_binidx_dataset",
     "iter_prefetched_global_batches",
+    "DistributedRunAuditIssue",
+    "DistributedRunAuditReport",
+    "audit_distributed_run",
+    "audit_report_to_dict",
     "DistributedCheckpointPayload",
     "checkpoint_path",
     "list_checkpoint_dirs",

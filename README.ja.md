@@ -100,7 +100,7 @@ uv run rwkv7m-train-binidx `
   --eval-steps 10
 ```
 
-同じ CLI は JSON config file も受け取れます。明示した CLI option は config の値を上書きします:
+同じ CLI は JSON config file も受け取れます。明示した CLI option は config の値を上書きします。repository に含める例は `.json.example` にし、生成物やlocal用の `.json` は ignore します:
 
 ```json
 {
@@ -117,7 +117,7 @@ uv run rwkv7m-train-binidx `
 ```
 
 ```powershell
-uv run rwkv7m-train-binidx --config configs/minipile-smoke.json --steps 2000
+uv run rwkv7m-train-binidx --config configs/minipile-smoke.json.example --steps 2000
 ```
 
 resume 時の `--steps` は、checkpoint から追加で実行する optimizer update 数です:
@@ -276,6 +276,12 @@ uv run rwkv7m-train-binidx-dp `
 
 これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。process-aware Flax checkpoint、TPU-scale run 向け Orbax train-state checkpoint、best-eval protection 付き checkpoint rotation、structured JSONL/CSV metrics、run summary、periodic validation、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を含みます。実 TPU pod 上での完全な sharded checkpoint policy 検証はまだ未実施です。
 
+distributed run artifact はローカルで監査できます:
+
+```powershell
+uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-records 10
+```
+
 TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md) にあります。
 
 ## Python API
@@ -336,7 +342,7 @@ from rwkv7m import (
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
-- process-aware Flax checkpoint、Orbax train-state checkpoint、best-eval protection 付き checkpoint rotation、structured JSONL/CSV logs、run summary、validation hook、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
+- process-aware Flax checkpoint、Orbax train-state checkpoint、best-eval protection 付き checkpoint rotation、structured JSONL/CSV logs、run summary、validation hook、run artifact audit CLI、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
