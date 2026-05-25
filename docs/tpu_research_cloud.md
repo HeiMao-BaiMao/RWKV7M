@@ -136,7 +136,7 @@ When `--output-dir` is set, the distributed CLI writes:
 - `metrics.jsonl`
 - `metrics.csv`
 
-`run_config.json` stores CLI args, model config, process count, device count, and device names. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. Use `--log-jsonl` and `--log-csv` to override metric paths.
+`run_config.json` stores CLI args, model config, process count, device count, and device names. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. Use `--log-jsonl` and `--log-csv` to override metric paths.
 
 ## State Carry
 

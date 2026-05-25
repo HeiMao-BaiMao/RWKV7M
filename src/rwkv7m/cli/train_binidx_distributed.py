@@ -17,6 +17,7 @@ from ..distributed import (
     make_mesh,
     mean_metric_dict,
     metrics_to_host_dict,
+    parameter_partition_summary,
     place_train_objects,
     restore_distributed_train_state,
     rotate_checkpoints,
@@ -109,7 +110,7 @@ def _metric_record(args, split, step, metrics, *, elapsed=None):
     return record
 
 
-def _write_run_config(args, config, info):
+def _write_run_config(args, config, info, *, params=None, mesh=None):
     if args.output_dir is None or info["process_index"] != 0:
         return None
     path = Path(args.output_dir) / "run_config.json"
@@ -124,6 +125,12 @@ def _write_run_config(args, config, info):
         },
         "devices": info.get("devices", []),
     }
+    if args.param_axis_name is not None and params is not None and mesh is not None:
+        payload["parameter_partition_summary"] = parameter_partition_summary(
+            params,
+            mesh,
+            axis_name=args.param_axis_name,
+        )
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -233,7 +240,7 @@ def run_distributed_training(args):
     )
     last_checkpoint = None
     log_jsonl, log_csv = _log_paths(args)
-    _write_run_config(args, config, info)
+    _write_run_config(args, config, info, params=train_state.params, mesh=mesh)
     try:
         _print_once(
             info,

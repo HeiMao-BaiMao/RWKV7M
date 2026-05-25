@@ -61,6 +61,25 @@ def parameter_sharding(path, value, mesh, *, axis_name):
     return NamedSharding(mesh, spec)
 
 
+def parameter_partition_summary(params, mesh, *, axis_name):
+    axis_size = mesh_axis_size(mesh, axis_name)
+    flat = flatten_dict(params)
+    summary = {}
+    for path, value in flat.items():
+        spec = parameter_partition_spec(
+            path,
+            value,
+            axis_name=axis_name,
+            axis_size=axis_size,
+        )
+        name = "/".join(str(part) for part in path)
+        summary[name] = {
+            "shape": [int(dim) for dim in jnp.asarray(value).shape],
+            "partition_spec": str(spec),
+        }
+    return summary
+
+
 def place_parameter_tree(params, mesh, *, axis_name):
     flat = flatten_dict(params)
     placed = {

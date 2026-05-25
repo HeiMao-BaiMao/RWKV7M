@@ -7,6 +7,7 @@ from rwkv7m.distributed import (
     make_1d_mesh,
     mesh_axis_size,
     parameter_partition_spec,
+    parameter_partition_summary,
     parameter_sharding,
     place_parameter_tree,
 )
@@ -71,3 +72,7 @@ def test_place_parameter_tree_uses_named_shardings():
         axis_name="data",
     )
     assert sharding.mesh is mesh
+
+    summary = parameter_partition_summary(state.params, mesh, axis_name="data")
+    assert summary["token_embedding/embedding"]["shape"] == [32, 32]
+    assert "data" in summary["token_embedding/embedding"]["partition_spec"]

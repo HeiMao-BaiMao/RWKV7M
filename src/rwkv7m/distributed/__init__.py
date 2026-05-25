@@ -19,6 +19,7 @@ from .checkpoint import (
 from .metrics import aggregate_metrics, mean_metric_dict, metrics_to_host_dict, write_metric_record
 from .partitioning import (
     mesh_axis_size,
+    parameter_partition_summary,
     parameter_partition_spec,
     parameter_sharding,
     place_parameter_tree,
@@ -63,6 +64,7 @@ __all__ = [
     "metrics_to_host_dict",
     "write_metric_record",
     "mesh_axis_size",
+    "parameter_partition_summary",
     "parameter_partition_spec",
     "parameter_sharding",
     "place_parameter_tree",
