@@ -9,7 +9,10 @@ from rwkv7m.distributed import (
     create_host_binidx_dataset,
     data_parallel_sharding,
     host_batch_to_global_arrays,
+    iter_prefetched_global_batches,
     make_1d_mesh,
+    make_mesh,
+    model_parallel_sharding,
     process_info,
     put_to_devices,
     replicated_sharding,
@@ -45,6 +48,15 @@ def test_make_mesh_and_shard_batch_on_available_devices():
     replicated = replicated_sharding(mesh)
     scalar = put_to_devices(jnp.asarray(1), replicated)
     assert scalar.shape == ()
+    model_sharding = model_parallel_sharding(mesh, axis_name="data")
+    assert model_sharding.mesh is mesh
+
+
+def test_make_mesh_validates_axis_sizes():
+    mesh = make_mesh(("data",), axis_sizes=(jax.device_count(),))
+    assert mesh.axis_names == ("data",)
+    with pytest.raises(ValueError):
+        make_mesh(("data", "model"))
 
 
 def test_compute_batch_layout_validates_divisibility():
@@ -105,5 +117,32 @@ def test_host_batch_to_global_arrays_on_single_process(tmp_path):
         assert global_batch["input_ids"].shape == (2, 4)
         assert global_batch["target_ids"].shape == (2, 4)
         assert global_batch["mask"].shape == (2, 4)
+    finally:
+        host.close()
+
+
+def test_iter_prefetched_global_batches_yields_sharded_arrays(tmp_path):
+    prefix = write_distributed_binidx(tmp_path)
+    host = create_host_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        global_batch_size=2,
+        process_index=0,
+        process_count=1,
+        local_device_count=1,
+    )
+    try:
+        mesh = make_1d_mesh()
+        batches = list(
+            iter_prefetched_global_batches(
+                host,
+                data_parallel_sharding(mesh),
+                start_step=0,
+                steps=2,
+                prefetch_size=2,
+            )
+        )
+        assert [step for step, _ in batches] == [0, 1]
+        assert batches[0][1]["input_ids"].shape == (2, 4)
     finally:
         host.close()

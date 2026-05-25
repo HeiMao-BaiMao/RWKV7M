@@ -212,7 +212,9 @@ save_model_safetensors("out/model.safetensors", runtime.variables["params"], run
 params, config, metadata = load_model_safetensors("out/model.safetensors")
 ```
 
-Optional PyTorch checkpoint loading boundary:
+`safetensors` is the canonical exchange format for external runtimes. Add `.pth` export only if a downstream runtime project needs it.
+
+External runtime artifact boundary:
 
 ```python
 from rwkv7m.backends.torch import load_torch_safetensors
@@ -220,7 +222,7 @@ from rwkv7m.backends.torch import load_torch_safetensors
 state_dict, config, metadata = load_torch_safetensors("out/model.safetensors")
 ```
 
-This is a backend boundary only; a full PyTorch RWKV7M runtime is still pending.
+This is an artifact compatibility helper only. A PyTorch/non-JAX RWKV7M runtime is out of scope for this repository and should live in a separate runtime project.
 
 Reference training checkpoint:
 
@@ -282,10 +284,16 @@ uv run rwkv7m-train-binidx-dp `
   --steps 10 `
   --vocab-size 65536 `
   --output-dir out/minipile-dp `
-  --save-every 10
+  --save-every 10 `
+  --keep-last-checkpoints 3 `
+  --eval-every 10 `
+  --eval-steps 2 `
+  --prefetch-size 2
 ```
 
-This is the first local-testable layer for TPU Research Cloud work. Full sharded training is still pending.
+This is the first local-testable layer for TPU Research Cloud work. It includes process-aware checkpointing, checkpoint rotation, structured JSONL/CSV metrics, periodic validation, device prefetching, and optional multi-axis mesh / heuristic parameter placement hooks. Full tuned sharded optimizer/parameter checkpointing is still pending.
+
+TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
 
 ## Public API
 
@@ -324,6 +332,7 @@ Lower-level modules:
 - RWKV tokenizer API and JSONL-to-binidx conversion.
 - Wheel-packaged RWKV tokenizer vocabulary fallback.
 - Safetensors export/import for Flax params plus model config metadata.
+- PyTorch-readable safetensors loading helper for external runtime projects.
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
@@ -333,8 +342,7 @@ Not yet included:
 
 - production fused RWKV kernels,
 - pretrained RWKV checkpoint conversion,
-- high-level text generation API,
-- full PyTorch/non-JAX runtime backend,
+- in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - sharded TPU checkpoint save/resume,
 - full distributed TPU trainer,
 - long-context evaluation harnesses.

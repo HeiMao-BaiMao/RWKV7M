@@ -39,7 +39,7 @@ from .io import (
     save_model_safetensors,
     save_train_checkpoint,
 )
-from .tokenizer import RWKVTokenizer
+from .tokenizer import RWKVTokenizer, tokenizer_metadata
 
 __all__ = [
     "RWKV7MRuntime",
@@ -81,4 +81,5 @@ __all__ = [
     "load_train_checkpoint",
     "load_train_checkpoint_metadata",
     "RWKVTokenizer",
+    "tokenizer_metadata",
 ]

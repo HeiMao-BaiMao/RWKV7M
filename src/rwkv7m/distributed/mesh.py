@@ -43,7 +43,30 @@ def initialize_jax_distributed(
 
 
 def make_1d_mesh(axis_name="data", devices=None):
+    return make_mesh((axis_name,), devices=devices)
+
+
+def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None):
+    if isinstance(axis_names, str):
+        axis_names = (axis_names,)
+    axis_names = tuple(axis_names)
+    if not axis_names:
+        raise ValueError("axis_names must not be empty")
+
     devices = list(jax.devices() if devices is None else devices)
     if not devices:
         raise ValueError("cannot create a mesh without devices")
-    return Mesh(np.asarray(devices), (axis_name,))
+
+    if axis_sizes is None:
+        if len(axis_names) != 1:
+            raise ValueError("axis_sizes is required for multi-axis meshes")
+        axis_sizes = (len(devices),)
+    axis_sizes = tuple(int(size) for size in axis_sizes)
+    if len(axis_sizes) != len(axis_names):
+        raise ValueError("axis_sizes must have the same length as axis_names")
+    if any(size <= 0 for size in axis_sizes):
+        raise ValueError("axis_sizes must be positive")
+    if int(np.prod(axis_sizes)) != len(devices):
+        raise ValueError("product of axis_sizes must equal number of devices")
+
+    return Mesh(np.asarray(devices).reshape(axis_sizes), axis_names)

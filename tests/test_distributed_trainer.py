@@ -6,7 +6,9 @@ from rwkv7m import create_train_runtime, tiny_config
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 from rwkv7m.distributed import (
     create_host_binidx_dataset,
+    evaluate_batch_data_parallel,
     make_1d_mesh,
+    metrics_to_host_dict,
     replicate_train_objects,
     train_batch_data_parallel,
 )
@@ -47,5 +49,14 @@ def test_data_parallel_train_batch_runs_on_local_mesh(tmp_path):
         )
         assert int(dist.train_state.step) == 1
         assert jnp.isfinite(metrics["loss"])
+        host_metrics = metrics_to_host_dict(metrics)
+        assert isinstance(host_metrics["loss"], float)
+
+        eval_metrics = evaluate_batch_data_parallel(
+            dist,
+            host_dataset.get_batch(1),
+            host_dataset.layout,
+        )
+        assert jnp.isfinite(eval_metrics["loss"])
     finally:
         host_dataset.close()

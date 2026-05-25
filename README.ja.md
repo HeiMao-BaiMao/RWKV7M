@@ -192,7 +192,9 @@ save_model_safetensors("out/model.safetensors", runtime.variables["params"], run
 params, config, metadata = load_model_safetensors("out/model.safetensors")
 ```
 
-Optional PyTorch checkpoint loading boundary:
+外部 runtime 向けの標準交換形式は `safetensors` とします。`.pth` export は downstream runtime project で必要になった場合だけ追加します。
+
+外部 runtime artifact 境界:
 
 ```python
 from rwkv7m.backends.torch import load_torch_safetensors
@@ -200,7 +202,7 @@ from rwkv7m.backends.torch import load_torch_safetensors
 state_dict, config, metadata = load_torch_safetensors("out/model.safetensors")
 ```
 
-これは backend 境界だけです。完全な PyTorch RWKV7M runtime はまだ未実装です。
+これは artifact 互換性確認用 helper です。この repository では PyTorch/non-JAX RWKV7M runtime は実装対象外で、別 runtime project 側で扱います。
 
 Reference training checkpoint:
 
@@ -262,10 +264,16 @@ uv run rwkv7m-train-binidx-dp `
   --steps 10 `
   --vocab-size 65536 `
   --output-dir out/minipile-dp `
-  --save-every 10
+  --save-every 10 `
+  --keep-last-checkpoints 3 `
+  --eval-every 10 `
+  --eval-steps 2 `
+  --prefetch-size 2
 ```
 
-これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。完全な sharded training はまだ未実装です。
+これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。process-aware checkpoint、checkpoint rotation、structured JSONL/CSV metrics、periodic validation、device prefetching、optional multi-axis mesh / heuristic parameter placement hook を含みます。完全に調整された sharded optimizer/parameter checkpointing はまだ未実装です。
+
+TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md) にあります。
 
 ## Python API
 
@@ -320,6 +328,7 @@ from rwkv7m import (
 - RWKV tokenizer API と JSONL-to-binidx 変換。
 - wheel に同梱される RWKV tokenizer vocabulary fallback。
 - Flax params と model config metadata の safetensors export/import。
+- 外部 runtime project 向けの PyTorch-readable safetensors loading helper。
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
@@ -329,7 +338,7 @@ from rwkv7m import (
 
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
-- 完全な PyTorch/non-JAX runtime backend。
+- repository 内 PyTorch/non-JAX runtime backend（意図的に対象外）。
 - sharded TPU checkpoint save/resume。
 - 完全な distributed TPU trainer。
 - long-context evaluation harnesses。

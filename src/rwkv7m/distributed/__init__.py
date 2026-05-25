@@ -3,32 +3,73 @@ from .input_pipeline import (
     HostBinIdxDataset,
     compute_batch_layout,
     create_host_binidx_dataset,
+    iter_prefetched_global_batches,
 )
-from .mesh import initialize_jax_distributed, make_1d_mesh, process_info
+from .checkpoint import (
+    DistributedCheckpointPayload,
+    checkpoint_path,
+    list_checkpoint_dirs,
+    load_distributed_checkpoint_metadata,
+    restore_distributed_train_state,
+    rotate_checkpoints,
+    save_data_parallel_checkpoint,
+)
+from .metrics import aggregate_metrics, mean_metric_dict, metrics_to_host_dict, write_metric_record
+from .mesh import initialize_jax_distributed, make_1d_mesh, make_mesh, process_info
 from .sharding import (
+    axis_sharding,
     data_parallel_sharding,
     host_batch_to_global_arrays,
     local_data_to_global_array,
+    model_parallel_sharding,
+    mesh_has_axis,
+    put_tree_auto_model_parallel,
     put_to_devices,
     replicated_sharding,
 )
-from .train_state import DistributedTrainObjects, replicate_train_objects
-from .trainer import train_batch_data_parallel
+from .train_state import DistributedTrainObjects, place_train_objects, replicate_train_objects
+from .trainer import (
+    evaluate_batch_data_parallel,
+    evaluate_global_batch_data_parallel,
+    train_batch_data_parallel,
+    train_global_batch_data_parallel,
+)
 
 __all__ = [
     "BatchLayout",
     "HostBinIdxDataset",
     "compute_batch_layout",
     "create_host_binidx_dataset",
+    "iter_prefetched_global_batches",
+    "DistributedCheckpointPayload",
+    "checkpoint_path",
+    "list_checkpoint_dirs",
+    "load_distributed_checkpoint_metadata",
+    "restore_distributed_train_state",
+    "rotate_checkpoints",
+    "save_data_parallel_checkpoint",
+    "aggregate_metrics",
+    "mean_metric_dict",
+    "metrics_to_host_dict",
+    "write_metric_record",
     "initialize_jax_distributed",
     "make_1d_mesh",
+    "make_mesh",
     "process_info",
+    "axis_sharding",
     "data_parallel_sharding",
+    "model_parallel_sharding",
+    "mesh_has_axis",
     "replicated_sharding",
     "put_to_devices",
+    "put_tree_auto_model_parallel",
     "local_data_to_global_array",
     "host_batch_to_global_arrays",
     "DistributedTrainObjects",
+    "place_train_objects",
     "replicate_train_objects",
     "train_batch_data_parallel",
+    "train_global_batch_data_parallel",
+    "evaluate_batch_data_parallel",
+    "evaluate_global_batch_data_parallel",
 ]

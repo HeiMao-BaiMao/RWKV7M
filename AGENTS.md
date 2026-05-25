@@ -2,14 +2,16 @@
 
 ## Project Direction
 
-This repository is moving from a JAX/Flax reference implementation toward a research training stack that can scale on Google TPU Research Cloud while still allowing non-JAX execution paths through portable checkpoint/export formats.
+This repository is moving from a JAX/Flax reference implementation toward a research training stack that can scale on Google TPU Research Cloud while still allowing external non-JAX runtimes to consume portable checkpoint/export formats.
 
 The long-term target is:
 
 - large-scale training on Google TPU Research Cloud with JAX-first distributed training,
-- portable model artifacts using `safetensors` plus explicit config/tokenizer metadata,
-- backend separation so training and inference are not permanently tied to JAX/Flax,
+- portable model artifacts using `safetensors` plus explicit config/tokenizer metadata, readable by external runtimes including PyTorch,
+- artifact-level backend separation so training output is not permanently tied to JAX/Flax,
 - reproducible experiments with resumable checkpoints, validation, and benchmark tooling.
+
+PyTorch runtime implementation is out of scope for this repository. The priority is TPU-scale JAX training plus export artifacts that other runtime projects can load.
 
 ## Current Baseline
 
@@ -26,40 +28,38 @@ Do not use ignored `sample/` files as runtime dependencies. If useful material e
 
 ## Near-Term Priorities
 
-1. Promote tokenizer support into a stable package module.
-   - Move tokenizer logic out of CLI-only code.
-   - Provide `encode`, `decode`, and text generation helpers.
-   - Keep tokenizer metadata tied to checkpoints and exports.
-
-2. Add portable checkpoint/export support.
-   - Add `safetensors` dependency.
-   - Implement Flax params to safetensors export.
-   - Implement safetensors import back into Flax params.
-   - Store model config and tokenizer metadata next to weights.
-   - Add round-trip tests on small models.
-
-3. Add training checkpointing.
-   - Save and restore model params, optimizer state, step, PRNG state, and dataset position.
-   - Support checkpoint rotation.
-   - Support resume from CLI.
-
-4. Add validation and experiment reporting.
-   - Validation loss/perplexity CLI.
-   - Baseline vs screening vs read-write comparison reports.
-   - Throughput logging with tokens/sec.
-   - Structured CSV/JSON logs.
-
-5. Prepare TPU Research Cloud training.
+1. Prepare TPU Research Cloud training.
    - Add JAX distributed initialization.
    - Add mesh and sharding helpers.
    - Add sharded train state handling.
    - Add host-aware binidx input pipeline.
    - Add TPU VM setup and run documentation.
+   - Add resumable sharded checkpointing, validation hooks, and metric aggregation.
 
-6. Add non-JAX execution path after export is stable.
-   - Start with PyTorch inference loading safetensors.
-   - Keep JAX as the first large-scale training backend.
-   - Avoid trying to maintain full JAX and PyTorch training parity before checkpoint/export boundaries are stable.
+2. Harden portable checkpoint/export support.
+   - Keep `safetensors` as the canonical portable artifact format.
+   - Implement Flax params to safetensors export.
+   - Implement safetensors import back into Flax params.
+   - Ensure exported safetensors can be read by external PyTorch runtimes.
+   - Store model config and tokenizer metadata next to weights.
+   - Add round-trip tests on small models.
+   - Add `.pth` export only if an external runtime actually requires it.
+
+3. Promote tokenizer support into a stable package module.
+   - Move tokenizer logic out of CLI-only code.
+   - Provide `encode`, `decode`, and text generation helpers.
+   - Keep tokenizer metadata tied to checkpoints and exports.
+
+4. Add training checkpointing.
+   - Save and restore model params, optimizer state, step, PRNG state, and dataset position.
+   - Support checkpoint rotation.
+   - Support resume from CLI.
+
+5. Add validation and experiment reporting.
+   - Validation loss/perplexity CLI.
+   - Baseline vs screening vs read-write comparison reports.
+   - Throughput logging with tokens/sec.
+   - Structured CSV/JSON logs.
 
 ## TPU Training Design Notes
 
@@ -113,13 +113,13 @@ Minimum safetensors metadata should include:
 - tokenizer vocabulary identity,
 - source training step if available.
 
-The first non-JAX backend should be inference-only PyTorch support that reads the exported safetensors and config. Full PyTorch training should be treated as a later project.
+The repository should not implement a PyTorch RWKV runtime. It may keep lightweight optional helpers that prove exported artifacts can be read through `safetensors.torch` or, if needed later, `torch.load` for `.pth` files. The runtime itself belongs in a separate project.
 
 ## Engineering Rules
 
 - Keep `sample/` ignored and out of runtime imports, tests, and README command paths.
 - Keep small reference APIs working while adding large-scale infrastructure.
-- Add tests for every format boundary: tokenizer, binidx, safetensors, checkpoint restore, and backend conversion.
+- Add tests for every format boundary: tokenizer, binidx, safetensors, checkpoint restore, distributed checkpointing, and external-runtime artifact loading.
 - Prefer explicit config files and metadata over implicit assumptions.
 - Do not claim upstream RWKV-7 checkpoint compatibility until conversion tests prove it.
 - Do not treat state-level screening as proven beneficial until benchmark and validation results support it.

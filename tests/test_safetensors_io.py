@@ -28,6 +28,12 @@ def test_safetensors_roundtrip_params_and_config(tmp_path):
 
     assert restored_config == config
     assert metadata["format"] == "rwkv7m"
+    assert metadata["architecture"] == "rwkv7m"
+    assert metadata["dtype"] == config.dtype
+    assert metadata["d_model"] == str(config.d_model)
+    assert metadata["n_layers"] == str(config.n_layers)
+    assert metadata["tokenizer_format"] == "rwkv_vocab"
+    assert len(metadata["tokenizer_vocab_sha256"]) == 64
     assert metadata["step"] == "7"
 
     original_flat = flatten_dict(variables["params"], sep="/")

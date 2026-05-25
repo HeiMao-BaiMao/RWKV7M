@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+from collections import deque
 
 import jax
 
 from ..data import create_binidx_dataset
+from .sharding import host_batch_to_global_arrays
 
 
 @dataclass(frozen=True)
@@ -101,3 +103,42 @@ def create_host_binidx_dataset(
         process_index=process_index,
         process_count=process_count,
     )
+
+
+def iter_prefetched_global_batches(
+    host_dataset,
+    sharding,
+    *,
+    start_step,
+    steps,
+    prefetch_size=2,
+    epoch=0,
+):
+    prefetch_size = max(1, int(prefetch_size))
+    queue = deque()
+    next_step = int(start_step)
+    stop_step = int(start_step) + int(steps)
+
+    def enqueue(step):
+        host_batch = host_dataset.get_batch(step, epoch=epoch)
+        queue.append(
+            (
+                step,
+                host_batch_to_global_arrays(
+                    host_batch,
+                    sharding,
+                    host_dataset.layout,
+                ),
+            )
+        )
+
+    while next_step < stop_step and len(queue) < prefetch_size:
+        enqueue(next_step)
+        next_step += 1
+
+    while queue:
+        step, batch = queue.popleft()
+        while next_step < stop_step and len(queue) < prefetch_size:
+            enqueue(next_step)
+            next_step += 1
+        yield step, batch

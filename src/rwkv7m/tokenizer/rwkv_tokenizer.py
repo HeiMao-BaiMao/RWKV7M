@@ -1,4 +1,5 @@
 import ast
+import hashlib
 from importlib.resources import files
 from pathlib import Path
 
@@ -47,6 +48,17 @@ def default_vocab_path():
     if asset.is_file():
         return Path(str(asset))
     return repo_copy
+
+
+def tokenizer_metadata(vocab_file=None):
+    vocab_file = Path(vocab_file) if vocab_file is not None else default_vocab_path()
+    data = vocab_file.read_bytes()
+    return {
+        "tokenizer_format": "rwkv_vocab",
+        "tokenizer_vocab_name": vocab_file.name,
+        "tokenizer_vocab_sha256": hashlib.sha256(data).hexdigest(),
+        "tokenizer_vocab_bytes": str(len(data)),
+    }
 
 
 class RWKVTokenizer:
