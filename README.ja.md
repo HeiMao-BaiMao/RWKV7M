@@ -328,10 +328,12 @@ from rwkv7m import (
 - RWKV tokenizer API と JSONL-to-binidx 変換。
 - wheel に同梱される RWKV tokenizer vocabulary fallback。
 - Flax params と model config metadata の safetensors export/import。
+- architecture、dtype、model dimensions、screening summary、tokenizer vocabulary identity を含む safetensors artifact metadata。
 - 外部 runtime project 向けの PyTorch-readable safetensors loading helper。
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
+- process-aware checkpoint、checkpoint rotation、structured JSONL/CSV logs、validation hook、device prefetching、optional multi-axis mesh / heuristic parameter placement hook を持つ data-parallel distributed binidx training CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -339,8 +341,9 @@ from rwkv7m import (
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
 - repository 内 PyTorch/non-JAX runtime backend（意図的に対象外）。
-- sharded TPU checkpoint save/resume。
-- 完全な distributed TPU trainer。
+- 完全に調整された per-parameter TPU sharding rules。
+- sharded TPU optimizer/parameter checkpoint save/resume。
+- 実 TPU pod 上で検証済みの production-scale distributed TPU trainer。
 - long-context evaluation harnesses。
 
 ## テスト
@@ -349,4 +352,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading が含まれます。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、safetensors/checkpoint boundary、local distributed training boundary が含まれます。

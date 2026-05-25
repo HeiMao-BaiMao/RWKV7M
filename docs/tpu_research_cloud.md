@@ -1,12 +1,14 @@
 # TPU Research Cloud Training
 
-This document describes the intended TPU path for `rwkv7m`. The current code provides a local-testable data-parallel layer and checkpoint boundary; full sharded TPU training is still being expanded.
+This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, validation hooks, device prefetching, and optional multi-axis mesh / heuristic parameter placement hooks.
+
+Still pending: fully tuned per-parameter sharding rules, sharded optimizer/parameter checkpointing, and production-scale validation on real TPU pods.
 
 ## Install
 
 ```powershell
 uv sync --extra tpu
-uv run pytest -q tests/test_distributed_skeleton.py tests/test_distributed_trainer.py
+uv run pytest -q tests/test_distributed_skeleton.py tests/test_distributed_train_state.py tests/test_distributed_trainer.py tests/test_train_binidx_distributed_cli.py
 ```
 
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
@@ -79,6 +81,27 @@ uv run rwkv7m-train-binidx-dp `
 ```
 
 The default remains replicated parameters over a 1D `data` mesh. `--param-axis-name` enables heuristic shape-based placement of parameter and optimizer leaves over that mesh axis; full tuned per-parameter sharding rules are still future work.
+
+## Current Implementation Boundary
+
+Implemented:
+
+- `jax.distributed.initialize()` environment-based setup.
+- 1D and multi-axis JAX mesh construction.
+- process-aware host binidx sampling.
+- data-parallel batch placement with `jax.make_array_from_process_local_data`.
+- train/eval step boundaries for local distributed tests.
+- recurrent/screening state reset by default for independent binidx chunks.
+- process 0 checkpoint writing and checkpoint rotation.
+- `run_config.json`, `metrics.jsonl`, and `metrics.csv` output.
+- safetensors artifacts with model and tokenizer metadata for external runtimes.
+
+Pending:
+
+- tuned sharding specs per parameter group.
+- sharded optimizer/parameter checkpointing rather than process 0 materialization.
+- TPU pod throughput tuning and failure recovery drills.
+- long-context evaluation harnesses.
 
 ## Resume
 

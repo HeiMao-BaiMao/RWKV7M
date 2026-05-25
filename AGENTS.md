@@ -22,6 +22,7 @@ The current implementation is still a reference path:
 - optional state-level screening memory.
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - small training and benchmark CLIs.
+- local-testable TPU/distributed data-parallel training CLI with process-aware checkpointing, checkpoint rotation, validation hooks, structured metrics, prefetching, and multi-axis mesh hooks.
 - repository-local RWKV tokenizer vocabulary at `data/rwkv_vocab_v20230424.txt`.
 
 Do not use ignored `sample/` files as runtime dependencies. If useful material exists under `sample/`, copy the required artifact into tracked project-owned paths and make code depend on that tracked copy.
@@ -29,12 +30,10 @@ Do not use ignored `sample/` files as runtime dependencies. If useful material e
 ## Near-Term Priorities
 
 1. Prepare TPU Research Cloud training.
-   - Add JAX distributed initialization.
-   - Add mesh and sharding helpers.
-   - Add sharded train state handling.
-   - Add host-aware binidx input pipeline.
-   - Add TPU VM setup and run documentation.
-   - Add resumable sharded checkpointing, validation hooks, and metric aggregation.
+   - Replace heuristic parameter placement with tuned per-parameter sharding rules.
+   - Add sharded optimizer/parameter checkpointing rather than process 0 materialization.
+   - Validate and tune throughput on real TPU pods.
+   - Add failure recovery drills and resume documentation from interrupted TPU runs.
 
 2. Harden portable checkpoint/export support.
    - Keep `safetensors` as the canonical portable artifact format.
@@ -88,6 +87,8 @@ The distributed trainer should own:
 - resumable checkpoint state,
 - validation hooks,
 - metric aggregation.
+
+Current distributed code already covers the local-testable data-parallel layer, structured metrics, validation hook, checkpoint rotation, and mesh construction. The remaining TPU work is deeper sharding policy, sharded checkpointing, and real TPU throughput validation.
 
 Keep the existing `train_binidx` API as a smoke/reference path.
 
