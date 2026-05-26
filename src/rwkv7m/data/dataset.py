@@ -39,6 +39,7 @@ class BinIdxConfig:
     epoch_steps: int | None = None
     rank: int = 0
     world_size: int = 1
+    sampling_mode: str = "magic"
 
 
 class BinIdxBatchDataset:
@@ -53,6 +54,8 @@ class BinIdxBatchDataset:
             raise ValueError("world_size must be positive")
         if config.rank < 0 or config.rank >= config.world_size:
             raise ValueError("rank must satisfy 0 <= rank < world_size")
+        if config.sampling_mode not in {"magic", "sequential"}:
+            raise ValueError("sampling_mode must be 'magic' or 'sequential'")
         self.config = config
         self.data = MMapIndexedDataset(config.data_file)
         self.data_size = self.data.data_size
@@ -84,6 +87,13 @@ class BinIdxBatchDataset:
             raise ValueError("binidx dataset is smaller than ctx_len + 1")
         if self.magic_prime * self.config.ctx_len + 1 > self.data_size:
             raise ValueError("magic_prime can sample beyond the end of the dataset")
+        if self.config.sampling_mode == "sequential":
+            lane_count = self.config.batch_size * self.config.world_size
+            if self.dataset_slot < lane_count:
+                raise ValueError(
+                    "sequential sampling requires at least one ctx_len slot per "
+                    f"stream lane (dataset_slot={self.dataset_slot}, lanes={lane_count})"
+                )
 
     @property
     def samples_per_epoch(self):
@@ -92,6 +102,17 @@ class BinIdxBatchDataset:
         return self.dataset_slot
 
     def sample_offset(self, sample_index, *, epoch=0):
+        if self.config.sampling_mode == "sequential":
+            batch_idx = int(sample_index) % self.config.batch_size
+            step_in_lane = int(sample_index) // self.config.batch_size
+            global_lane = self.config.rank * self.config.batch_size + batch_idx
+            lane_count = self.config.world_size * self.config.batch_size
+            lane_length = self.dataset_slot // lane_count
+            chunk_index = global_lane * lane_length + (
+                (int(epoch) * lane_length + step_in_lane) % lane_length
+            )
+            return chunk_index * self.config.ctx_len
+
         ii = (
             1
             + int(epoch) * self.samples_per_epoch
@@ -139,6 +160,7 @@ def create_binidx_dataset(
     epoch_steps=None,
     rank=0,
     world_size=1,
+    sampling_mode="magic",
 ):
     return BinIdxBatchDataset(
         BinIdxConfig(
@@ -149,5 +171,6 @@ def create_binidx_dataset(
             epoch_steps=epoch_steps,
             rank=rank,
             world_size=world_size,
+            sampling_mode=sampling_mode,
         )
     )

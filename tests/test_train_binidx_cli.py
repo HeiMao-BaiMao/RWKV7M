@@ -77,3 +77,40 @@ def test_train_binidx_cli_saves_and_resumes(tmp_path):
     )
     assert int(resumed_state.step) == 2
     assert resumed_checkpoint == output_dir / "ckpt-00000002"
+
+
+def test_train_binidx_cli_carry_state_requires_sequential_sampling(tmp_path):
+    prefix = write_train_binidx(tmp_path)
+    output_dir = tmp_path / "out"
+    args = base_args(prefix, output_dir, ["--carry-state"])
+
+    try:
+        run_training(args)
+    except ValueError as exc:
+        assert "--carry-state requires --sampling-mode sequential" in str(exc)
+    else:
+        raise AssertionError("carry-state with magic sampling should fail")
+
+
+def test_train_binidx_cli_carry_state_saves_runtime_state(tmp_path):
+    prefix = write_train_binidx(tmp_path)
+    output_dir = tmp_path / "out"
+    args = base_args(
+        prefix,
+        output_dir,
+        [
+            "--carry-state",
+            "--sampling-mode",
+            "sequential",
+            "--eval-every",
+            "0",
+        ],
+    )
+
+    state, _, checkpoint = run_training(args)
+
+    assert int(state.step) == 1
+    assert (checkpoint / "runtime_state.msgpack").exists()
+    _, payload = load_train_checkpoint_metadata(checkpoint)
+    assert payload["metadata"]["carry_state"] is True
+    assert payload["metadata"]["sampling_mode"] == "sequential"

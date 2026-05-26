@@ -34,6 +34,7 @@ from .io import (
     load_model_safetensors,
     load_train_checkpoint,
     load_train_checkpoint_metadata,
+    load_train_runtime_state,
     model_config_from_dict,
     model_config_to_dict,
     save_model_safetensors,
@@ -80,6 +81,7 @@ __all__ = [
     "save_train_checkpoint",
     "load_train_checkpoint",
     "load_train_checkpoint_metadata",
+    "load_train_runtime_state",
     "RWKVTokenizer",
     "tokenizer_metadata",
 ]

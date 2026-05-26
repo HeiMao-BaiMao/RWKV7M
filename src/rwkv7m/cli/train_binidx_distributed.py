@@ -40,6 +40,7 @@ def parse_args(argv=None):
     parser.add_argument("--global-batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--magic-prime", type=int, default=None)
+    parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
@@ -152,6 +153,8 @@ def _initial_run_summary(args, info, start_step):
         "tokens_per_step": tokens_per_step,
         "tokens_seen": 0,
         "checkpoint_backend": args.checkpoint_backend,
+        "sampling_mode": args.sampling_mode,
+        "carry_state": args.carry_state,
         "latest_checkpoint": None,
         "best_eval": None,
         "last_train": None,
@@ -242,6 +245,8 @@ def _save_checkpoint(args, dist, config, step, info, *, protected_paths=None, me
         "ctx_len": args.ctx_len,
         "global_batch_size": args.global_batch_size,
         "phase": args.phase,
+        "carry_state": args.carry_state,
+        "sampling_mode": args.sampling_mode,
         "eval_data_file": args.eval_data_file,
     }
     if metadata:
@@ -294,6 +299,8 @@ def run_distributed_training(args):
     info = initialize_jax_distributed()
     if "data" not in tuple(args.mesh_axis_names):
         raise ValueError("mesh_axis_names must include 'data'")
+    if args.carry_state and args.sampling_mode != "sequential":
+        raise ValueError("--carry-state requires --sampling-mode sequential")
     mesh = make_mesh(tuple(args.mesh_axis_names), axis_sizes=args.mesh_axis_sizes)
     if args.resume:
         checkpoint_payload = load_distributed_checkpoint_metadata(args.resume)
@@ -312,6 +319,7 @@ def run_distributed_training(args):
         process_index=info["process_index"],
         process_count=info["process_count"],
         local_device_count=info["local_device_count"],
+        sampling_mode=args.sampling_mode,
     )
     eval_dataset = None
     if args.eval_every > 0 and args.eval_data_file is not None:
@@ -324,6 +332,7 @@ def run_distributed_training(args):
             process_index=info["process_index"],
             process_count=info["process_count"],
             local_device_count=info["local_device_count"],
+            sampling_mode=args.sampling_mode,
         )
     runtime, train_state = create_train_runtime(
         jax.random.PRNGKey(args.seed),

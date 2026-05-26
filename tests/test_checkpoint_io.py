@@ -7,6 +7,7 @@ from rwkv7m import (
     load_model_safetensors,
     load_train_checkpoint,
     load_train_checkpoint_metadata,
+    load_train_runtime_state,
     save_train_checkpoint,
     tiny_config,
     train_batch,
@@ -33,6 +34,10 @@ def test_train_checkpoint_roundtrip(tmp_path):
         rng_key=jax.random.PRNGKey(2),
         dataset_position={"step": 1},
         metadata={"run": "test"},
+        runtime_state={
+            "rwkv_state": runtime.rwkv_state,
+            "screen_state": runtime.screen_state,
+        },
     )
 
     metadata_config, payload = load_train_checkpoint_metadata(checkpoint_dir)
@@ -54,6 +59,19 @@ def test_train_checkpoint_roundtrip(tmp_path):
     assert restored_config == config
     assert restored_payload["metadata"] == {"run": "test"}
     assert int(restored.step) == int(state.step)
+
+    restored_runtime_state = load_train_runtime_state(
+        checkpoint_dir,
+        {
+            "rwkv_state": runtime.initial_rwkv_state,
+            "screen_state": runtime.initial_screen_state,
+        },
+    )
+    assert restored_runtime_state is not None
+    assert jnp.allclose(
+        restored_runtime_state["rwkv_state"][0].time_mix_x,
+        runtime.rwkv_state[0].time_mix_x,
+    )
 
     original_flat = flatten_dict(state.params, sep="/")
     restored_flat = flatten_dict(restored.params, sep="/")

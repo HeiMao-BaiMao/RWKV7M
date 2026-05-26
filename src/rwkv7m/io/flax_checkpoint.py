@@ -11,6 +11,7 @@ from .safetensors import save_model_safetensors
 
 CHECKPOINT_JSON = "checkpoint.json"
 TRAIN_STATE_MSGPACK = "train_state.msgpack"
+RUNTIME_STATE_MSGPACK = "runtime_state.msgpack"
 MODEL_SAFETENSORS = "model.safetensors"
 
 
@@ -28,12 +29,16 @@ def save_train_checkpoint(
     rng_key=None,
     dataset_position=None,
     metadata=None,
+    runtime_state=None,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     state_path = checkpoint_dir / TRAIN_STATE_MSGPACK
     state_path.write_bytes(serialization.to_bytes(train_state))
+    if runtime_state is not None:
+        runtime_state_path = checkpoint_dir / RUNTIME_STATE_MSGPACK
+        runtime_state_path.write_bytes(serialization.to_bytes(runtime_state))
 
     save_model_safetensors(
         checkpoint_dir / MODEL_SAFETENSORS,
@@ -73,3 +78,11 @@ def load_train_checkpoint(checkpoint_dir, train_state_template):
     state_bytes = (checkpoint_dir / TRAIN_STATE_MSGPACK).read_bytes()
     train_state = serialization.from_bytes(train_state_template, state_bytes)
     return train_state, config, payload
+
+
+def load_train_runtime_state(checkpoint_dir, runtime_state_template):
+    checkpoint_dir = Path(checkpoint_dir)
+    state_path = checkpoint_dir / RUNTIME_STATE_MSGPACK
+    if not state_path.exists():
+        return None
+    return serialization.from_bytes(runtime_state_template, state_path.read_bytes())

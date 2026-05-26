@@ -8,6 +8,7 @@ from ..data import create_binidx_dataset
 from ..io import (
     load_train_checkpoint,
     load_train_checkpoint_metadata,
+    load_train_runtime_state,
     save_train_checkpoint,
 )
 from ..model import ModelConfig, ScreeningConfig
@@ -67,6 +68,7 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--magic-prime", type=int, default=None)
+    parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
@@ -84,6 +86,7 @@ def parse_args(argv=None):
     parser.add_argument("--n-slots", type=int, default=4)
     parser.add_argument("--bank-ids", type=int, nargs="+", default=None)
     parser.add_argument("--screened-layers", type=int, nargs="*", default=[])
+    parser.add_argument("--carry-state", action="store_true")
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--save-every", type=int, default=0)
@@ -97,7 +100,14 @@ def _checkpoint_path(output_dir, step):
     return Path(output_dir) / f"ckpt-{int(step):08d}"
 
 
-def _save_checkpoint(args, train_state, cfg, step):
+def _runtime_state_payload(runtime):
+    return {
+        "rwkv_state": runtime.rwkv_state,
+        "screen_state": runtime.screen_state,
+    }
+
+
+def _save_checkpoint(args, train_state, cfg, step, runtime=None):
     if args.output_dir is None:
         return None
     checkpoint_dir = _checkpoint_path(args.output_dir, step)
@@ -112,8 +122,15 @@ def _save_checkpoint(args, train_state, cfg, step):
             "ctx_len": args.ctx_len,
             "batch_size": args.batch_size,
             "phase": args.phase,
+            "carry_state": args.carry_state,
+            "sampling_mode": args.sampling_mode,
             "total_requested_steps": args.steps,
         },
+        runtime_state=(
+            _runtime_state_payload(runtime)
+            if args.carry_state and runtime is not None
+            else None
+        ),
     )
     print(f"saved checkpoint {checkpoint_dir}")
     return checkpoint_dir
@@ -152,6 +169,8 @@ def _run_eval(args, checkpoint_dir, step):
 
 
 def run_training(args):
+    if args.carry_state and args.sampling_mode != "sequential":
+        raise ValueError("--carry-state requires --sampling-mode sequential")
     if args.resume:
         cfg, payload = load_train_checkpoint_metadata(args.resume)
         start_step = int(payload.get("step", 0))
@@ -165,6 +184,7 @@ def run_training(args):
         batch_size=args.batch_size,
         magic_prime=args.magic_prime,
         epoch_steps=max(args.steps, 1),
+        sampling_mode=args.sampling_mode,
     )
     total_steps = max(start_step + args.steps, 1)
     runtime, train_state = create_train_runtime(
@@ -176,12 +196,24 @@ def run_training(args):
     if args.resume:
         train_state, cfg, _ = load_train_checkpoint(args.resume, train_state)
         runtime.variables = {"params": train_state.params}
+        if args.carry_state:
+            runtime_state = load_train_runtime_state(
+                args.resume,
+                _runtime_state_payload(runtime),
+            )
+            if runtime_state is not None:
+                runtime.rwkv_state = runtime_state["rwkv_state"]
+                runtime.screen_state = runtime_state["screen_state"]
+            else:
+                print("runtime_state.msgpack not found; carry-state resume starts from zero runtime state")
 
     last_checkpoint = None
     try:
         print(
             f"data_tokens={dataset.data_size} magic_prime={dataset.magic_prime} "
-            f"ctx_len={args.ctx_len} batch_size={args.batch_size} start_step={start_step}"
+            f"ctx_len={args.ctx_len} batch_size={args.batch_size} "
+            f"sampling_mode={args.sampling_mode} carry_state={args.carry_state} "
+            f"start_step={start_step}"
         )
         for local_step in range(args.steps):
             global_step = start_step + local_step
@@ -191,7 +223,7 @@ def run_training(args):
                 batch,
                 runtime,
                 phase=args.phase,
-                carry_state=False,
+                carry_state=args.carry_state,
             )
             completed_step = int(train_state.step)
             if args.print_every and (
@@ -205,7 +237,7 @@ def run_training(args):
                 and completed_step % args.save_every == 0
             )
             if should_save:
-                last_checkpoint = _save_checkpoint(args, train_state, cfg, completed_step)
+                last_checkpoint = _save_checkpoint(args, train_state, cfg, completed_step, runtime)
 
             should_eval = (
                 args.eval_every > 0
@@ -214,14 +246,14 @@ def run_training(args):
             )
             if should_eval:
                 if last_checkpoint is None or last_checkpoint.name != f"ckpt-{completed_step:08d}":
-                    last_checkpoint = _save_checkpoint(args, train_state, cfg, completed_step)
+                    last_checkpoint = _save_checkpoint(args, train_state, cfg, completed_step, runtime)
                 _run_eval(args, last_checkpoint, completed_step)
 
         if args.output_dir is not None:
             final_step = int(train_state.step)
             final_path = _checkpoint_path(args.output_dir, final_step)
             if last_checkpoint != final_path:
-                last_checkpoint = _save_checkpoint(args, train_state, cfg, final_step)
+                last_checkpoint = _save_checkpoint(args, train_state, cfg, final_step, runtime)
     finally:
         dataset.close()
     return train_state, runtime, last_checkpoint

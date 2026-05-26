@@ -55,6 +55,50 @@ def test_distributed_binidx_training_cli_runs_one_step(tmp_path):
     assert int(dist.train_state.step) == 1
 
 
+def test_distributed_binidx_training_cli_carry_state_requires_sequential_sampling(tmp_path):
+    prefix = write_dp_train_data(tmp_path)
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--ctx-len",
+            "4",
+            "--global-batch-size",
+            "1",
+            "--steps",
+            "1",
+            "--vocab-size",
+            "32",
+            "--d-model",
+            "32",
+            "--d-ffn",
+            "64",
+            "--n-layers",
+            "2",
+            "--n-heads",
+            "2",
+            "--head-size",
+            "16",
+            "--d-slot",
+            "16",
+            "--d-k",
+            "16",
+            "--d-v",
+            "16",
+            "--carry-state",
+            "--print-every",
+            "0",
+        ]
+    )
+
+    try:
+        run_distributed_training(args)
+    except ValueError as exc:
+        assert "--carry-state requires --sampling-mode sequential" in str(exc)
+    else:
+        raise AssertionError("carry-state with magic sampling should fail")
+
+
 def test_distributed_binidx_training_cli_saves_and_resumes(tmp_path):
     prefix = write_dp_train_data(tmp_path)
     output_dir = tmp_path / "out"

@@ -199,14 +199,19 @@ def train_binidx(
     num_steps: int,
     magic_prime: int | None = None,
     phase="read_screening_only",
+    carry_state: bool = False,
+    sampling_mode: str = "magic",
     print_every: int | None = None,
 ):
+    if carry_state and sampling_mode != "sequential":
+        raise ValueError("carry_state training requires sampling_mode='sequential'")
     dataset = create_binidx_dataset(
         data_file,
         ctx_len=ctx_len,
         batch_size=batch_size,
         magic_prime=magic_prime,
         epoch_steps=num_steps,
+        sampling_mode=sampling_mode,
     )
     runtime, train_state = create_train_runtime(
         rng_key,
@@ -223,7 +228,7 @@ def train_binidx(
                 batch,
                 runtime,
                 phase=phase,
-                carry_state=False,
+                carry_state=carry_state,
             )
             loss = float(metrics["loss"])
             losses.append(loss)

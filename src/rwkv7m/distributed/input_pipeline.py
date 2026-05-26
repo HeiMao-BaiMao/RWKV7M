@@ -74,6 +74,7 @@ def create_host_binidx_dataset(
     process_index=None,
     process_count=None,
     local_device_count=None,
+    sampling_mode="magic",
 ):
     process_index = jax.process_index() if process_index is None else int(process_index)
     process_count = jax.process_count() if process_count is None else int(process_count)
@@ -96,6 +97,7 @@ def create_host_binidx_dataset(
         epoch_steps=epoch_steps,
         rank=process_index,
         world_size=process_count,
+        sampling_mode=sampling_mode,
     )
     return HostBinIdxDataset(
         dataset=dataset,

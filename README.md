@@ -6,6 +6,8 @@ JAX/Flax reference implementation of an RWKV-7 style recurrent language model wi
 
 This repository is research-oriented. The current implementation is optimized for correctness, tests, and API usability before custom kernels or checkpoint compatibility.
 
+For a more detailed setup and training walkthrough, including config files, checkpoints, resume, distributed runs, and run artifact auditing, see the Japanese README.
+
 ## Install
 
 From this checkout:
@@ -57,7 +59,7 @@ state, metrics = train_batch(state, batch, runtime)
 print(float(metrics["loss"]))
 ```
 
-`train_batch` resets recurrent state by default, which is the correct mode for independently sampled training chunks. Use `carry_state=True` only for deliberate streaming/stateful training. The default path reuses immutable initial zero states in the runtime, so it does not rebuild zero states every step for the configured batch size.
+`train_batch` resets recurrent state by default, which is the correct mode for independently sampled training chunks. Use `carry_state=True` only for deliberate streaming/stateful training. For binidx training, pair carry-state training with `sampling_mode="sequential"` / `--sampling-mode sequential`; carrying state across the default shuffled `magic` sampler mixes unrelated chunks. The default path reuses immutable initial zero states in the runtime, so it does not rebuild zero states every step for the configured batch size.
 
 ## Training From RWKV-LM-V7 `.bin/.idx`
 

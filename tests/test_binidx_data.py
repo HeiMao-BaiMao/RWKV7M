@@ -80,6 +80,42 @@ def test_binidx_batch_dataset_returns_train_step_batch(tmp_path):
         dataset.close()
 
 
+def test_binidx_sequential_sampling_keeps_stream_lanes_contiguous(tmp_path):
+    prefix = write_demo_binidx(tmp_path)
+    dataset = create_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        batch_size=1,
+        sampling_mode="sequential",
+    )
+    try:
+        assert dataset.sample_offset(0) == 0
+        assert dataset.sample_offset(1) == 4
+        first = dataset.get_batch(0)
+        second = dataset.get_batch(1)
+        assert int(second["input_ids"][0, 0]) == int(first["input_ids"][0, -1]) + 1
+    finally:
+        dataset.close()
+
+
+def test_binidx_sequential_sampling_partitions_batch_lanes(tmp_path):
+    prefix = write_demo_binidx(tmp_path)
+    dataset = create_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        batch_size=2,
+        sampling_mode="sequential",
+    )
+    try:
+        lane_length = dataset.dataset_slot // 2
+        assert dataset.sample_offset(0) == 0
+        assert dataset.sample_offset(1) == lane_length * 4
+        assert dataset.sample_offset(2) == 4
+        assert dataset.sample_offset(3) == (lane_length + 1) * 4
+    finally:
+        dataset.close()
+
+
 def test_binidx_batch_dataset_supports_multi_document_global_sampling(tmp_path):
     prefix = str(tmp_path / "multi")
     builder = MMapIndexedDatasetBuilder(data_file_path(prefix), dtype=np.uint16)
@@ -111,6 +147,24 @@ def test_train_binidx_runs_one_step(tmp_path):
     )
     assert len(losses) == 1
     assert np.isfinite(losses[0])
+
+
+def test_train_binidx_can_carry_state_on_sequential_sampling(tmp_path):
+    prefix = write_demo_binidx(tmp_path, n_tokens=257)
+    cfg = tiny_config(vocab_size=512, d_model=32, n_layers=2, n_heads=2, head_size=16)
+    losses, runtime, _ = train_binidx(
+        jax.random.PRNGKey(0),
+        cfg,
+        prefix,
+        ctx_len=4,
+        batch_size=1,
+        num_steps=2,
+        carry_state=True,
+        sampling_mode="sequential",
+    )
+    assert len(losses) == 2
+    assert np.isfinite(losses[-1])
+    assert not jnp.allclose(runtime.rwkv_state[0].time_mix_x, runtime.initial_rwkv_state[0].time_mix_x)
 
 
 def test_new_cli_parsers_import():
