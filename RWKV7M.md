@@ -33,7 +33,7 @@ Implemented:
 11. PyTorch-readable safetensors loading helper for external runtime projects.
 12. Single-process train checkpoints with optional runtime state for carry-state resume.
 13. Local-testable distributed data-parallel training layer with mesh/sharding helpers.
-14. Process-aware Flax and Orbax train-state checkpoints, metrics, summaries, validation hooks, checkpoint rotation, and run artifact audit tooling.
+14. Process-aware Flax and Orbax train-state checkpoints, carry-state runtime checkpoints, metrics, summaries, validation hooks, checkpoint rotation, and run artifact audit tooling.
 15. Installable library API: `from rwkv7m import ...`.
 
 Important limitation:
@@ -408,7 +408,7 @@ Current tests cover:
 - binidx data loading and sequential carry-state reset behavior,
 - safetensors export/import and train checkpoint round trip,
 - stateful binidx validation CLI,
-- local distributed mesh/sharding, train-state placement, trainer, checkpoint, run audit, and CLI boundaries,
+- local distributed mesh/sharding, train-state and runtime-state placement, trainer, checkpoint, run audit, and CLI boundaries,
 - toy training stability,
 - forward/backward smoke benchmarks.
 
@@ -418,7 +418,7 @@ Run:
 uv run pytest -q
 ```
 
-As of this document update, the full suite passes locally: 88 tests.
+As of this document update, the full suite passes locally: 89 tests.
 
 ## 14. Design Rules
 
@@ -443,7 +443,7 @@ Prefer:
 
 Next engineering steps:
 
-1. Validate Orbax train-state checkpoint save/resume on real TPU pods, including sharded optimizer/parameter states.
+1. Validate Orbax train-state and runtime-state checkpoint save/resume on real TPU pods, including sharded optimizer/parameter/recurrent states.
 2. Tune per-parameter TPU sharding rules beyond the current rule-based placement hooks.
 3. Tune TPU pod throughput and document failure recovery drills.
 4. Implement task-specific long-context evaluation harnesses beyond stateful binidx validation.

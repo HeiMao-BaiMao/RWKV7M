@@ -3,8 +3,13 @@ import json
 import math
 from pathlib import Path
 
-from ..io.flax_checkpoint import MODEL_SAFETENSORS, TRAIN_STATE_MSGPACK
-from .checkpoint import CHECKPOINT_JSON, ORBAX_TRAIN_STATE_DIR, list_checkpoint_dirs
+from ..io.flax_checkpoint import MODEL_SAFETENSORS, RUNTIME_STATE_MSGPACK, TRAIN_STATE_MSGPACK
+from .checkpoint import (
+    CHECKPOINT_JSON,
+    ORBAX_RUNTIME_STATE_DIR,
+    ORBAX_TRAIN_STATE_DIR,
+    list_checkpoint_dirs,
+)
 
 
 @dataclass(frozen=True)
@@ -220,6 +225,8 @@ def _check_summary(issues, run_summary, *, require_complete=False):
 
 def _check_checkpoint_artifacts(issues, checkpoint_dir, payload):
     backend = payload.get("backend", "flax")
+    metadata = payload.get("metadata", {})
+    expects_runtime_state = metadata.get("carry_state") or metadata.get("runtime_state")
     if backend == "orbax":
         state_dir = checkpoint_dir / ORBAX_TRAIN_STATE_DIR
         if not state_dir.exists():
@@ -229,6 +236,15 @@ def _check_checkpoint_artifacts(issues, checkpoint_dir, payload):
                 "checkpoint_artifact_missing",
                 f"missing Orbax train-state directory: {state_dir}",
                 state_dir,
+            )
+        runtime_state_dir = checkpoint_dir / ORBAX_RUNTIME_STATE_DIR
+        if expects_runtime_state and not runtime_state_dir.exists():
+            _issue(
+                issues,
+                "error",
+                "checkpoint_artifact_missing",
+                f"missing Orbax runtime-state directory: {runtime_state_dir}",
+                runtime_state_dir,
             )
         return
     if backend != "flax":
@@ -245,6 +261,15 @@ def _check_checkpoint_artifacts(issues, checkpoint_dir, payload):
                 f"missing checkpoint artifact: {path}",
                 path,
             )
+    runtime_path = checkpoint_dir / RUNTIME_STATE_MSGPACK
+    if expects_runtime_state and not runtime_path.exists():
+        _issue(
+            issues,
+            "error",
+            "checkpoint_artifact_missing",
+            f"missing runtime-state artifact: {runtime_path}",
+            runtime_path,
+        )
 
 
 def _check_checkpoints(issues, output_dir, run_summary):

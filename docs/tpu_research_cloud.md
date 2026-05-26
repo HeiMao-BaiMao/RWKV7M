@@ -100,6 +100,7 @@ Implemented:
 - validation with a separate carried eval state, so validation does not mutate the training stream state.
 - process 0 checkpoint writing and checkpoint rotation.
 - Orbax train-state checkpoint writing for TPU-scale runs.
+- distributed carry-state runtime checkpoint/resume for local and single-process distributed runs.
 - `run_config.json`, `run_summary.json`, `best_eval.json`, `metrics.jsonl`, and `metrics.csv` output.
 - best validation checkpoint tracking with rotation protection.
 - safetensors artifacts with model and tokenizer metadata for external runtimes.
@@ -107,7 +108,7 @@ Implemented:
 Pending:
 
 - tuned sharding specs per parameter group.
-- sharded runtime-state checkpoint/resume policy for carried recurrent/screening state.
+- real TPU pod validation of sharded runtime-state checkpoint/resume for carried recurrent/screening state.
 - real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
 - TPU pod throughput tuning and failure recovery drills.
 - task-specific long-context evaluation harnesses beyond stateful binidx validation.
@@ -116,8 +117,8 @@ Pending:
 
 Two checkpoint backends are available:
 
-- `--checkpoint-backend flax`: process 0 materializes and writes `train_state.msgpack` plus `model.safetensors`; this remains the default and is useful for small/local runs and portable artifact export.
-- `--checkpoint-backend orbax`: all processes write an Orbax train-state checkpoint under `orbax_train_state`, while process 0 writes `checkpoint.json`; use this for TPU-scale runs where materializing the full train state on process 0 is not viable.
+- `--checkpoint-backend flax`: process 0 materializes and writes `train_state.msgpack` plus `model.safetensors`; this remains the default and is useful for small/local runs and portable artifact export. With `--carry-state`, it also writes `runtime_state.msgpack`.
+- `--checkpoint-backend orbax`: all processes write an Orbax train-state checkpoint under `orbax_train_state`, while process 0 writes `checkpoint.json`; use this for TPU-scale runs where materializing the full train state on process 0 is not viable. With `--carry-state`, it also writes `orbax_runtime_state`.
 
 Resume works for both backends:
 
@@ -171,7 +172,7 @@ Sequential sampling assigns one stream lane per batch row. When a lane wraps fro
 
 Periodic validation can also run in carry-state mode. It advances a separate eval state across validation batches and resets that eval state at the same lane-wrap boundaries, so validation does not mutate the training stream state.
 
-Current checkpoint backends persist train state, but distributed carry-state runtime state restore is not yet validated as a sharded TPU resume policy. Single-process `rwkv7m-train-binidx` stores `runtime_state.msgpack` for carry-state resume.
+Current checkpoint backends persist distributed carry-state runtime state and restore it before mesh placement on resume. The Flax backend writes `runtime_state.msgpack`; the Orbax backend writes `orbax_runtime_state`. This is covered by local distributed tests, but real TPU pod validation of the sharded runtime-state policy is still pending.
 
 ## Export Contract
 

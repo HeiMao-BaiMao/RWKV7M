@@ -324,7 +324,7 @@ uv run rwkv7m-train-binidx-dp `
   --prefetch-size 2
 ```
 
-This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
+This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, carry-state runtime checkpoint/resume for distributed local runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
 
 Audit distributed run artifacts locally:
 
@@ -377,7 +377,7 @@ Lower-level modules:
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
-- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, carry-state runtime checkpoint/resume, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
@@ -386,7 +386,7 @@ Not yet included:
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,
-- real TPU pod validation of Orbax sharded optimizer/parameter checkpoint save/resume,
+- real TPU pod validation of Orbax sharded optimizer/parameter/runtime-state checkpoint save/resume,
 - production-scale distributed TPU trainer validation on real TPU pods,
 - task-specific long-context evaluation harnesses beyond stateful binidx validation.
 
@@ -396,4 +396,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, and local distributed training boundaries. The current full suite is 88 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, and local distributed training boundaries. The current full suite is 89 tests.

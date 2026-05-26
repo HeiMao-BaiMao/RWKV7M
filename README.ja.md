@@ -398,7 +398,7 @@ uv run rwkv7m-train-binidx-dp `
 | --- | --- |
 | `--global-batch-size` | 全process合計のbatch sizeです。分散runでは `--batch-size` ではなくこちらを使います。 |
 | `--sampling-mode` | `magic` または `sequential` です。`--carry-state` を使う場合は `sequential` が必要です。 |
-| `--carry-state` | 分散train/eval step間でstateを持ち越します。validation は評価用 state を別に進め、lane wrap 境界では state をリセットします。実TPU podでのsharded runtime-state checkpoint/resume検証はまだ未完了です。 |
+| `--carry-state` | 分散train/eval step間でstateを持ち越します。validation は評価用 state を別に進め、lane wrap 境界では state をリセットします。分散ローカルrunでは runtime state も checkpoint/resume されます。実TPU podでのsharded runtime-state checkpoint/resume検証はまだ未完了です。 |
 | `--checkpoint-backend flax` | process 0 が `train_state.msgpack` と `model.safetensors` を書きます。小さいローカルrunやartifact export確認向けです。 |
 | `--checkpoint-backend orbax` | 全processで Orbax train-state checkpoint を書きます。TPU-scale run の主経路です。 |
 | `--keep-last-checkpoints` | 古いcheckpointを残す数です。best checkpoint はrotationから保護されます。 |
@@ -419,7 +419,7 @@ uv run rwkv7m-train-binidx-dp `
 - `metrics.csv`: 表計算や簡易確認用のCSV log。
 - `ckpt-*`: checkpoint directory。
 
-これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。実 TPU pod 上での完全な sharded checkpoint policy 検証はまだ未実施です。
+これは TPU Research Cloud 対応に向けた、ローカルテスト可能な最初の層です。分散ローカルrunでは carry-state runtime state も checkpoint/resume 対象です。実 TPU pod 上での完全な sharded checkpoint policy 検証はまだ未実施です。
 
 distributed run artifact はローカルで監査できます:
 
@@ -488,7 +488,7 @@ from rwkv7m import (
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
-- process-aware Flax checkpoint、Orbax train-state checkpoint、best-eval protection 付き checkpoint rotation、structured JSONL/CSV logs、run summary、validation hook、run artifact audit CLI、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
+- process-aware Flax checkpoint、Orbax train-state checkpoint、carry-state runtime checkpoint/resume、best-eval protection 付き checkpoint rotation、structured JSONL/CSV logs、run summary、validation hook、run artifact audit CLI、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -497,7 +497,7 @@ from rwkv7m import (
 - pretrained RWKV checkpoint conversion。
 - repository 内 PyTorch/non-JAX runtime backend（意図的に対象外）。
 - 完全に調整された per-parameter TPU sharding rules。
-- 実 TPU pod 上での Orbax sharded optimizer/parameter checkpoint save/resume 検証。
+- 実 TPU pod 上での Orbax sharded optimizer/parameter/runtime-state checkpoint save/resume 検証。
 - 実 TPU pod 上で検証済みの production-scale distributed TPU trainer。
 - stateful binidx validation を超える task-specific long-context evaluation harnesses。
 
@@ -507,4 +507,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary が含まれます。現時点の full suite は 88 tests です。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary が含まれます。現時点の full suite は 89 tests です。

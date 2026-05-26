@@ -1,5 +1,6 @@
 import json
 
+import jax.numpy as jnp
 import numpy as np
 
 from rwkv7m import load_train_checkpoint_metadata
@@ -155,6 +156,102 @@ def test_distributed_binidx_training_cli_saves_and_resumes(tmp_path):
     )
     assert int(resumed.train_state.step) == 2
     assert resumed_checkpoint == output_dir / "ckpt-00000002"
+
+
+def test_distributed_binidx_training_cli_carry_state_saves_and_restores_runtime_state(tmp_path):
+    prefix = write_dp_train_data(tmp_path)
+    output_dir = tmp_path / "carry"
+    first_args = [
+        "--data-file",
+        prefix,
+        "--ctx-len",
+        "4",
+        "--global-batch-size",
+        "1",
+        "--steps",
+        "2",
+        "--vocab-size",
+        "32",
+        "--d-model",
+        "32",
+        "--d-ffn",
+        "64",
+        "--n-layers",
+        "2",
+        "--n-heads",
+        "2",
+        "--head-size",
+        "16",
+        "--d-slot",
+        "16",
+        "--d-k",
+        "16",
+        "--d-v",
+        "16",
+        "--output-dir",
+        str(output_dir),
+        "--save-every",
+        "2",
+        "--sampling-mode",
+        "sequential",
+        "--carry-state",
+        "--print-every",
+        "0",
+    ]
+    dist, checkpoint = run_distributed_training(parse_args(first_args))
+    assert int(dist.train_state.step) == 2
+    assert checkpoint == output_dir / "ckpt-00000002"
+    assert (checkpoint / "runtime_state.msgpack").exists()
+
+    _, payload = load_train_checkpoint_metadata(checkpoint)
+    assert payload["metadata"]["carry_state"] is True
+    assert payload["metadata"]["runtime_state"] is True
+
+    resume_args = [
+        "--data-file",
+        prefix,
+        "--ctx-len",
+        "4",
+        "--global-batch-size",
+        "1",
+        "--steps",
+        "0",
+        "--vocab-size",
+        "32",
+        "--d-model",
+        "32",
+        "--d-ffn",
+        "64",
+        "--n-layers",
+        "2",
+        "--n-heads",
+        "2",
+        "--head-size",
+        "16",
+        "--d-slot",
+        "16",
+        "--d-k",
+        "16",
+        "--d-v",
+        "16",
+        "--output-dir",
+        str(output_dir),
+        "--save-every",
+        "0",
+        "--sampling-mode",
+        "sequential",
+        "--carry-state",
+        "--resume",
+        str(checkpoint),
+        "--print-every",
+        "0",
+    ]
+    resumed, _ = run_distributed_training(parse_args(resume_args))
+    assert int(resumed.train_state.step) == 2
+    assert not jnp.allclose(
+        resumed.rwkv_state[0].time_mix_x,
+        resumed.initial_rwkv_state[0].time_mix_x,
+    )
 
 
 def test_distributed_binidx_training_cli_logs_eval_and_rotates(tmp_path):

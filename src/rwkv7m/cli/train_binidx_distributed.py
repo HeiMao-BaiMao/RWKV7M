@@ -23,6 +23,7 @@ from ..distributed import (
     parameter_partition_summary,
     place_train_objects,
     restore_distributed_train_state,
+    restore_distributed_runtime_state,
     rotate_checkpoints,
     save_data_parallel_checkpoint,
     train_global_batch_data_parallel,
@@ -263,6 +264,11 @@ def _save_checkpoint(args, dist, config, step, info, *, protected_paths=None, me
         dataset_position={"step": int(step)},
         metadata=checkpoint_metadata,
         backend=args.checkpoint_backend,
+        runtime_state=(
+            _runtime_state_payload(dist)
+            if args.carry_state
+            else None
+        ),
     )
     if checkpoint_dir is not None:
         _print_once(info, f"saved checkpoint {checkpoint_dir}")
@@ -284,7 +290,7 @@ def _run_validation(args, dist, dataset, completed_step):
     eval_rwkv_state = dist.initial_rwkv_state
     eval_screen_state = dist.initial_screen_state
     for eval_offset in range(args.eval_steps):
-        eval_step = int(completed_step) + eval_offset
+        eval_step = int(eval_offset)
         if args.carry_state and dataset.should_reset_state_before_step(eval_step):
             eval_rwkv_state = dist.initial_rwkv_state
             eval_screen_state = dist.initial_screen_state
@@ -312,6 +318,13 @@ def _run_validation(args, dist, dataset, completed_step):
     if "loss" in mean_metrics:
         mean_metrics["perplexity"] = math.exp(min(mean_metrics["loss"], 20.0))
     return mean_metrics
+
+
+def _runtime_state_payload(runtime_or_dist):
+    return {
+        "rwkv_state": runtime_or_dist.rwkv_state,
+        "screen_state": runtime_or_dist.screen_state,
+    }
 
 
 def run_distributed_training(args):
@@ -366,6 +379,19 @@ def run_distributed_training(args):
         )
         config = checkpoint_payload.config
         runtime.variables = {"params": train_state.params}
+        if args.carry_state:
+            runtime_state = restore_distributed_runtime_state(
+                args.resume,
+                _runtime_state_payload(runtime),
+            )
+            if runtime_state is not None:
+                runtime.rwkv_state = runtime_state["rwkv_state"]
+                runtime.screen_state = runtime_state["screen_state"]
+            else:
+                _print_once(
+                    info,
+                    "distributed runtime state not found; carry-state resume starts from zero runtime state",
+                )
     dist = place_train_objects(
         runtime,
         train_state,

@@ -38,6 +38,8 @@ def place_train_objects(
     batch_sharding = data_parallel_sharding(mesh, axis_name=axis_name)
     initial_rwkv_state = put_to_devices(runtime.initial_rwkv_state, batch_sharding)
     initial_screen_state = put_to_devices(runtime.initial_screen_state, batch_sharding)
+    rwkv_state = put_to_devices(runtime.rwkv_state, batch_sharding)
+    screen_state = put_to_devices(runtime.screen_state, batch_sharding)
 
     if param_axis_name is not None:
         if not mesh_has_axis(mesh, param_axis_name):
@@ -62,8 +64,8 @@ def place_train_objects(
         train_state=placed_train_state,
         initial_rwkv_state=initial_rwkv_state,
         initial_screen_state=initial_screen_state,
-        rwkv_state=initial_rwkv_state,
-        screen_state=initial_screen_state,
+        rwkv_state=rwkv_state,
+        screen_state=screen_state,
         mesh=mesh,
         batch_sharding=batch_sharding,
         state_sharding=state_sharding,

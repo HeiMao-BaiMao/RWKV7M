@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 
 from rwkv7m import create_train_runtime, tiny_config
 import pytest
@@ -18,8 +19,14 @@ def test_replicate_train_objects_on_local_mesh():
     dist = replicate_train_objects(runtime, state, mesh=mesh)
     assert dist.mesh is mesh
     assert dist.train_state.step.shape == ()
-    assert dist.initial_rwkv_state is dist.rwkv_state
-    assert dist.initial_screen_state is dist.screen_state
+    assert jnp.allclose(
+        dist.initial_rwkv_state[0].time_mix_x,
+        dist.rwkv_state[0].time_mix_x,
+    )
+    assert jnp.allclose(
+        dist.initial_screen_state.layers[0].slots,
+        dist.screen_state.layers[0].slots,
+    )
     assert len(dist.rwkv_state) == config.n_layers
     assert len(dist.screen_state.layers) == len(config.screening.screened_layers)
 
