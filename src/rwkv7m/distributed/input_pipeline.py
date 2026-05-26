@@ -34,6 +34,9 @@ class HostBinIdxDataset:
     def get_batch(self, step, *, epoch=0):
         return self.dataset.get_batch(step, epoch=epoch)
 
+    def should_reset_state_before_step(self, step):
+        return self.dataset.should_reset_state_before_step(step)
+
     def iter_batches(self, *, epoch=0, steps=None):
         return self.dataset.iter_batches(epoch=epoch, steps=steps)
 

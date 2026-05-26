@@ -116,6 +116,25 @@ def test_binidx_sequential_sampling_partitions_batch_lanes(tmp_path):
         dataset.close()
 
 
+def test_binidx_sequential_sampling_reports_state_reset_boundaries(tmp_path):
+    prefix = write_demo_binidx(tmp_path)
+    dataset = create_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        batch_size=2,
+        sampling_mode="sequential",
+    )
+    try:
+        lane_length = dataset.sequential_lane_length
+        assert lane_length == dataset.dataset_slot // 2
+        assert not dataset.should_reset_state_before_step(0)
+        assert not dataset.should_reset_state_before_step(lane_length - 1)
+        assert dataset.should_reset_state_before_step(lane_length)
+        assert not dataset.should_reset_state_before_step(lane_length + 1)
+    finally:
+        dataset.close()
+
+
 def test_binidx_batch_dataset_supports_multi_document_global_sampling(tmp_path):
     prefix = str(tmp_path / "multi")
     builder = MMapIndexedDatasetBuilder(data_file_path(prefix), dtype=np.uint16)

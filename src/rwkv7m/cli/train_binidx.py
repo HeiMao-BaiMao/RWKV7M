@@ -154,9 +154,13 @@ def _run_eval(args, checkpoint_dir, step):
         str(args.seed),
         "--phase",
         args.phase,
+        "--sampling-mode",
+        args.sampling_mode,
         "--print-every",
         "0",
     ]
+    if args.carry_state:
+        eval_argv.append("--carry-state")
     if args.magic_prime is not None:
         eval_argv.extend(["--magic-prime", str(args.magic_prime)])
     eval_args = parse_eval_args(eval_argv)
@@ -217,6 +221,9 @@ def run_training(args):
         )
         for local_step in range(args.steps):
             global_step = start_step + local_step
+            if args.carry_state and dataset.should_reset_state_before_step(global_step):
+                runtime.rwkv_state = runtime.initial_rwkv_state
+                runtime.screen_state = runtime.initial_screen_state
             batch = dataset.get_batch(global_step)
             train_state, metrics = train_batch(
                 train_state,

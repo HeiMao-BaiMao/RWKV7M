@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import math
@@ -12,6 +13,7 @@ from ..distributed import (
     create_host_binidx_dataset,
     checkpoint_path,
     evaluate_batch_data_parallel,
+    evaluate_batch_data_parallel_with_state,
     initialize_jax_distributed,
     iter_prefetched_global_batches,
     load_distributed_checkpoint_metadata,
@@ -279,15 +281,32 @@ def _run_validation(args, dist, dataset, completed_step):
     if args.eval_steps <= 0:
         return None
     metrics = []
+    eval_rwkv_state = dist.initial_rwkv_state
+    eval_screen_state = dist.initial_screen_state
     for eval_offset in range(args.eval_steps):
         eval_step = int(completed_step) + eval_offset
-        eval_metrics = evaluate_batch_data_parallel(
-            dist,
-            dataset.get_batch(eval_step),
-            dataset.layout,
-            phase=args.phase,
-            carry_state=args.carry_state,
-        )
+        if args.carry_state and dataset.should_reset_state_before_step(eval_step):
+            eval_rwkv_state = dist.initial_rwkv_state
+            eval_screen_state = dist.initial_screen_state
+        if args.carry_state:
+            eval_metrics, eval_rwkv_state, eval_screen_state = (
+                evaluate_batch_data_parallel_with_state(
+                    dist,
+                    dataset.get_batch(eval_step),
+                    dataset.layout,
+                    eval_rwkv_state,
+                    eval_screen_state,
+                    phase=args.phase,
+                )
+            )
+        else:
+            eval_metrics = evaluate_batch_data_parallel(
+                dist,
+                dataset.get_batch(eval_step),
+                dataset.layout,
+                phase=args.phase,
+                carry_state=False,
+            )
         metrics.append(metrics_to_host_dict(eval_metrics))
     mean_metrics = mean_metric_dict(metrics)
     if "loss" in mean_metrics:
@@ -375,6 +394,12 @@ def run_distributed_training(args):
             prefetch_size=args.prefetch_size,
         ):
             local_step = global_step - start_step
+            if args.carry_state and dataset.should_reset_state_before_step(global_step):
+                dist = replace(
+                    dist,
+                    rwkv_state=dist.initial_rwkv_state,
+                    screen_state=dist.initial_screen_state,
+                )
             step_start = time.perf_counter()
             dist, metrics = train_global_batch_data_parallel(
                 dist,

@@ -66,7 +66,7 @@ def train_batch_data_parallel(
 
 @jax.jit(static_argnames=["phase"])
 def eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
-    logits, _, _, stats = train_state.apply_fn(
+    logits, new_rwkv_state, new_screen_state, stats = train_state.apply_fn(
         {"params": train_state.params},
         batch["input_ids"],
         rwkv_state,
@@ -82,7 +82,7 @@ def eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase=
         "u_norm_mean": stats.get("u_norm_mean", jnp.zeros(())),
         "rel_write_mean": stats.get("rel_write_mean", jnp.zeros(())),
         "rel_write_effective_mean": stats.get("rel_write_effective_mean", jnp.zeros(())),
-    }
+    }, new_rwkv_state, new_screen_state
 
 
 def evaluate_global_batch_data_parallel(
@@ -93,7 +93,7 @@ def evaluate_global_batch_data_parallel(
     carry_state=False,
 ):
     rwkv_state, screen_state = _state_inputs(dist, carry_state)
-    metrics = eval_step_data_parallel(
+    metrics, _, _ = eval_step_data_parallel(
         dist.train_state,
         global_batch,
         rwkv_state,
@@ -101,6 +101,24 @@ def evaluate_global_batch_data_parallel(
         phase=phase,
     )
     return aggregate_metrics(metrics)
+
+
+def evaluate_global_batch_data_parallel_with_state(
+    dist,
+    global_batch,
+    rwkv_state,
+    screen_state,
+    *,
+    phase="read_screening_only",
+):
+    metrics, rwkv_state, screen_state = eval_step_data_parallel(
+        dist.train_state,
+        global_batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+    )
+    return aggregate_metrics(metrics), rwkv_state, screen_state
 
 
 def evaluate_batch_data_parallel(
@@ -117,4 +135,23 @@ def evaluate_batch_data_parallel(
         global_batch,
         phase=phase,
         carry_state=carry_state,
+    )
+
+
+def evaluate_batch_data_parallel_with_state(
+    dist,
+    host_batch,
+    layout,
+    rwkv_state,
+    screen_state,
+    *,
+    phase="read_screening_only",
+):
+    global_batch = host_batch_to_global_arrays(host_batch, dist.batch_sharding, layout)
+    return evaluate_global_batch_data_parallel_with_state(
+        dist,
+        global_batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
     )

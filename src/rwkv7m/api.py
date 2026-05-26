@@ -222,6 +222,9 @@ def train_binidx(
     losses = []
     try:
         for step in range(num_steps):
+            if carry_state and dataset.should_reset_state_before_step(step):
+                runtime.rwkv_state = runtime.initial_rwkv_state
+                runtime.screen_state = runtime.initial_screen_state
             batch = dataset.get_batch(step)
             train_state, metrics = train_batch(
                 train_state,

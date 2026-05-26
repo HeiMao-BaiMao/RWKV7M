@@ -45,7 +45,9 @@ from .sharding import (
 from .train_state import DistributedTrainObjects, place_train_objects, replicate_train_objects
 from .trainer import (
     evaluate_batch_data_parallel,
+    evaluate_batch_data_parallel_with_state,
     evaluate_global_batch_data_parallel,
+    evaluate_global_batch_data_parallel_with_state,
     train_batch_data_parallel,
     train_global_batch_data_parallel,
 )
@@ -97,5 +99,7 @@ __all__ = [
     "train_batch_data_parallel",
     "train_global_batch_data_parallel",
     "evaluate_batch_data_parallel",
+    "evaluate_batch_data_parallel_with_state",
     "evaluate_global_batch_data_parallel",
+    "evaluate_global_batch_data_parallel_with_state",
 ]

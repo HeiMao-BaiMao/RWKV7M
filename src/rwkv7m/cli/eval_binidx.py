@@ -62,6 +62,8 @@ def resolve_checkpoint_file(checkpoint):
 
 
 def evaluate_binidx(args):
+    if args.carry_state and args.sampling_mode != "sequential":
+        raise ValueError("--carry-state requires --sampling-mode sequential")
     if args.checkpoint:
         params, config, _ = load_model_safetensors(resolve_checkpoint_file(args.checkpoint))
         if config is None:
@@ -76,6 +78,7 @@ def evaluate_binidx(args):
         batch_size=args.batch_size,
         magic_prime=args.magic_prime,
         epoch_steps=args.steps,
+        sampling_mode=args.sampling_mode,
     )
     runtime = create_runtime(
         jax.random.PRNGKey(args.seed),
@@ -97,17 +100,44 @@ def evaluate_binidx(args):
         )
         return cross_entropy_loss(logits, target_ids, mask), stats
 
+    @jax.jit
+    def stateful_eval_step(input_ids, target_ids, mask, rwkv_state, screen_state):
+        logits, new_rwkv_state, new_screen_state, stats = runtime.model.apply(
+            runtime.variables,
+            input_ids,
+            rwkv_state,
+            screen_state,
+            phase=args.phase,
+            deterministic=True,
+        )
+        loss = cross_entropy_loss(logits, target_ids, mask)
+        return loss, new_rwkv_state, new_screen_state, stats
+
     losses = []
+    rwkv_state = runtime.initial_rwkv_state
+    screen_state = runtime.initial_screen_state
     try:
         for step in range(args.steps):
+            if args.carry_state and dataset.should_reset_state_before_step(step):
+                rwkv_state = runtime.initial_rwkv_state
+                screen_state = runtime.initial_screen_state
             batch = dataset.get_batch(step)
-            loss, _ = eval_step(
-                batch["input_ids"],
-                batch["target_ids"],
-                batch["mask"],
-                runtime.initial_rwkv_state,
-                runtime.initial_screen_state,
-            )
+            if args.carry_state:
+                loss, rwkv_state, screen_state, _ = stateful_eval_step(
+                    batch["input_ids"],
+                    batch["target_ids"],
+                    batch["mask"],
+                    rwkv_state,
+                    screen_state,
+                )
+            else:
+                loss, _ = eval_step(
+                    batch["input_ids"],
+                    batch["target_ids"],
+                    batch["mask"],
+                    runtime.initial_rwkv_state,
+                    runtime.initial_screen_state,
+                )
             losses.append(float(loss))
             if args.print_every and (step % args.print_every == 0 or step == args.steps - 1):
                 print(f"eval step={step} loss={losses[-1]:.6f}")
@@ -120,6 +150,8 @@ def evaluate_binidx(args):
         "tokens": args.steps * args.batch_size * args.ctx_len,
         "loss": mean_loss,
         "perplexity": math.exp(min(mean_loss, 20.0)),
+        "carry_state": bool(args.carry_state),
+        "sampling_mode": args.sampling_mode,
     }
 
 
@@ -131,6 +163,8 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--magic-prime", type=int, default=None)
+    parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
+    parser.add_argument("--carry-state", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")

@@ -96,6 +96,8 @@ Implemented:
 - data-parallel batch placement with `jax.make_array_from_process_local_data`.
 - train/eval step boundaries for local distributed tests.
 - recurrent/screening state reset by default for independent binidx chunks.
+- sequential carry-state train/eval mode with automatic state reset at stream-lane wrap boundaries.
+- validation with a separate carried eval state, so validation does not mutate the training stream state.
 - process 0 checkpoint writing and checkpoint rotation.
 - Orbax train-state checkpoint writing for TPU-scale runs.
 - `run_config.json`, `run_summary.json`, `best_eval.json`, `metrics.jsonl`, and `metrics.csv` output.
@@ -105,9 +107,10 @@ Implemented:
 Pending:
 
 - tuned sharding specs per parameter group.
+- sharded runtime-state checkpoint/resume policy for carried recurrent/screening state.
 - real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
 - TPU pod throughput tuning and failure recovery drills.
-- long-context evaluation harnesses.
+- task-specific long-context evaluation harnesses beyond stateful binidx validation.
 
 ## Resume
 
@@ -162,7 +165,13 @@ The audit checks `run_config.json`, `run_summary.json`, `best_eval.json`, `metri
 
 ## State Carry
 
-The distributed trainer resets recurrent and screening state by default for each sampled binidx chunk, matching the reference `train_batch` behavior. Use `--carry-state` only for deliberate streaming/stateful training.
+The distributed trainer resets recurrent and screening state by default for each sampled binidx chunk, matching the reference `train_batch` behavior. Use `--carry-state` only for deliberate streaming/stateful training, and pair it with `--sampling-mode sequential`.
+
+Sequential sampling assigns one stream lane per batch row. When a lane wraps from its tail back to its head, the trainer resets carried RWKV/screening state before the next step, avoiding context contamination between the end and beginning of the lane.
+
+Periodic validation can also run in carry-state mode. It advances a separate eval state across validation batches and resets that eval state at the same lane-wrap boundaries, so validation does not mutate the training stream state.
+
+Current checkpoint backends persist train state, but distributed carry-state runtime state restore is not yet validated as a sharded TPU resume policy. Single-process `rwkv7m-train-binidx` stores `runtime_state.msgpack` for carry-state resume.
 
 ## Export Contract
 

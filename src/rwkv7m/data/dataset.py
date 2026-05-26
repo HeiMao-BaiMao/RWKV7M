@@ -101,6 +101,20 @@ class BinIdxBatchDataset:
             return self.config.epoch_steps * self.config.batch_size * self.config.world_size
         return self.dataset_slot
 
+    @property
+    def sequential_lane_length(self):
+        if self.config.sampling_mode != "sequential":
+            return None
+        lane_count = self.config.batch_size * self.config.world_size
+        return self.dataset_slot // lane_count
+
+    def should_reset_state_before_step(self, step):
+        lane_length = self.sequential_lane_length
+        if lane_length is None:
+            return False
+        step = int(step)
+        return step > 0 and step % lane_length == 0
+
     def sample_offset(self, sample_index, *, epoch=0):
         if self.config.sampling_mode == "sequential":
             batch_idx = int(sample_index) % self.config.batch_size

@@ -26,11 +26,19 @@ Implemented:
    - optional read/write separated phase.
 5. Optax training step and toy training loop.
 6. Inference helpers: `prefill`, `decode_one`, `generate`.
-7. Installable library API: `from rwkv7m import ...`.
+7. RWKV-LM-V7 compatible `.bin/.idx` reader and sampler.
+8. Sequential carry-state binidx training and validation with lane-wrap state reset.
+9. RWKV tokenizer API and JSONL-to-binidx conversion using the repository vocabulary.
+10. Safetensors export/import for Flax params with model config and tokenizer metadata.
+11. PyTorch-readable safetensors loading helper for external runtime projects.
+12. Single-process train checkpoints with optional runtime state for carry-state resume.
+13. Local-testable distributed data-parallel training layer with mesh/sharding helpers.
+14. Process-aware Flax and Orbax train-state checkpoints, metrics, summaries, validation hooks, checkpoint rotation, and run artifact audit tooling.
+15. Installable library API: `from rwkv7m import ...`.
 
 Important limitation:
 
-The current code is a pure JAX/Flax reference path. It is full-sequence-training-first and suitable for correctness testing and small experiments. It does not yet provide production fused RWKV kernels, pretrained RWKV checkpoint conversion, tokenizer integration, or distributed training. The external recurrent state carry is implemented for this reference model, but it should not be treated as compatibility with upstream RWKV-7 production checkpoints.
+The current code is still a JAX/Flax reference path. It is suitable for correctness testing, small experiments, portable artifact validation, and local distributed smoke tests. It does not yet provide production fused RWKV kernels, pretrained RWKV checkpoint conversion, tuned TPU sharding policy, real TPU pod checkpoint validation, or a PyTorch/non-JAX runtime. The external recurrent state carry is implemented for this reference model, but it should not be treated as compatibility with upstream RWKV-7 production checkpoints.
 
 ## 3. Package Layout
 
@@ -38,11 +46,35 @@ The current code is a pure JAX/Flax reference path. It is full-sequence-training
 src/rwkv7m/
   __init__.py
   api.py
+  assets/
+  backends/
+    torch/
+      checkpoint.py
   data/
     binidx.py
     dataset.py
   cli/
+    audit_distributed_run.py
+    bench_binidx.py
+    eval_binidx.py
+    generate.py
+    make_binidx.py
     train_binidx.py
+    train_binidx_distributed.py
+  distributed/
+    audit.py
+    checkpoint.py
+    input_pipeline.py
+    mesh.py
+    metrics.py
+    partitioning.py
+    sharding.py
+    train_state.py
+    trainer.py
+  io/
+    config.py
+    flax_checkpoint.py
+    safetensors.py
   model/
     rwkv_core.py
     screened_rwkv.py
@@ -50,6 +82,8 @@ src/rwkv7m/
     state.py
   infer/
     generate.py
+  tokenizer/
+    rwkv_tokenizer.py
   train/
     train_loop.py
     train_state.py
@@ -103,6 +137,8 @@ train_state, metrics = train_batch(train_state, batch, runtime)
 ```
 
 `train_batch` resets recurrent state by default. This is intentional: normal RWKV-LM-V7 style binidx training samples shuffled independent chunks. Pass `carry_state=True` only for contiguous streaming/stateful training.
+
+For binidx training and validation, carry-state mode must be paired with `sampling_mode="sequential"` / `--sampling-mode sequential`. The `magic` sampler is a cubic pseudo-shuffle, so carrying state through it would mix unrelated contexts. In sequential mode each batch row is a separate stream lane, and carried RWKV/screening state is reset automatically when that lane wraps from its tail back to its head.
 
 For JAX efficiency, `RWKV7MRuntime` keeps reusable initial zero states for the configured batch size. The default stateless training path reuses those immutable JAX arrays instead of rebuilding zero states every step.
 
@@ -303,10 +339,30 @@ offset = ((factor * ii^3) % magic_prime) * ctx_len
 
 `magic_prime` is automatically computed as the largest `3n+2` prime not greater than `(data_size - 1) // ctx_len`, and can also be supplied explicitly. The extra `-1` ensures that every sampled `ctx_len + 1` span remains inside the `.bin` file.
 
+For streaming/stateful training, use sequential sampling:
+
+```powershell
+uv run rwkv7m-train-binidx --data-file data/minipile --ctx-len 512 --batch-size 1 --steps 100 --sampling-mode sequential --carry-state --vocab-size 65536
+```
+
+Sequential sampling assigns a stream lane to each batch row. The sampler exposes `should_reset_state_before_step(step)` so training and validation reset carried state at lane wrap boundaries instead of carrying context from the end of a lane into its beginning.
+
 CLI:
 
 ```powershell
 uv run rwkv7m-train-binidx --data-file data/minipile --ctx-len 512 --batch-size 1 --steps 100 --vocab-size 65536
+```
+
+Validation:
+
+```powershell
+uv run rwkv7m-eval-binidx --data-file data/minipile --ctx-len 512 --batch-size 1 --steps 10 --vocab-size 65536
+```
+
+Stateful stream validation:
+
+```powershell
+uv run rwkv7m-eval-binidx --data-file data/minipile --ctx-len 512 --batch-size 1 --steps 10 --sampling-mode sequential --carry-state --vocab-size 65536
 ```
 
 ## 12. Inference
@@ -348,6 +404,11 @@ Current tests cover:
 - config validation,
 - public top-level runtime API,
 - public top-level train API,
+- tokenizer metadata and text round trip,
+- binidx data loading and sequential carry-state reset behavior,
+- safetensors export/import and train checkpoint round trip,
+- stateful binidx validation CLI,
+- local distributed mesh/sharding, train-state placement, trainer, checkpoint, run audit, and CLI boundaries,
 - toy training stability,
 - forward/backward smoke benchmarks.
 
@@ -357,7 +418,7 @@ Run:
 uv run pytest -q
 ```
 
-As of this document update, the full suite passes locally.
+As of this document update, the full suite passes locally: 88 tests.
 
 ## 14. Design Rules
 
@@ -382,10 +443,10 @@ Prefer:
 
 Next engineering steps:
 
-1. tokenizer and checkpoint IO,
-2. upstream RWKV-7 checkpoint mapping,
-3. custom kernels or kernel-backed WKV recurrence,
-4. long-context retrieval evaluation,
-5. causal intervention hooks for slot ablation/patching,
-6. richer train configs and checkpoint save/load,
-7. distributed training support.
+1. Validate Orbax train-state checkpoint save/resume on real TPU pods, including sharded optimizer/parameter states.
+2. Tune per-parameter TPU sharding rules beyond the current rule-based placement hooks.
+3. Tune TPU pod throughput and document failure recovery drills.
+4. Implement task-specific long-context evaluation harnesses beyond stateful binidx validation.
+5. Add causal intervention hooks for slot ablation/patching, read shuffle, write suppression, and frozen-slot controls.
+6. Implement upstream RWKV-7 checkpoint mapping only after conversion tests prove compatibility.
+7. Add fused/custom kernels or kernel-backed WKV recurrence if JAX/XLA output is insufficient.

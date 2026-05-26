@@ -95,7 +95,7 @@ state, metrics = train_batch(state, batch, runtime)
 print(float(metrics["loss"]))
 ```
 
-`train_batch` はデフォルトで recurrent state をリセットします。これは、独立にサンプリングされた training chunk で学習する通常の使い方に合わせた挙動です。連続した streaming/stateful training を意図する場合だけ `carry_state=True` を指定してください。binidx 学習で state を持ち越す場合は、疑似シャッフルされた `magic` sampler ではなく `sampling_mode="sequential"` / `--sampling-mode sequential` と組み合わせます。
+`train_batch` はデフォルトで recurrent state をリセットします。これは、独立にサンプリングされた training chunk で学習する通常の使い方に合わせた挙動です。連続した streaming/stateful training を意図する場合だけ `carry_state=True` を指定してください。binidx 学習と評価で state を持ち越す場合は、疑似シャッフルされた `magic` sampler ではなく `sampling_mode="sequential"` / `--sampling-mode sequential` と組み合わせます。`sequential` では batch row ごとに stream lane を割り当て、lane が末尾から先頭へ wrap する境界で carried state を自動リセットします。
 
 ## 設定項目の考え方
 
@@ -109,7 +109,7 @@ CLI の設定は、まず小さい値で smoke run を通し、checkpoint/resume
 | `--global-batch-size` | `rwkv7m-train-binidx-dp` 用の全体batch sizeです。`process_count` と local device 数で割り切れる値にします。 |
 | `--steps` | 実行する optimizer update 数です。resume 時も「checkpointから追加で何step回すか」を意味します。 |
 | `--sampling-mode` | `magic` は従来の疑似シャッフルsampling、`sequential` はstream laneごとに連続chunkを読むmodeです。 |
-| `--carry-state` | chunk間で RWKV state / screening state を持ち越します。長期stream訓練用です。`--sampling-mode sequential` とセットで使います。 |
+| `--carry-state` | chunk間で RWKV state / screening state を持ち越します。長期stream訓練/評価用です。`--sampling-mode sequential` とセットで使います。 |
 | `--vocab-size` | tokenizer/dataset の語彙サイズです。RWKV vocab の binidx では通常 `65536` です。 |
 | `--d-model`, `--d-ffn`, `--n-layers` | model size を決める主要項目です。大きくするとメモリとcompile時間が増えます。 |
 | `--n-heads`, `--head-size` | recurrent block のhead構成です。`d_model` と整合する小さい構成から始めます。 |
@@ -123,7 +123,7 @@ config file では CLI option の destination 名をJSON keyにします。た�
 uv run rwkv7m-train-binidx --config configs/minipile-smoke.json.example --steps 2000
 ```
 
-`carry_state` は、長文や章単位のstreamを学習させるための入口です。ただし、疑似シャッフルされたchunkへstateを持ち越すと別文脈が混ざるため、CLIでは `--carry-state` と `--sampling-mode sequential` を同時に指定する必要があります。checkpointには `runtime_state.msgpack` も保存され、単一プロセスCLIではresume時に carried state を復元します。
+`carry_state` は、長文や章単位のstreamを学習・評価させるための入口です。ただし、疑似シャッフルされたchunkへstateを持ち越すと別文脈が混ざるため、CLIでは `--carry-state` と `--sampling-mode sequential` を同時に指定する必要があります。sequential stream lane が wrap する境界では state を自動リセットします。checkpointには `runtime_state.msgpack` も保存され、単一プロセスCLIではresume時に carried state を復元します。
 
 ## RWKV-LM-V7 `.bin/.idx` からの学習
 
@@ -206,7 +206,7 @@ uv run rwkv7m-train-binidx `
   --output-dir out/minipile-smoke
 ```
 
-長期stream訓練を試す場合は、最初から次のように `sequential` sampling と `carry-state` を使います。`batch-size=1` ならstep間で隣接chunkをそのまま読みます。`batch-size>1` ではbatch rowごとに別stream laneを割り当てます。
+長期stream訓練を試す場合は、最初から次のように `sequential` sampling と `carry-state` を使います。`batch-size=1` ならstep間で隣接chunkをそのまま読みます。`batch-size>1` ではbatch rowごとに別stream laneを割り当てます。各 lane が末尾から先頭へ戻る時は state がリセットされるため、stream 終端と先頭の文脈は混ざりません。
 
 ```powershell
 uv run rwkv7m-train-binidx `
@@ -242,6 +242,19 @@ uv run rwkv7m-eval-binidx `
   --ctx-len 512 `
   --batch-size 1 `
   --steps 10 `
+  --vocab-size 65536
+```
+
+stateful stream として validation する場合は、training と同じく `sequential` sampling と `carry-state` を使います。
+
+```powershell
+uv run rwkv7m-eval-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 10 `
+  --sampling-mode sequential `
+  --carry-state `
   --vocab-size 65536
 ```
 
@@ -385,7 +398,7 @@ uv run rwkv7m-train-binidx-dp `
 | --- | --- |
 | `--global-batch-size` | 全process合計のbatch sizeです。分散runでは `--batch-size` ではなくこちらを使います。 |
 | `--sampling-mode` | `magic` または `sequential` です。`--carry-state` を使う場合は `sequential` が必要です。 |
-| `--carry-state` | 分散train step間でstateを持ち越します。ローカル検証用の入口で、実TPU podでのsharded runtime-state checkpoint/resume検証はまだ未完了です。 |
+| `--carry-state` | 分散train/eval step間でstateを持ち越します。validation は評価用 state を別に進め、lane wrap 境界では state をリセットします。実TPU podでのsharded runtime-state checkpoint/resume検証はまだ未完了です。 |
 | `--checkpoint-backend flax` | process 0 が `train_state.msgpack` と `model.safetensors` を書きます。小さいローカルrunやartifact export確認向けです。 |
 | `--checkpoint-backend orbax` | 全processで Orbax train-state checkpoint を書きます。TPU-scale run の主経路です。 |
 | `--keep-last-checkpoints` | 古いcheckpointを残す数です。best checkpoint はrotationから保護されます。 |
@@ -466,6 +479,7 @@ from rwkv7m import (
 - RWKV-LM-V7 互換 `.bin/.idx` dataset reader と sampler。
 - reference RWKV state の chunked inference state carry。
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
+- lane wrap reset 付きの sequential carry-state binidx training / validation。
 - RWKV tokenizer API と JSONL-to-binidx 変換。
 - wheel に同梱される RWKV tokenizer vocabulary fallback。
 - Flax params と model config metadata の safetensors export/import。
@@ -485,7 +499,7 @@ from rwkv7m import (
 - 完全に調整された per-parameter TPU sharding rules。
 - 実 TPU pod 上での Orbax sharded optimizer/parameter checkpoint save/resume 検証。
 - 実 TPU pod 上で検証済みの production-scale distributed TPU trainer。
-- long-context evaluation harnesses。
+- stateful binidx validation を超える task-specific long-context evaluation harnesses。
 
 ## テスト
 
@@ -493,4 +507,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、safetensors/checkpoint boundary、local distributed training boundary が含まれます。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary が含まれます。現時点の full suite は 88 tests です。

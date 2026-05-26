@@ -52,3 +52,91 @@ def test_eval_binidx_runs_one_step(tmp_path):
     assert metrics["tokens"] == 4
     assert metrics["loss"] > 0
     assert metrics["perplexity"] > 1
+
+
+def test_eval_binidx_can_carry_state_on_sequential_sampling(tmp_path):
+    prefix = write_eval_binidx(tmp_path)
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--ctx-len",
+            "4",
+            "--batch-size",
+            "1",
+            "--steps",
+            "2",
+            "--vocab-size",
+            "64",
+            "--d-model",
+            "32",
+            "--d-ffn",
+            "64",
+            "--n-layers",
+            "2",
+            "--n-heads",
+            "2",
+            "--head-size",
+            "16",
+            "--d-slot",
+            "16",
+            "--d-k",
+            "16",
+            "--d-v",
+            "16",
+            "--sampling-mode",
+            "sequential",
+            "--carry-state",
+            "--print-every",
+            "0",
+        ]
+    )
+    metrics = evaluate_binidx(args)
+    assert metrics["steps"] == 2
+    assert metrics["tokens"] == 8
+    assert metrics["carry_state"] is True
+    assert metrics["sampling_mode"] == "sequential"
+    assert metrics["loss"] > 0
+
+
+def test_eval_binidx_carry_state_requires_sequential_sampling(tmp_path):
+    prefix = write_eval_binidx(tmp_path)
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--ctx-len",
+            "4",
+            "--batch-size",
+            "1",
+            "--steps",
+            "1",
+            "--vocab-size",
+            "64",
+            "--d-model",
+            "32",
+            "--d-ffn",
+            "64",
+            "--n-layers",
+            "2",
+            "--n-heads",
+            "2",
+            "--head-size",
+            "16",
+            "--d-slot",
+            "16",
+            "--d-k",
+            "16",
+            "--d-v",
+            "16",
+            "--carry-state",
+            "--print-every",
+            "0",
+        ]
+    )
+    try:
+        evaluate_binidx(args)
+    except ValueError as exc:
+        assert "--carry-state requires --sampling-mode sequential" in str(exc)
+    else:
+        raise AssertionError("carry-state eval with magic sampling should fail")

@@ -59,7 +59,7 @@ state, metrics = train_batch(state, batch, runtime)
 print(float(metrics["loss"]))
 ```
 
-`train_batch` resets recurrent state by default, which is the correct mode for independently sampled training chunks. Use `carry_state=True` only for deliberate streaming/stateful training. For binidx training, pair carry-state training with `sampling_mode="sequential"` / `--sampling-mode sequential`; carrying state across the default shuffled `magic` sampler mixes unrelated chunks. The default path reuses immutable initial zero states in the runtime, so it does not rebuild zero states every step for the configured batch size.
+`train_batch` resets recurrent state by default, which is the correct mode for independently sampled training chunks. Use `carry_state=True` only for deliberate streaming/stateful training. For binidx training and evaluation, pair carry-state mode with `sampling_mode="sequential"` / `--sampling-mode sequential`; carrying state across the default shuffled `magic` sampler mixes unrelated chunks. Sequential sampling assigns one stream lane per batch row and automatically resets carried RWKV/screening state when a lane wraps back to its beginning. The default path reuses immutable initial zero states in the runtime, so it does not rebuild zero states every step for the configured batch size.
 
 ## Training From RWKV-LM-V7 `.bin/.idx`
 
@@ -134,6 +134,21 @@ uv run rwkv7m-train-binidx `
   --output-dir out/minipile-smoke
 ```
 
+For long stream training, use sequential sampling and carry-state mode from the start:
+
+```powershell
+uv run rwkv7m-train-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 1000 `
+  --sampling-mode sequential `
+  --carry-state `
+  --vocab-size 65536 `
+  --output-dir out/minipile-stream `
+  --save-every 100
+```
+
 `magic_prime` is computed automatically from dataset size and `ctx_len`; pass `--magic-prime` to force a specific value. The automatic value is constrained so every sampled `ctx_len + 1` span stays inside the `.bin` file.
 
 For read/write screening from scratch, the write branch uses slot identity in its write key and a tiny `write_rel_floor` update floor. This avoids a dead write branch when slots are all zero at initialization.
@@ -175,6 +190,19 @@ uv run rwkv7m-eval-binidx `
   --ctx-len 512 `
   --batch-size 1 `
   --steps 10 `
+  --vocab-size 65536
+```
+
+Stateful stream validation uses the same sequential/carry-state contract as training:
+
+```powershell
+uv run rwkv7m-eval-binidx `
+  --data-file data/minipile `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 10 `
+  --sampling-mode sequential `
+  --carry-state `
   --vocab-size 65536
 ```
 
@@ -340,6 +368,7 @@ Lower-level modules:
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
 - State-level screening with `read_screening_only` and `read_write` phases.
+- Sequential carry-state binidx training and validation with lane-wrap state reset.
 - RWKV tokenizer API and JSONL-to-binidx conversion.
 - Wheel-packaged RWKV tokenizer vocabulary fallback.
 - Safetensors export/import for Flax params plus model config metadata.
@@ -359,7 +388,7 @@ Not yet included:
 - fully tuned per-parameter TPU sharding rules,
 - real TPU pod validation of Orbax sharded optimizer/parameter checkpoint save/resume,
 - production-scale distributed TPU trainer validation on real TPU pods,
-- long-context evaluation harnesses.
+- task-specific long-context evaluation harnesses beyond stateful binidx validation.
 
 ## Tests
 
@@ -367,4 +396,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, safetensors/checkpoint boundaries, and local distributed training boundaries.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, and local distributed training boundaries. The current full suite is 88 tests.
