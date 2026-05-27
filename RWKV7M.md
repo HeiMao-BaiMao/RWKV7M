@@ -160,6 +160,7 @@ losses, runtime, train_state = train_binidx(
 `ModelConfig` validates:
 
 - `d_model == n_heads * head_size`
+- ChannelMix uses `d_ffn` as its hidden width; `d_ffn <= 0` falls back to `4 * d_model` for compatibility with the default config sentinel.
 - if screening is enabled:
   - `screening.d_model == model.d_model`
   - `len(screening.bank_ids) == screening.n_slots`
@@ -418,7 +419,7 @@ Run:
 uv run pytest -q
 ```
 
-As of this document update, the full suite passes locally: 89 tests.
+As of this document update, the full suite passes locally: 90 tests.
 
 ## 14. Design Rules
 

@@ -32,6 +32,10 @@ def _get_dtype(cfg: RWKV7Config):
     return jnp.float32
 
 
+def _get_ffn_dim(cfg: RWKV7Config):
+    return int(cfg.d_ffn) if int(cfg.d_ffn) > 0 else int(cfg.d_model) * 4
+
+
 def _time_shift(x, prev_x=None):
     """x: [B, T, C] -> shift by 1 in time, using prev_x for chunked decode."""
     if prev_x is None:
@@ -253,7 +257,8 @@ class RWKV7ChannelMix(nn.Module):
         x_k = x + xx * self.param("x_k", mix_init, (1, 1, C))
 
         # FFN
-        k = nn.Dense(C * 4, use_bias=False, name="key",
+        d_ffn = _get_ffn_dim(self.config)
+        k = nn.Dense(d_ffn, use_bias=False, name="key",
                      kernel_init=nn.initializers.uniform(scale=1.0 / math.sqrt(C)))(x_k)
         k = jax.nn.relu(k) ** 2  # Squared ReLU
         v = nn.Dense(C, use_bias=False, name="value",

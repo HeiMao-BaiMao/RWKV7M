@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from flax.traverse_util import flatten_dict
 from rwkv7m.model.screening import ScreeningConfig
 from rwkv7m.model.state import init_screen_state, tuple_set
 from rwkv7m.model.screened_rwkv import (
@@ -66,6 +67,28 @@ class TestShapes:
         for l_state in screen_state.layers:
             assert l_state.slots.shape == (self.batch_size, self.cfg.screening.n_slots, self.cfg.screening.d_slot)
             assert l_state.ages.shape == (self.batch_size, self.cfg.screening.n_slots)
+
+    def test_channel_mix_uses_configured_d_ffn(self):
+        key, subkey = jax.random.split(self.key)
+        variables, _ = create_model_variables(subkey, self.cfg, self.batch_size)
+        flat_params = flatten_dict(variables["params"], sep="/")
+
+        ffn_key_kernels = [
+            value
+            for name, value in flat_params.items()
+            if name.endswith("/ffn/key/kernel")
+        ]
+        ffn_value_kernels = [
+            value
+            for name, value in flat_params.items()
+            if name.endswith("/ffn/value/kernel")
+        ]
+        assert len(ffn_key_kernels) == self.cfg.n_layers
+        assert len(ffn_value_kernels) == self.cfg.n_layers
+        for kernel in ffn_key_kernels:
+            assert kernel.shape == (self.cfg.d_model, self.cfg.d_ffn)
+        for kernel in ffn_value_kernels:
+            assert kernel.shape == (self.cfg.d_ffn, self.cfg.d_model)
 
     def test_state_updates(self):
         key, subkey = jax.random.split(self.key)
