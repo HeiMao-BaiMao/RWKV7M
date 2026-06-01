@@ -5,6 +5,7 @@ import pytest
 from rwkv7m.model.screening import ScreeningConfig
 from rwkv7m.model.screened_rwkv import ModelConfig
 from rwkv7m.train.train_loop import run_toy_training, generate_toy_batch
+from rwkv7m.train.train_state import rwkv_warmup_cosine_schedule
 
 
 def make_train_config():
@@ -113,3 +114,16 @@ class TestTraining:
         )
 
         assert jnp.isfinite(metrics["loss"])
+
+
+def test_rwkv_warmup_cosine_schedule_matches_reference_points():
+    schedule = rwkv_warmup_cosine_schedule(
+        lr_init=1e-3,
+        lr_final=1e-5,
+        warmup_steps=10,
+        total_steps=100,
+    )
+
+    assert float(schedule(0)) == pytest.approx(1e-5)
+    assert float(schedule(10)) == pytest.approx(1e-3)
+    assert float(schedule(100)) == pytest.approx(1e-5)

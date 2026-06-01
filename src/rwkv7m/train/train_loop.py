@@ -19,8 +19,12 @@ def build_train_state(key, model, variables, config, total_steps=10000):
         "lr_init": getattr(config, "lr_init", 1e-3),
         "lr_final": getattr(config, "lr_final", 1e-5),
         "warmup_steps": getattr(config, "warmup_steps", 10),
+        "lr_schedule": getattr(config, "lr_schedule", "optax_cosine"),
         "max_grad_norm": getattr(config, "max_grad_norm", 1.0),
         "weight_decay": getattr(config, "weight_decay", 0.001),
+        "adam_beta1": getattr(config, "adam_beta1", 0.9),
+        "adam_beta2": getattr(config, "adam_beta2", 0.999),
+        "adam_eps": getattr(config, "adam_eps", 1e-8),
     }
     tx = create_optimizer(opt_config, total_steps=total_steps)
     state = TrainState.create(

@@ -28,6 +28,17 @@ class ModelConfig:
     use_screening: bool = True
     screening: ScreeningConfig = field(default_factory=ScreeningConfig)
 
+    # Training defaults used by the reference train-state builder.
+    lr_init: float = 1e-3
+    lr_final: float = 1e-5
+    warmup_steps: int = 10
+    lr_schedule: str = "optax_cosine"
+    max_grad_norm: float = 1.0
+    weight_decay: float = 0.001
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
+
     def __post_init__(self):
         if self.d_model != self.n_heads * self.head_size:
             raise ValueError("d_model must equal n_heads * head_size")

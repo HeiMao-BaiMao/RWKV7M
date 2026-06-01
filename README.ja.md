@@ -29,6 +29,72 @@ RWKV-7 風の recurrent language model に、任意で state-level screening mem
 | JSONL text を dataset 化する | `rwkv7m-make-binidx` | repository 同梱の RWKV tokenizer vocabulary で `.bin/.idx` を作ります。 |
 | 分散runの成果物を検査する | `rwkv7m-audit-dp-run` | `run_summary.json`、metrics、checkpoint参照、best checkpoint などの整合性を確認します。 |
 
+## RWKV7M と RWKV-7 のアーキテクチャ差分
+
+この repository の RWKV7M は、RWKV-7 風の recurrent core を置き換えるものではなく、その上に任意の state-level screening memory を追加して検証する研究用アーキテクチャです。`--no-screening` を指定した場合は、この実装内で最も RWKV-7 baseline に近い構成になります。ただし現時点の実装は JAX/Flax reference path であり、upstream RWKV-LM-V7 の fused CUDA kernel や既存 `.pth` checkpoint との互換性を主張するものではありません。
+
+| 観点 | RWKV-7 | この repository の RWKV7M | 評価上の注意 |
+| --- | --- | --- | --- |
+| 基本構造 | token embedding、RWKV-7 block stack、final layer norm、LM head で構成される recurrent LM。 | 同じ形の RWKV-7 風 core を `ScreenedRWKVLayer` で包み、指定 layer だけに screening module を挿入できる。 | `--no-screening` を必ず baseline として走らせる。 |
+| Layer 内の処理 | TimeMix/WKV recurrent update と ChannelMix FFN が主な処理。 | 各 layer はまず RWKV block を実行し、その出力に対して必要な layer だけ screening read/write を加える。 | core の差ではなく screening 追加分の寄与を分けて見る。 |
+| Recurrent state | layer ごとに前回の TimeMix input、ChannelMix input、WKV matrix state を持つ。 | RWKV state に加えて、screened layer ごとに slot bank、age、usage EMA を持つ。 | screening state は token列のKV cacheではなく、固定サイズの圧縮memory。 |
+| Memory の表現 | WKV state に履歴情報を圧縮する。明示的な候補slot集合は持たない。 | `n_slots` 個の固定slotに情報を蓄え、query/key similarity と閾値で読むslotを選ぶ。 | slot数やslot次元を増やすとparameter数とstate量も増える。 |
+| Read mechanism | WKV recurrence の結果が hidden update に入る。 | layer input から read query、slotから read key/value を作り、unit-normalized similarity を閾値 `tau` でscreeningする。 | softmax attention ではない。全slotが不要なら総和1に正規化して無理に読む挙動を避ける設計。 |
+| Relevance | 標準attentionのような候補集合softmaxではなく、RWKV recurrent update が系列情報を処理する。 | `Trim-and-Square` relevance を使い、slotごとに独立した採否強度を作る。 | 「相対的に一番ましなslot」ではなく「読む価値があるslot」を選ぶ仮説。 |
+| Read 出力の合成 | RWKV block の出力がそのまま次段へ渡る。 | slot value の重み付き和を TanhNorm で bounded にし、gate と `lambda_screen` を通して RWKV block 出力へ残差的に足す。 | screeningが不安定な初期段階でもcore経路は残る。 |
+| Write / slot update | WKV state はTimeMix内の recurrence で更新される。 | `read_screening_only` ではslow updaterでslotをゆっくり更新する。`read_write` では別の write query/key による write relevance も使える。 | write branch は `read_write` phase かつ `use_write_screening=True` の時だけ有効。 |
+| Phase | architecture上のread/write phaseはない。 | `read_screening_only` と `read_write` を明示的に分ける。互換aliasとして `read_only` は `read_screening_only` に対応する。 | まず `read_screening_only` で安定性を見てから `read_write` を比較する。 |
+| Multi-timescale bank | 標準のRWKV state更新に依存する。 | slotごとに short / mid / long bank id を持ち、bank別の最大更新率でslotの寿命を変えられる。 | 長期memory仮説の検証点。まだ有効性はbenchmarkで確認する必要がある。 |
+| Parameter count | `n_layers`、`d_model`、`d_ffn`、vocab size が主なparameter規模を決める。 | screening layer ごとに read/write projection、gate、delta projection、slot embedding などが増える。 | 機構の有効性を主張するには、単純なparameter増加と分離する必要がある。 |
+| Training state carry | 独立chunk学習ではstateを持ち越さない運用が一般的。 | デフォルトではstateを毎batchリセットし、streaming用途では `--sampling-mode sequential --carry-state` で明示的に持ち越す。 | `magic` sampler でcarryすると無関係chunkが混ざるため禁止している。 |
+| Backend / artifacts | upstream RWKV-LM-V7 は PyTorch + CUDA kernel を主経路にする。 | この repository は JAX/Flax + TPU Research Cloud を主経路にし、外部runtime向けには `safetensors` artifact境界を用意する。 | PyTorch runtime 本体や upstream checkpoint変換はこのrepositoryの対象外。 |
+
+### 1. 共通している RWKV-7 風 core
+
+RWKV7M の core は、RWKV-7 風の `TimeMix` / `ChannelMix` block を積む構成です。TimeMix は layerごとの recurrent state と WKV matrix state を使い、ChannelMix は FFN 経路を担当します。token embedding、block stack、final layer norm、LM head という大枠は RWKV-7 baseline と同じです。
+
+このため、screening の寄与を見たい場合は、同じ `d_model`、`d_ffn`、`n_layers`、`n_heads`、`head_size`、`vocab_size` で `--no-screening` を指定した run を基準にします。これは「この実装内の RWKV-7 風 baseline」です。
+
+### 2. RWKV7M 固有の state-level screening memory
+
+RWKV7M が追加する主な機構は、selected layer にだけ配置される固定slot型の memory です。screened layer では `LayerScreenState` が `slots`、`ages`、`usage_ema` を持ちます。slot は過去tokenをそのまま保存する KV cache ではなく、固定個数・固定次元の圧縮状態です。
+
+Read時は layer input から query を作り、slot から key/value を作ります。query/key は unit norm 化され、similarity が閾値を超えた分だけ `Trim-and-Square` relevance として採用されます。この設計は softmax attention と違い、全候補slotが不要な場合に総和1の重みを強制しません。
+
+### 3. Read 出力の入り方
+
+screening module は RWKV block の代わりではありません。まず RWKV block が通常通り hidden を更新し、その後で slot read の結果を residual として加えます。slot value の合成結果は TanhNorm でboundedにされ、gate と `lambda_screen` を通ってから hidden に足されます。
+
+この構造により、screening が学習初期に有用なslotを作れていない場合でも、core RWKV経路は残ります。一方で、screening 経路が有効なら、core stateだけでは拾いにくい固定slot memoryから追加情報を戻せる、という仮説を検証できます。
+
+### 4. Write と phase の分離
+
+RWKV7M には `read_screening_only` と `read_write` の2つの主要phaseがあります。
+
+`read_screening_only` では、read relevance は使いますが、write relevance branch は使いません。slot は bank別の小さい更新率でゆっくり更新されます。これは、まずread側の効果と安定性を見るための保守的な構成です。
+
+`read_write` では、`use_write_screening=True` の場合に write専用の query/key branch が有効になります。write branch は、どのslotをどれだけ更新するかを別途screeningします。初期slotがゼロに近い状態でwrite branchが死なないよう、slot identity と小さい `write_rel_floor` を使います。
+
+### 5. Parameter 増加との分離
+
+screening module は追加parameterを持つため、単に「RWKV7M が RWKV-7 baseline より loss が低い」だけでは、機構の有効性を示したことになりません。parameter数が増えただけで改善した可能性が残るためです。
+
+そのため、学術用の比較では最低限次の3本を同じdata、token budget、optimizer、dtype、global batch、samplerで比較します。
+
+| 比較run | 目的 |
+| --- | --- |
+| `local_core_baseline` | screeningなしのRWKV-7風baseline。 |
+| `local_mechanism` | 同じcore幅にscreeningを追加した本命run。 |
+| `local_param_control` | screeningなしでFFN幅を増やし、`local_mechanism` 以上のparameter数にしたcontrol。 |
+
+`local_mechanism` が `local_core_baseline` だけでなく `local_param_control` にも held-out validation loss / perplexity で勝つ場合、機構そのものの寄与を示す材料になります。さらに、同じlossへ到達するstep/token数や eval loss curve のAUCが小さければ、state-level screening memory が学習を速くしている材料になります。`comparison.sh` はこの比較行列、parameter count、run protocol、metrics summary、learning speed summary を出すための入口です。
+
+### 6. 互換性と主張範囲
+
+この repository は RWKV-LM-V7 compatible な `.bin/.idx` dataset reader と RWKV tokenizer vocabulary を持ちますが、upstream RWKV-7 checkpoint互換や PyTorch runtime互換をまだ主張しません。学習主経路は JAX/Flax、TPU Research Cloud を意識した distributed training、外部runtimeへ渡すartifact境界は `safetensors` です。
+
+したがって、現時点で主張できるのは「RWKV-7 風 recurrent core に state-level screening memory を追加する研究実装があり、その有効性をparameter control付きで検証できる」という範囲です。性能改善や長期記憶の有効性は、validation / benchmark / ablation の結果で示す必要があります。
+
 ## ファイルとディレクトリの扱い
 
 - `data/`: dataset を置く場所です。`.bin` / `.idx` は大きくなりやすいので git には含めません。

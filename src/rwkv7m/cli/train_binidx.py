@@ -45,6 +45,15 @@ def build_config(args):
         dtype=args.dtype,
         use_screening=args.use_screening,
         screening=screening,
+        lr_init=args.lr_init,
+        lr_final=args.lr_final,
+        warmup_steps=args.warmup_steps,
+        lr_schedule=args.lr_schedule,
+        max_grad_norm=args.max_grad_norm,
+        weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_eps=args.adam_eps,
     )
 
 
@@ -72,6 +81,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--lr-init", type=float, default=1e-3)
+    parser.add_argument("--lr-final", type=float, default=1e-5)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default="optax_cosine")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--weight-decay", type=float, default=0.001)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--adam-eps", type=float, default=1e-8)
     parser.add_argument("--vocab-size", type=int, default=65536)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-ffn", type=int, default=256)

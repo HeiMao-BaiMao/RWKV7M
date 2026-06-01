@@ -2,6 +2,7 @@ __pycache__
 /.venv
 /sample
 /out/
+/.comparison/
 *.json
 !*.json.example
 /data/*.bin
