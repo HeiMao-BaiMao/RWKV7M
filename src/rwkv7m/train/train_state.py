@@ -34,19 +34,14 @@ def rwkv_warmup_cosine_schedule(lr_init, lr_final, warmup_steps, total_steps):
 
 
 def decay_mask_fn(params):
+    # Upstream RWKV-LM decays only true matmul weights. Matching that here
+    # keeps token-shift mix params, w0/a0/v0/k_k/k_a/r_k anchors, LoRA
+    # matrices, norms, biases, tau/lambda scalars, and slot_embed decay-free.
     flat = flax.traverse_util.flatten_dict(params)
     mask = {}
     for path, value in flat.items():
-        name = "/".join(path)
-        use_decay = (
-            value.ndim >= 2
-            and "slot_embed" not in name
-            and "tau" not in name
-            and "lambda" not in name
-            and "norm" not in name.lower()
-            and "bias" not in name.lower()
-        )
-        mask[path] = use_decay
+        leaf = path[-1]
+        mask[path] = value.ndim >= 2 and leaf in ("kernel", "embedding")
     return flax.traverse_util.unflatten_dict(mask)
 
 

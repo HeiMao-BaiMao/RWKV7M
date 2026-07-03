@@ -396,4 +396,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, and local distributed training boundaries. The current full suite is 90 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, and local distributed training boundaries. The current full suite is 91 tests.

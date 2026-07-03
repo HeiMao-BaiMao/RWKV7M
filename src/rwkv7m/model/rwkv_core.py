@@ -44,6 +44,13 @@ def _time_shift(x, prev_x=None):
     return jnp.concatenate([first, x[:, :-1, :]], axis=1)
 
 
+def symmetric_uniform_init(bound):
+    """U(-bound, +bound); flax nn.initializers.uniform is [0, scale) only."""
+    def init_fn(key, shape, dtype=jnp.float32):
+        return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
+    return init_fn
+
+
 def wkv_step(state, r_t, w_t, k_t, v_t, neg_kk_t, kka_t):
     """Single-step WKV recurrence (pure function).
 
@@ -109,7 +116,7 @@ class RWKV7TimeMix(nn.Module):
 
         # --- Projections ---
         r = nn.Dense(C, use_bias=False, name="receptance",
-                     kernel_init=nn.initializers.uniform(scale=1.0 / math.sqrt(C)))(x_r)
+                     kernel_init=symmetric_uniform_init(0.5 / math.sqrt(C)))(x_r)
 
         # Decay (LoRA-style)
         d_decay = max(32, int(round((2.5 * math.sqrt(C)) / 32) * 32))
@@ -128,9 +135,9 @@ class RWKV7TimeMix(nn.Module):
         w_clamped = -jax.nn.softplus(-w_raw) - 0.5  # soft-clamp to (-inf, -0.5)
 
         k = nn.Dense(C, use_bias=False, name="key",
-                     kernel_init=nn.initializers.uniform(scale=0.1 / math.sqrt(C)))(x_k)
+                     kernel_init=symmetric_uniform_init(0.05 / math.sqrt(C)))(x_k)
         v = nn.Dense(C, use_bias=False, name="value",
-                     kernel_init=nn.initializers.uniform(scale=1.0 / math.sqrt(C)))(x_v)
+                     kernel_init=symmetric_uniform_init(0.5 / math.sqrt(C)))(x_v)
 
         # --- Value residual (cross-layer, layer > 0) ---
         if self.layer_idx == 0:
@@ -145,7 +152,7 @@ class RWKV7TimeMix(nn.Module):
                 return (0.73 - linear * 0.4).reshape(1, 1, C)
 
             v0 = self.param("v0", v0_init, (1, 1, C))
-            v12 = jnp.tanh(x_v @ v1) @ v2
+            v12 = (x_v @ v1) @ v2
             v = v + (v_first - v) * jax.nn.sigmoid(v0 + v12)
 
         # --- In-context learning rate gate ---
@@ -160,7 +167,7 @@ class RWKV7TimeMix(nn.Module):
             return (-0.19 + zigzag * 0.3 + linear * 0.4).reshape(1, 1, C)
 
         a0 = self.param("a0", a0_init, (1, 1, C))
-        a12 = jnp.tanh(x_a @ a1) @ a2
+        a12 = (x_a @ a1) @ a2
         a = jax.nn.sigmoid(a0 + a12)
 
         # --- Output gate ---
@@ -214,8 +221,11 @@ class RWKV7TimeMix(nn.Module):
         y = jnp.swapaxes(y_h, 0, 1).reshape(B, T, C)
 
         # --- Post-processing ---
-        # GroupNorm (note: eps=64e-5 = 0.00064)
-        y = nn.GroupNorm(num_groups=H, epsilon=64e-5, name="ln_x")(
+        # GroupNorm (note: eps=64e-5 = 0.00064; scale init follows the
+        # upstream layer-dependent ((1+layer)/n_layers)**0.7 rule)
+        ln_x_scale = ((1 + self.layer_idx) / self.config.n_layers) ** 0.7
+        y = nn.GroupNorm(num_groups=H, epsilon=64e-5, name="ln_x",
+                         scale_init=nn.initializers.constant(ln_x_scale))(
             y.reshape(B * T, C)
         ).reshape(B, T, C)
 
@@ -259,7 +269,7 @@ class RWKV7ChannelMix(nn.Module):
         # FFN
         d_ffn = _get_ffn_dim(self.config)
         k = nn.Dense(d_ffn, use_bias=False, name="key",
-                     kernel_init=nn.initializers.uniform(scale=1.0 / math.sqrt(C)))(x_k)
+                     kernel_init=symmetric_uniform_init(0.5 / math.sqrt(C)))(x_k)
         k = jax.nn.relu(k) ** 2  # Squared ReLU
         v = nn.Dense(C, use_bias=False, name="value",
                      kernel_init=nn.initializers.zeros)(k)

@@ -279,11 +279,15 @@ Initialization creates write branch parameters whenever `cfg.use_write_screening
 
 ## 11. Training
 
-Training uses next-token cross entropy:
+Training uses next-token cross entropy plus the RWKV-LM L2Wrap max-logit
+regularizer (equivalent auxiliary form, factor `1e-4`):
 
 ```python
-loss = cross_entropy_loss(logits, target_ids, mask)
+loss = cross_entropy_loss(logits, target_ids, mask) + l2wrap_loss(logits)
 ```
+
+Metrics report the pure cross entropy as `loss` and the regularized
+objective as `total_loss`. Evaluation paths use `cross_entropy_loss` only.
 
 `train_step` is JIT-compiled with static `phase`.
 
@@ -292,7 +296,9 @@ Optimizer:
 - global norm clipping,
 - AdamW,
 - warmup cosine decay,
-- no weight decay on bias, norm, tau, lambda, and slot embeddings.
+- weight decay only on dense kernels and the token embedding, matching
+  upstream RWKV-LM: bias, norm, tau, lambda, slot embeddings, token-shift
+  mix params, LoRA matrices, and w0/a0/v0/k_k/k_a/r_k anchors are excluded.
 
 The optimizer clamps warmup steps for very short schedules so library smoke tests such as `total_steps=2` remain valid.
 
@@ -419,7 +425,7 @@ Run:
 uv run pytest -q
 ```
 
-As of this document update, the full suite passes locally: 90 tests.
+As of this document update, the full suite passes locally: 91 tests.
 
 ## 14. Design Rules
 

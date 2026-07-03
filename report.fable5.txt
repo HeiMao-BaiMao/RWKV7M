@@ -1,0 +1,280 @@
+# RWKV7M 理論・実装検証報告書
+
+検証日: 2026-07-03
+検証者: Claude Fable 5 (Claude Code)
+対象リビジョン: main @ 403f85e "Add academic comparison harness for screening memory"
+検証方法:
+  - 理論文書 (RWKV7M.paper.md / RWKV7M.md / README.md) の精読
+  - 全引用文献の実在確認 (知識カットオフ後の文献は Web で確認)
+  - 出典論文の数式と本プロジェクトの数式の照合
+  - src/rwkv7m のモデル・学習・データコードを、同梱の上流参照
+    sample/RWKV-LM-V7/src/model.py および RWKV7(Goose).md と逐一照合
+  - テストスイート実行 (uv run pytest -q)
+
+====================================================================
+結論 (TL;DR)
+====================================================================
+
+理論は学術的に健全である。依拠する全 9 引用文献の実在を確認し
+(核心の「Screening Is Enough」arXiv:2604.01178 も 2026 年 4 月投稿の
+実在論文)、本プロジェクトの数式は出典論文の数式と数学的に一致する
+(Trim-and-Square は出典の Trim 変換の正確な再パラメータ化)。主張は
+「検証されるべき研究仮説」として反証可能な形で提示されており、
+方法論的に誠実である。
+
+コードは自プロジェクトの仕様 (RWKV7M.md / RWKV7M.paper.md) に忠実で、
+検証時点でテスト 91 件全て成功。WKV 再帰の数式は上流 RWKV-7 と厳密に
+一致する。ただし上流 RWKV-7 との相違を 3 点発見した。うち 1 つ
+(重み初期化の非対称性) はほぼ確実に意図しないバグである。
+(→ 末尾「適用した修正」参照)
+
+====================================================================
+1. 理論の学術的検証
+====================================================================
+
+1.1 引用文献の実在性 — 全て実在
+--------------------------------------------------------------------
+RWKV7M.paper.md の参考文献 9 本を確認した。
+
+- RWKV-7 "Goose" (Peng et al., arXiv:2503.14456, 2025) …… 実在
+- Attention Is All You Need (arXiv:1706.03762) …… 実在
+- Mamba (arXiv:2312.00752) …… 実在
+- RetNet (arXiv:2307.08621) …… 実在
+- DeltaNet 並列化 (Yang et al., arXiv:2406.06484) …… 実在
+- Zoology (arXiv:2312.04927) …… 実在
+- Lost in the Middle (arXiv:2307.03172) …… 実在
+- RULER (arXiv:2404.06654) …… 実在
+- Nakanishi, "Screening Is Enough" (arXiv:2604.01178, 2026)
+  …… Web で実在確認 (RIKEN CEMS / 東京大学、2026-04-01 投稿、
+  v3 は 2026-05-07 改訂)。「Multiscreen」= 有界類似度 + 明示的閾値で
+  無関連キーを棄却するアーキテクチャ、という本プロジェクトの引用内容
+  も論文と一致。
+
+捏造引用はない。
+
+1.2 数式の照合 — 出典と数学的に一致
+--------------------------------------------------------------------
+本プロジェクト                     | Multiscreen 論文 (2604.01178)
+-----------------------------------+--------------------------------
+rel = relu((sim-τ)/(1-τ))^2        | Trim 変換 α = [max(1-(1-s)/r, 0)]^2
+                                   | → τ = 1-r と置けば恒等的に同一式
+τ = 2σ(θ)-1 ∈ (-1,1)               | r = σ(s_r) → 実効閾値 1-r ∈ (0,1)
+                                   | → 本実装の方が範囲が広い (負の閾値
+                                   |   も許容)。分母 1-τ > 0 は常に保証
+                                   |   され数学的に well-defined
+TanhNorm(z) = cap·tanh(‖z‖/cap)    | TanhNorm(x) = tanh‖x‖ · x/‖x‖
+             · z/‖z‖               | → cap=1 (デフォルト) で完全一致。
+                                   |   cap は自然な一般化
+z = Σ rel·unit(v) (非 sum-to-one)  | h = Σ α·v̄ (非 sum-to-one)
+                                   | → 一致 (value の unit norm 含む)
+
+出典論文はトークン列に対する screening だが、本プロジェクトはそれを
+固定サイズの state slot に移植するのが新規部分。この差分 (距離マスク
+の不在、write screening の追加) は paper.md 自身が「token-level
+Multiscreen の結果は RWKV state slot に直接には移らない」とリスク
+明記しており、誠実である。
+
+1.3 手法自体の健全性
+--------------------------------------------------------------------
+- 動機: 「softmax は全候補が無関係でも総和 1 の重みを割り当てる」と
+  いう問題意識は、attention sink (StreamingLLM) や softmax off-by-one
+  の議論など既存文献で裏付けられた実在の問題。
+- 安定性: スロット更新 s ← s + μ·rel·(δ - s) は μ·rel ≤ 0.05、
+  δ = tanh(…) ∈ (-1,1) なので非拡大的で状態爆発しない。読み出しは
+  TanhNorm で有界、残差融合は λ ≈ 0.01 (softplus パラメータ化) の
+  小初期化 + ゲート付き — backbone を壊さない設計として妥当。
+- 計算量の主張: 追加メモリ O(M·d_slot)、トークンあたり計算 O(M) 定数
+  で「token-to-token attention を復活させない」という主張は正しい
+  (KV キャッシュは増えない)。ウォールクロックが自動では改善しない点
+  もリスク節で自認済み。
+- 既知のリスクの自認: 閾値超えのスロットにしか勾配が流れない (τ が
+  上がりすぎると記憶が死ぬ) 問題を論文自身が挙げ、コード側に
+  leaky warmup・write_rel_floor・スロット埋め込みによる write key
+  ウォームアップという緩和策が実装済み。
+- 方法論: parameter/FLOPs マッチのベースライン、softmax-over-slots
+  対照群、random slot 対照群、因果的介入 (ablation/patching) という
+  評価計画と、反証可能な 8 項目の受け入れ基準 — 研究設計として良質。
+
+1.4 学術的な弱点 (誤りではなく改善提案)
+--------------------------------------------------------------------
+(1) 関連研究の欠落: 外部メモリ系 (NTM/DNC、Memformer、Recurrent
+    Memory Transformer、Titans)、fast weights (Ba et al. 2016;
+    Schlag et al. 2021 — linear attention = fast weight memory の
+    指摘は、RWKV-7 の delta rule 自体が連想メモリである点に直結)、
+    正規化を保ったままゼロを作れる sparsemax/entmax や ReLU/sigmoid
+    attention との対比が未引用。特に RWKV-7 の in-context learning
+    rate a_t 自体がすでに state への書き込みゲートなので、write
+    screening との関係整理は査読で確実に問われる。
+(2) マルチタイムスケール bank (short/mid/long) は複数時間スケール
+    記憶の先行研究 (fast/slow weights、Clockwork RNN、Titans) と
+    整合的な妥当な仮説だが、その系譜への言及がない。
+(3) usage_ema が状態として定義されながら一切更新されない死に
+    フィールド (state.py、screening.py では素通し)。設計文書と実装の
+    対応として明記すべき。
+
+====================================================================
+2. コード検証
+====================================================================
+
+2.1 RWKV-7 コアは上流と数学的に一致
+--------------------------------------------------------------------
+同梱の上流参照 sample/RWKV-LM-V7/src/model.py および RWKV7(Goose).md
+と逐一照合した。
+
+- WKV 再帰 (rwkv_core.py の wkv_step):
+    S_t = S_{t-1}·diag(e^{-e^w}) + (S_{t-1}·(-κ̂))⊗(κ̂⊙a) + v⊗k
+    o_t = S_t·r_t
+  上流カーネル・Goose.md の式と完全一致 (decay の key 次元適用、
+  除去項の pre-decay 状態使用、状態行列の次元の向きまで正しい)。
+- soft-clamp -softplus(-w)-0.5、GroupNorm eps=64e-5、k の L2 正規化
+  (実効 eps 1e-12)、k·(1+(a-1)k_a)、r·k·r_k 残差、全初期化定数
+  (w0 の zigzag 式、a0/v0/k_k/k_a/r_k、mix 係数のべき
+  0.2/0.9/0.7/0.7/0.9/0.2、LoRA 次元 2.5/2.5/1.7/5.0·√C) — 全て
+  上流と一致。
+- チャンク分割 decode 用の状態持ち越し (token-shift 前値 + WKV 行列)
+  は正しい拡張で、prefill と逐次 decode の一致がテストで検証されて
+  いる (tests/test_shapes.py: test_scan_consistency)。
+
+2.2 発見した問題
+--------------------------------------------------------------------
+(A) 初期化バグ — 非対称 uniform 【重要・要修正】
+    Flax の nn.initializers.uniform(scale) は [0, scale) の片側分布
+    (実測で min≈0 / mean≈scale/2 を確認済み)。上流は対称分布。
+    - rwkv_core.py receptance: uniform(1.0/√C)
+        → 上流は U(-0.5/√C, +0.5/√C) (model.py:617)
+    - rwkv_core.py key / value、ChannelMix key も同様
+        (上流 model.py:618-619, 761)
+    選ばれた scale が上流の対称範囲の全幅とちょうど一致しているため、
+    対称 uniform のつもりの移植ミスとほぼ断定できる。全正の C×C 重み
+    は出力が入力チャネル平均に支配され、初期学習ダイナミクスを歪める
+    (LayerNorm があるので学習は進むが、ベースライン忠実度を毀損)。
+
+(B) LoRA 経路の tanh — 上流にない非線形 【重要】
+    - rwkv_core.py: v12 = tanh(x_v @ v1) @ v2 — 上流は tanh なし
+      (model.py:658)
+    - rwkv_core.py: a12 = tanh(x_a @ a1) @ a2 — 上流は tanh なし
+      (model.py:667)
+    上流 RWKV-7 で tanh を使うのは decay w の LoRA のみ。v1/a1 が
+    ゼロ初期化なので初期状態では同値だが、学習が進むと関数クラスが
+    変わる。「RWKV-7 baseline」を名乗る比較をするなら上流に合わせる
+    か、相違として文書化すべき。
+
+(C) 学習レシピの相違 【軽微〜中程度】
+    - L2Wrap (max-logit 抑制ペナルティ、係数 1e-4/(B·T) 相当) なし。
+    - w0 の 2x LR なし。
+    - weight decay 対象が上流と異なる: train_state.py の
+      decay_mask_fn は ndim≥2 で判定するため、形状 (1,1,C) の
+      x_r…x_g, w0, a0, v0, k_k, k_a や LoRA 行列 w1/w2/a1/a2… まで
+      decay される。上流は squeeze 後 2D かつ名前に ".weight" を含む
+      ものだけ (= これらは全て decay 対象外)。w0 を 0 へ引く decay は
+      減衰率分布を歪めるので注意。
+    - embedding の ±1e-4 tiny init、head の orthogonal init
+      (gain 0.5·√(V/C))、ln_x の層依存スケール init
+      (((1+layer)/n_layers)^0.7) も未移植。
+
+(D) 些末な指摘
+    - dataset.py sequential モードの epoch*lane_length は
+      % lane_length で常に消える無効項 (実害なし)。
+    - RWKV7M.md の「90 tests」は検証時点で 91。
+    - usage_ema 未使用 (前述 1.4(3))。
+
+2.3 正しさを確認できた点
+--------------------------------------------------------------------
+- magic prime サンプラ (dataset.py): 式は上流 dataset.py と同一。
+  p ≡ 2 (mod 3) の素数なら x↦x^3 が Z_p 上の全単射になるという数論的
+  前提も正しく (gcd(3, p-1)=1)、(data_size-1)//ctx_len の -1 により
+  上流に存在する末尾 1 トークンのはみ出しリスクをむしろ修正している
+  (専用テストあり)。
+- sequential モードのレーン分割・lane wrap での状態リセット判定は
+  仕様どおり (step % lane_length == 0 で wrap 前にリセット)。
+- screening 実装は仕様書 RWKV7M.md §9-10 と完全一致 (phase 検証、
+  write 時のみの age リセット、read-only 時の slow updater、init 時の
+  write パラメータ生成、write_rel_floor、slot_embed による write key
+  ウォームアップ)。
+- 「全スロット無関連 → 読み出しゼロ」という理論の中核主張には直接の
+  単体テストが存在する (test_shapes.py:
+  test_all_irrelevant_yields_zero_readout)。
+- 検証時点のテスト: uv run pytest -q → 91 passed (3分53秒)。
+
+====================================================================
+3. 総合評価
+====================================================================
+
+「実在する 2026 年の screening 研究を、実在する RWKV-7 の固定サイズ
+状態へ移植する」という理論構成は学術的に正当で、数式は出典と一致し、
+主張の強さの管理 (仮説明示・リスク列挙・反証可能な基準) も適切。
+コードは自らの仕様に忠実でテストも通っており、WKV 再帰は上流と厳密に
+一致する。直すべきは (A) の初期化バグが第一で、(B)(C) は「RWKV-7
+baseline」と比較実験する前に上流へ揃えるか相違として明文化することを
+推奨する。
+
+====================================================================
+4. 適用した修正 (2026-07-03、本検証セッションで実施)
+====================================================================
+
+上記 2.2 の指摘のうち、モデルの数式・初期化・学習目的関数に関わる
+ものを修正した。いずれもパラメータの名前・形状は変えないため、
+既存チェックポイントとの互換性は保たれる。
+
+(A) 対称 uniform 初期化への修正 【src/rwkv7m/model/rwkv_core.py】
+    - symmetric_uniform_init(bound) ヘルパーを追加
+      (flax の nn.initializers.uniform は [0, scale) の片側分布のため)。
+    - TimeMix receptance/value: U(-0.5/√C, +0.5/√C)
+    - TimeMix key:              U(-0.05/√C, +0.05/√C)
+    - ChannelMix key:           U(-0.5/√C, +0.5/√C)
+    → 上流 model.py:617-619, 761 と一致。
+    実測確認: receptance min=-0.0625 / max=+0.0624 / mean≈2.7e-4。
+
+(B) a/v LoRA の tanh 除去 【src/rwkv7m/model/rwkv_core.py】
+    - v12 = (x_v @ v1) @ v2   (旧: tanh(x_v @ v1) @ v2)
+    - a12 = (x_a @ a1) @ a2   (旧: tanh(x_a @ a1) @ a2)
+    → 上流 RWKV-7 は decay w の LoRA にのみ tanh を使う。これで一致。
+
+(C-1) 上流準拠の初期化を追加
+    - ln_x (GroupNorm) の scale を ((1+layer)/n_layers)^0.7 で初期化
+      【rwkv_core.py】。実測: layer0=0.4635, layer2(最終層)=1.0000。
+    - token embedding を U(-1e-4, +1e-4) の tiny init に変更
+      (ln0 が再正規化する上流のトリックを踏襲)【screened_rwkv.py】。
+    - lm_head を orthogonal(gain = 0.5·√(V/C)、V≤C なら 0.5) で初期化
+      【screened_rwkv.py】。flax の kernel (C,V) は行直交 × gain となり、
+      torch の (V,C) 重みに対する orthogonal_ (列直交 × gain) の転置と
+      厳密に等価であることを確認済み (K·K^T = gain²·I)。
+
+(C-2) weight decay マスクの上流準拠化 【src/rwkv7m/train/train_state.py】
+    - decay 対象を「leaf 名が kernel または embedding の ndim≥2 パラメータ」
+      のみに変更。
+    → x_r…x_g / w0 / a0 / v0 / k_k / k_a / r_k / LoRA 行列 (w1/w2/a1/a2/
+      v1/v2/g1/g2) / norm / bias / tau / lambda / slot_embed は全て decay
+      対象外となり、上流の「squeeze 後 2D かつ .weight のみ decay」と
+      同じ集合になる。実測確認: decay 対象 leaf は kernel/embedding のみ、
+      w0/x_r/w1 は非対象。
+
+(C-3) L2Wrap 補助損失の追加 【src/rwkv7m/train/train_step.py】
+    - l2wrap_loss(logits) = 0.5 · 1e-4 · mean(max_logit²) を学習目的に加算。
+      上流 L2Wrap (backward で argmax 位置に max_logit·1e-4/(B·T) を加算)
+      と勾配等価な陽な損失形。
+    - metrics["loss"] は純粋な cross entropy のまま、metrics["total_loss"]
+      が正則化込みの値。評価経路 (eval_binidx、distributed eval) は
+      cross_entropy_loss のみを使うため影響なし。
+
+修正しなかった項目 (既知の相違として残置):
+    - w0 の 2x learning rate (上流 configure_optimizers のレシピ)。
+      optax.multi_transform によるパラメータ別 LR が必要で、変更規模に
+      対して効果が限定的なため見送り。
+    - dataset.py sequential モードの無効な epoch 項 (挙動に影響なし)。
+    - usage_ema の未使用 (設計上のプレースホルダとして残置)。
+    - 1.4 の関連研究拡充 (文書側の課題)。
+
+ドキュメント更新:
+    - RWKV7M.md §11: L2Wrap と decay ポリシーの記述を実装に合わせ更新。
+    - RWKV7M.md §13 / README.md / README.ja.md: テスト数 90 → 91。
+
+修正後の検証:
+    - uv run pytest -q → 91 passed (2分50秒、全件成功)。
+    - 初期化・decay マスクの実測スモークチェック (上記の実測値) も成功。
+
+====================================================================
+
+参考 URL:
+- Screening Is Enough: https://arxiv.org/abs/2604.01178
+- RWKV-7 "Goose":      https://arxiv.org/abs/2503.14456

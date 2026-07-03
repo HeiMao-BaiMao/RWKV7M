@@ -1,3 +1,5 @@
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -10,7 +12,7 @@ from .state import (
     init_screen_state,
     init_rwkv_state as init_model_rwkv_state,
 )
-from .rwkv_core import RWKV7Block
+from .rwkv_core import RWKV7Block, symmetric_uniform_init
 
 
 @dataclass
@@ -118,9 +120,11 @@ class ScreenedRWKVModel(nn.Module):
 
     def setup(self):
         cfg = self.config
+        # Upstream RWKV-LM tiny embedding init (relies on ln0 to renormalize).
         self.token_embedding = nn.Embed(
             cfg.vocab_size,
             cfg.d_model,
+            embedding_init=symmetric_uniform_init(1e-4),
             name="token_embedding",
         )
         self.layers = [
@@ -132,9 +136,14 @@ class ScreenedRWKVModel(nn.Module):
             for i in range(cfg.n_layers)
         ]
         self.final_ln = nn.LayerNorm(epsilon=1e-5, name="final_ln")
+        if cfg.vocab_size > cfg.d_model:
+            head_gain = 0.5 * math.sqrt(cfg.vocab_size / cfg.d_model)
+        else:
+            head_gain = 0.5
         self.lm_head = nn.Dense(
             cfg.vocab_size,
             use_bias=False,
+            kernel_init=nn.initializers.orthogonal(scale=head_gain),
             name="lm_head",
         )
 

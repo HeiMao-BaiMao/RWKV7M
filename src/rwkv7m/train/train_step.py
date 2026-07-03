@@ -15,6 +15,19 @@ class TrainMetrics:
     u_norm_mean: jnp.ndarray
 
 
+_L2WRAP_FACTOR = 1e-4
+
+
+def l2wrap_loss(logits, factor=_L2WRAP_FACTOR):
+    """RWKV-LM L2Wrap: pull down the max logit per position.
+
+    Equivalent to the upstream custom-gradient formulation, whose backward
+    adds max_logit * factor / (B*T) at each argmax position.
+    """
+    max_logits = jnp.max(logits.astype(jnp.float32), axis=-1)
+    return 0.5 * factor * jnp.mean(jnp.square(max_logits))
+
+
 @jax.jit(static_argnames=["phase"], donate_argnums=(0,))
 def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
     def loss_fn(params):
@@ -26,13 +39,14 @@ def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screeni
             phase=phase,
             deterministic=False,
         )
-        loss = cross_entropy_loss(
+        ce_loss = cross_entropy_loss(
             logits,
             batch["target_ids"],
             batch.get("mask"),
         )
+        loss = ce_loss + l2wrap_loss(logits)
         metrics = {
-            "loss": loss,
+            "loss": ce_loss,
             "rel_read_mean": stats.get("rel_read_mean", jnp.zeros(())),
             "active_slots_mean": stats.get("active_slots_mean", jnp.zeros(())),
             "u_norm_mean": stats.get("u_norm_mean", jnp.zeros(())),
