@@ -227,10 +227,17 @@ def main(argv=None):
         capture_output=True,
         text=True,
     ).stdout.strip()
+    upstream_diff = subprocess.run(
+        ["git", "-C", str(upstream), "diff", "--binary"],
+        check=True,
+        capture_output=True,
+    ).stdout
     metadata = {
         "format": "rwkv7m-upstream-x070-parity",
         "format_version": 2,
         "upstream_commit": commit,
+        "upstream_dirty": bool(upstream_diff),
+        "upstream_diff_sha256": hashlib.sha256(upstream_diff).hexdigest(),
         "checkpoint": str(checkpoint) if checkpoint else None,
         "checkpoint_sha256": sha256_file(checkpoint) if checkpoint else None,
         "n_layers": args.n_layer,

@@ -144,7 +144,10 @@ def _require_orbax():
 
 def save_orbax_train_state(checkpoint_dir, train_state, *, force=True):
     ocp = _require_orbax()
-    state_dir = Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR
+    # Current Orbax/TensorStore versions require an absolute filesystem path.
+    # Keep the public checkpoint path unchanged while normalizing the internal
+    # path passed across the serialization boundary.
+    state_dir = (Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR).resolve()
     checkpointer = ocp.StandardCheckpointer()
     try:
         checkpointer.save(state_dir, train_state, force=force)
@@ -156,7 +159,7 @@ def save_orbax_train_state(checkpoint_dir, train_state, *, force=True):
 
 def save_orbax_runtime_state(checkpoint_dir, runtime_state, *, force=True):
     ocp = _require_orbax()
-    state_dir = Path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR
+    state_dir = (Path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR).resolve()
     checkpointer = ocp.StandardCheckpointer()
     try:
         checkpointer.save(state_dir, runtime_state, force=force)
@@ -168,7 +171,7 @@ def save_orbax_runtime_state(checkpoint_dir, runtime_state, *, force=True):
 
 def load_orbax_train_state(checkpoint_dir, train_state_template):
     ocp = _require_orbax()
-    state_dir = Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR
+    state_dir = (Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR).resolve()
     checkpointer = ocp.StandardCheckpointer()
     try:
         return checkpointer.restore(state_dir, train_state_template)
@@ -178,7 +181,7 @@ def load_orbax_train_state(checkpoint_dir, train_state_template):
 
 def load_orbax_runtime_state(checkpoint_dir, runtime_state_template):
     ocp = _require_orbax()
-    state_dir = Path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR
+    state_dir = (Path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR).resolve()
     checkpointer = ocp.StandardCheckpointer()
     try:
         return checkpointer.restore(state_dir, runtime_state_template)

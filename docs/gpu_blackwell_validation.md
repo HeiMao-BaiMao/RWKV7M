@@ -67,6 +67,14 @@ The official Lightning training CLI did not complete on this rental host:
 
 Direct official BF16 fused forward, backward, L2Wrap, and FusedAdam execution all
 succeeded. The observed CLI failures therefore do not contradict the core numeric
-results, but upstream multi-step learning curves and official throughput remain
-unverified on this machine. Those measurements require a compatible, preferably
-non-virtualized NCCL/DeepSpeed environment.
+results.
+
+As a follow-up, the comparison harness now defaults to
+`--upstream-launcher single_gpu`. Its direct loop preserves the official model,
+fused CUDA operators and loss, dataset sampler, initialization, FusedAdam groups,
+gradient clipping, warmup, and cosine decay while bypassing Lightning and
+DeepSpeed launch orchestration. The original `--upstream-launcher deepspeed` path
+remains available. The rental server stopped accepting SSH connections before
+this new multi-step runner could be executed there, so upstream learning curves
+and direct-loop throughput are still unverified on this machine. They must be
+rerun on an NVIDIA host before being reported as measured results.

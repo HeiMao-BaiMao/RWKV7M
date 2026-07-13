@@ -1,0 +1,36 @@
+diff --git a/cuda/rwkv7_cmix_bf16_v5.cu b/cuda/rwkv7_cmix_bf16_v5.cu
+--- a/cuda/rwkv7_cmix_bf16_v5.cu
++++ b/cuda/rwkv7_cmix_bf16_v5.cu
+@@ -20,3 +20,8 @@ __device__ inline void atomic_add_float2(float* ptr, float x0, float x1) {
+ __device__ inline void atomic_add_float2(float* ptr, float x0, float x1) {
++#if __CUDA_ARCH__ >= 900
+     atomicAdd(reinterpret_cast<float2*>(ptr), make_float2(x0, x1));
++#else
++    atomicAdd(ptr, x0);
++    atomicAdd(ptr + 1, x1);
++#endif
+ }
+diff --git a/cuda/rwkv7_tmix_kk_pre_bf16_v5.cu b/cuda/rwkv7_tmix_kk_pre_bf16_v5.cu
+--- a/cuda/rwkv7_tmix_kk_pre_bf16_v5.cu
++++ b/cuda/rwkv7_tmix_kk_pre_bf16_v5.cu
+@@ -35,3 +35,8 @@ __device__ inline void atomic_add_float2(float* ptr, float x0, float x1) {
+ __device__ inline void atomic_add_float2(float* ptr, float x0, float x1) {
++#if __CUDA_ARCH__ >= 900
+     atomicAdd(reinterpret_cast<float2*>(ptr), make_float2(x0, x1));
++#else
++    atomicAdd(ptr, x0);
++    atomicAdd(ptr + 1, x1);
++#endif
+ }
+diff --git a/cuda/rwkv7_tmix_mix6_bf16_v5.cu b/cuda/rwkv7_tmix_mix6_bf16_v5.cu
+--- a/cuda/rwkv7_tmix_mix6_bf16_v5.cu
++++ b/cuda/rwkv7_tmix_mix6_bf16_v5.cu
+@@ -19,3 +19,8 @@ __device__ inline void atomic_add_float2(float* ptr, float x0, float x1) {
+ __device__ inline void atomic_add_float2(float* ptr, float x0, float x1) {
++#if __CUDA_ARCH__ >= 900
+     atomicAdd(reinterpret_cast<float2*>(ptr), make_float2(x0, x1));
++#else
++    atomicAdd(ptr, x0);
++    atomicAdd(ptr + 1, x1);
++#endif
+ }

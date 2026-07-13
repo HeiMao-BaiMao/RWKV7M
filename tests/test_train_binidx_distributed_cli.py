@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
@@ -396,3 +397,62 @@ def test_distributed_binidx_training_cli_orbax_checkpoint_roundtrip(tmp_path):
     )
     assert int(resumed.train_state.step) == 2
     assert resumed_checkpoint == output_dir / "ckpt-00000002"
+
+
+def test_distributed_binidx_training_cli_orbax_accepts_relative_output_dir(
+    tmp_path,
+    monkeypatch,
+):
+    prefix = write_dp_train_data(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    output_dir = "relative-orbax"
+    base = [
+        "--data-file",
+        prefix,
+        "--ctx-len",
+        "4",
+        "--global-batch-size",
+        "1",
+        "--steps",
+        "1",
+        "--vocab-size",
+        "32",
+        "--d-model",
+        "32",
+        "--d-ffn",
+        "64",
+        "--n-layers",
+        "2",
+        "--n-heads",
+        "2",
+        "--head-size",
+        "16",
+        "--d-slot",
+        "16",
+        "--d-k",
+        "16",
+        "--d-v",
+        "16",
+        "--output-dir",
+        output_dir,
+        "--save-every",
+        "1",
+        "--checkpoint-backend",
+        "orbax",
+        "--print-every",
+        "0",
+    ]
+
+    dist, checkpoint = run_distributed_training(parse_args(base))
+
+    assert int(dist.train_state.step) == 1
+    assert checkpoint == Path(output_dir) / "ckpt-00000001"
+    assert (checkpoint / "checkpoint.json").exists()
+    assert (checkpoint / "orbax_train_state").exists()
+
+    resumed, resumed_checkpoint = run_distributed_training(
+        parse_args([*base, "--resume", str(checkpoint)])
+    )
+
+    assert int(resumed.train_state.step) == 2
+    assert resumed_checkpoint == Path(output_dir) / "ckpt-00000002"

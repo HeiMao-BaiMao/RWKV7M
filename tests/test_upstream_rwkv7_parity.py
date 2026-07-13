@@ -90,6 +90,8 @@ def build_reference_archive(
         "head_size": 32,
         "local_dtype": "float32",
         "upstream_commit": "test",
+        "upstream_dirty": True,
+        "upstream_diff_sha256": "abc123",
     }
     payload = {
         "input_ids": np.asarray(input_ids),
@@ -204,6 +206,8 @@ def test_verify_cli_passes_matching_archive(tmp_path):
     assert report["passed"] is True
     assert report["parameter_coverage"]["complete"] is True
     assert report["logits"]["max_abs"] == pytest.approx(0.0, abs=1e-6)
+    assert report["upstream_dirty"] is True
+    assert report["upstream_diff_sha256"] == "abc123"
 
 
 def test_verify_cli_fails_perturbed_reference(tmp_path):
