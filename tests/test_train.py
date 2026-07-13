@@ -5,7 +5,7 @@ import pytest
 from rwkv7m.model.screening import ScreeningConfig
 from rwkv7m.model.screened_rwkv import ModelConfig
 from rwkv7m.train.train_loop import run_toy_training, generate_toy_batch
-from rwkv7m.train.train_state import rwkv_warmup_cosine_schedule
+from rwkv7m.train.train_state import create_optimizer, rwkv_warmup_cosine_schedule
 
 
 def make_train_config():
@@ -127,3 +127,28 @@ def test_rwkv_warmup_cosine_schedule_matches_reference_points():
     assert float(schedule(0)) == pytest.approx(1e-5)
     assert float(schedule(10)) == pytest.approx(1e-3)
     assert float(schedule(100)) == pytest.approx(1e-5)
+
+
+def test_optimizer_applies_upstream_two_x_learning_rate_to_w0():
+    params = {
+        "att": {
+            "w0": jnp.ones((1,), dtype=jnp.float32),
+            "a0": jnp.ones((1,), dtype=jnp.float32),
+        }
+    }
+    gradients = jax.tree.map(jnp.ones_like, params)
+    optimizer = create_optimizer(
+        {
+            "lr_schedule": "rwkv",
+            "lr_init": 1e-3,
+            "lr_final": 1e-3,
+            "warmup_steps": 0,
+            "weight_decay": 0.0,
+            "max_grad_norm": 100.0,
+        },
+        total_steps=1,
+    )
+    updates, _ = optimizer.update(gradients, optimizer.init(params), params)
+    assert float(updates["att"]["w0"][0]) == pytest.approx(
+        2.0 * float(updates["att"]["a0"][0]), rel=1e-6
+    )

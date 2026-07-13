@@ -193,24 +193,25 @@ bash scripts/compare_minipile.sh \
   --eval-steps 100
 ```
 
-The local project requires Python 3.13 or newer, while the upstream repository pins older dependencies. The comparison script therefore creates `.comparison/venvs/rwkv-lm-v7` as a dedicated Python 3.12 environment with `uv venv` and installs the upstream requirements with `uv pip`. The environment is reused across seeds, and its dependencies are synchronized automatically when upstream `requirements.txt` changes. The following preparation invocation creates the venv without starting training:
+The local project requires Python 3.13 or newer, while the upstream repository pins older dependencies. The comparison script therefore creates `.comparison/venvs/rwkv-lm-v7` as a dedicated Python 3.12 environment with `uv venv` and installs the upstream requirements with `uv pip`. It also constrains `setuptools<81`, because the upstream Lightning 1.9.5 dependency still imports `pkg_resources`. The environment is reused across seeds, and its dependencies are synchronized automatically when either the upstream requirements or this compatibility constraint changes. The following preparation invocation creates the venv without starting training:
 
 ```bash
 bash scripts/compare_minipile.sh --profile smoke --no-run
 ```
 
-Set `UPSTREAM_VENV=/path/to/venv` to change the cache location, `UPSTREAM_PYTHON_VERSION=3.12` to select the Python requested from `uv`, or `INSTALL_UPSTREAM_DEPS=1` to force dependency synchronization. The legacy `UPSTREAM_PYTHON` variable is accepted as the interpreter request used to create the venv, but upstream commands always execute with the venv Python. Use `cuda13` instead of `cuda12` in both `uv` commands and `LOCAL_PREFIX` when appropriate.
+Set `UPSTREAM_VENV=/path/to/venv` to change the cache location, `UPSTREAM_PYTHON_VERSION=3.12` to select the Python requested from `uv`, or `INSTALL_UPSTREAM_DEPS=1` to force dependency synchronization. The legacy `UPSTREAM_PYTHON` variable is accepted as the interpreter request used to create the venv, but upstream commands always execute with the venv Python. Use `cuda13` instead of `cuda12` in both `uv` commands and `LOCAL_PREFIX` when appropriate. The NVIDIA driver alone is not sufficient for the official fused extensions: the server must also provide a CUDA compiler and development headers compatible with the installed PyTorch CUDA build. For example, the Blackwell validation used PyTorch CUDA 13.0 with the CUDA 13.0 compiler and development libraries.
 
-`--verify-core-parity` adds a separate implementation-equivalence check before interpreting the training curves. It creates a small deterministic official x070 model, runs the actual upstream fused BF16 CUDA path on a fixed 16-token sequence, exports every official tensor and the reference logits, maps those tensors into the no-screening Flax tree, and runs `rwkv7m-verify-upstream-rwkv7` on the same IDs from zero recurrent state. The machine-readable result is written to `upstream_core_parity/parity_report.json`; any missing/extra/shape-mismatched tensor or logits tolerance failure makes the comparison command fail.
+`--verify-core-parity` adds a separate implementation-equivalence check before interpreting the training curves. It creates a small deterministic official x070 model, runs the actual upstream fused BF16 CUDA forward and backward paths on a fixed 16-token sequence, and performs one official FusedAdam step. It exports every official tensor, logits, gradients, and updated weights; maps them into the no-screening Flax tree; and verifies the same loss, gradient, and optimizer rules from zero recurrent state. The machine-readable result is written to `upstream_core_parity/parity_report.json`; incomplete tensor coverage or tolerance, cosine-similarity, or relative-L2 failure makes the comparison command fail.
 
-This check establishes fixed-weight, zero-initial-state sequence forward parity for the tested upstream commit. It does not by itself establish optimizer or multi-seed training-dynamics equivalence. The reference capture requires the upstream Python environment, PyTorch/CUDA, and a working compiler for the official extensions. The generated small model avoids copying a multi-billion-parameter training checkpoint solely for the parity check; `scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` can be used separately when a particular official `.pth` must be checked.
+This check establishes fixed-weight, zero-initial-state sequence forward/backward parity and one-step BF16 optimizer compatibility for the tested upstream commit. It does not establish identical multi-step or multi-seed training dynamics. The capture uses the official JIT path, which binds the upstream fused operators unambiguously; on the validated upstream commit it produced exactly the same reference logits as the mechanically disambiguated non-JIT wrappers. The reference capture requires the upstream Python environment, PyTorch/CUDA, and a working compiler for the official extensions. The generated small model avoids copying a multi-billion-parameter training checkpoint solely for the parity check; `scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` can be used separately when a particular official `.pth` must be checked. See the measured results and limitations in [NVIDIA Blackwell validation](docs/gpu_blackwell_validation.md).
 
 The two parity stages can also be replayed directly:
 
 ```bash
 .comparison/venvs/rwkv-lm-v7/bin/python scripts/capture_upstream_rwkv7_reference.py \
   --upstream-repo .comparison/RWKV-LM-V7 \
-  --output out/upstream-core-parity/reference.npz
+  --output out/upstream-core-parity/reference.npz \
+  --optimizer-step
 
 JAX_PLATFORMS=cuda uv run --extra cuda12 rwkv7m-verify-upstream-rwkv7 \
   out/upstream-core-parity/reference.npz \

@@ -155,6 +155,7 @@ CORE_PARITY_TOKENS="${CORE_PARITY_TOKENS:-16}"
 # the uv interpreter request, but always execute upstream inside UPSTREAM_VENV.
 UPSTREAM_PYTHON_REQUEST="${UPSTREAM_PYTHON_VERSION:-${UPSTREAM_PYTHON:-3.12}}"
 UPSTREAM_PYTHON=""
+UPSTREAM_VENV_BIN=""
 PYTHON_BIN="${PYTHON_BIN:-}"
 UPSTREAM_STRATEGY="${UPSTREAM_STRATEGY:-deepspeed_stage_2}"
 UPSTREAM_GRAD_CP="${UPSTREAM_GRAD_CP:-0}"
@@ -410,15 +411,17 @@ prepare_upstream_venv() {
   [[ -f "$requirements_file" ]] || die "missing upstream requirements file: $requirements_file"
   local requirements_hash
   requirements_hash="$(git -C "$UPSTREAM_DIR" hash-object requirements.txt)"
+  local dependency_fingerprint="${requirements_hash}:setuptools<81"
   local requirements_marker="$UPSTREAM_VENV/.rwkv7m-requirements.hash"
   local installed_hash=""
   if [[ -f "$requirements_marker" ]]; then
     installed_hash="$(<"$requirements_marker")"
   fi
-  if [[ "$created" == "1" || "$INSTALL_UPSTREAM_DEPS" == "1" || "$installed_hash" != "$requirements_hash" ]]; then
+  if [[ "$created" == "1" || "$INSTALL_UPSTREAM_DEPS" == "1" || "$installed_hash" != "$dependency_fingerprint" ]]; then
     echo "Syncing upstream RWKV-LM-V7 dependencies into $UPSTREAM_VENV"
-    uv pip install --python "$UPSTREAM_PYTHON" -r "$requirements_file"
-    printf '%s\n' "$requirements_hash" > "$requirements_marker"
+    # Lightning 1.9.5 imports pkg_resources, which setuptools 81+ removed.
+    uv pip install --python "$UPSTREAM_PYTHON" -r "$requirements_file" "setuptools<81"
+    printf '%s\n' "$dependency_fingerprint" > "$requirements_marker"
   else
     echo "Using cached upstream RWKV-LM-V7 venv: $UPSTREAM_VENV"
   fi
@@ -426,6 +429,9 @@ prepare_upstream_venv() {
 
 if [[ "$RUN_TARGETS" == "both" || "$RUN_TARGETS" == "upstream" || "$RUN_TARGETS" == "commands" || "$RUN_CORE_PARITY" == "1" ]]; then
   prepare_upstream_venv
+  UPSTREAM_VENV_BIN="$(dirname "$UPSTREAM_PYTHON")"
+  # torch.utils.cpp_extension invokes ninja by name even when Python is absolute.
+  export PATH="$UPSTREAM_VENV_BIN:$PATH"
 fi
 
 dataset_metadata() {
@@ -745,6 +751,13 @@ upstream_parity_cmd=(
   --tokens "$CORE_PARITY_TOKENS"
   --seed "$SEED"
   --kernel "$UPSTREAM_KERNEL"
+  --optimizer-step
+  --lr "$LR_INIT"
+  --weight-decay "$WEIGHT_DECAY"
+  --grad-clip "$GRAD_CLIP"
+  --adam-beta1 "$ADAM_BETA1"
+  --adam-beta2 "$ADAM_BETA2"
+  --adam-eps "$ADAM_EPS"
 )
 local_parity_cmd=(
   "${LOCAL_PREFIX_ARRAY[@]}" rwkv7m-verify-upstream-rwkv7
@@ -875,13 +888,16 @@ quote_cmd() {
   echo "- learning_speed_summary.csv records best/final eval, eval-loss AUC over tokens, improvement per token, and throughput."
   echo "- learning_target_hits.csv records steps/tokens/estimated seconds needed to reach baseline/control/explicit loss targets."
   echo "- commands.sh records the exact commands for replay."
-  echo "- upstream_core_parity/parity_report.json records fixed-weight official CUDA vs local JAX logits parity when requested."
+  echo "- upstream_core_parity/parity_report.json records fixed-weight official CUDA vs local JAX forward, backward, and one-step optimizer parity when requested."
 } > "$run_root/protocol.md"
 
 {
   echo "#!/usr/bin/env bash"
   echo "set -euo pipefail"
   echo "cd $(printf '%q' "$script_dir")"
+  if [[ -n "$UPSTREAM_VENV_BIN" ]]; then
+    printf 'export PATH=%q:$PATH\n' "$UPSTREAM_VENV_BIN"
+  fi
   echo
   echo "# Local core baseline"
   quote_cmd "${local_baseline_cmd[@]}"

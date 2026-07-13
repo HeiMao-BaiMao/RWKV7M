@@ -45,6 +45,13 @@ def decay_mask_fn(params):
     return flax.traverse_util.unflatten_dict(mask)
 
 
+def rwkv_w0_mask_fn(params):
+    """Select the decay anchor that upstream RWKV trains at 2x base LR."""
+    flat = flax.traverse_util.flatten_dict(params)
+    mask = {path: path[-1] == "w0" for path in flat}
+    return flax.traverse_util.unflatten_dict(mask)
+
+
 def create_optimizer(config, total_steps=10000):
     total_steps = max(int(total_steps), 1)
     warmup_steps = min(config.get("warmup_steps", 100), max(total_steps - 1, 0))
@@ -74,5 +81,6 @@ def create_optimizer(config, total_steps=10000):
             eps=config.get("adam_eps", 1e-8),
             mask=decay_mask_fn,
         ),
+        optax.masked(optax.scale(2.0), rwkv_w0_mask_fn),
     )
     return tx

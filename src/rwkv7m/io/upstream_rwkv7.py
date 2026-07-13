@@ -207,6 +207,14 @@ def load_upstream_rwkv7_reference_archive(path):
             key.removeprefix("weight::"): np.asarray(archive[key])
             for key in archive.files if key.startswith("weight::")
         }
+        gradients = {
+            key.removeprefix("gradient::"): np.asarray(archive[key])
+            for key in archive.files if key.startswith("gradient::")
+        }
+        updated_weights = {
+            key.removeprefix("updated_weight::"): np.asarray(archive[key])
+            for key in archive.files if key.startswith("updated_weight::")
+        }
         layers = {
             int(key.removeprefix("layer::")): np.asarray(archive[key])
             for key in archive.files if key.startswith("layer::")
@@ -215,8 +223,14 @@ def load_upstream_rwkv7_reference_archive(path):
         return {
             "metadata": metadata,
             "weights": weights,
+            "gradients": gradients,
+            "updated_weights": updated_weights,
             "input_ids": np.asarray(archive["input_ids"]),
             "target_ids": targets,
             "reference_logits": np.asarray(archive["reference_logits"]),
+            "reference_loss": (
+                float(archive["reference_loss"])
+                if "reference_loss" in archive else None
+            ),
             "reference_layers": layers,
         }
