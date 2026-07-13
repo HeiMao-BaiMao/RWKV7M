@@ -87,7 +87,9 @@ def main(argv=None):
         RWKV_HEAD_SIZE=str(args.head_size),
         RWKV_HEAD_L2WRAP_CE_CHUNK="0",
         RWKV_FLOAT_MODE="bf16",
-        RWKV_JIT_ON="0",
+        # Current upstream reuses the same non-JIT helper name for several
+        # fused ops. Its JIT path binds each official CUDA op unambiguously.
+        RWKV_JIT_ON="1",
     )
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
