@@ -89,14 +89,95 @@ screening module は追加parameterを持つため、単に「RWKV7M が RWKV-7 
 
 `local_mechanism` が `local_core_baseline` だけでなく `local_param_control` にも held-out validation loss / perplexity で勝つ場合、機構そのものの寄与を示す材料になります。さらに、同じlossへ到達するstep/token数や eval loss curve のAUCが小さければ、state-level screening memory が学習を速くしている材料になります。`comparison.sh` はこの比較行列、parameter count、run protocol、metrics summary、learning speed summary を出すための入口です。
 
-指定の MiniPile と `RWKV-Vibe/RWKV-LM-V7` を自動取得して比較モデルを作る推奨入口は次です。`smoke` は配線確認、`small` は約0.19B規模です。
+指定の MiniPile と `RWKV-Vibe/RWKV-LM-V7` を自動取得して比較モデルを作る推奨入口は次です。
 
 ```bash
 bash scripts/compare_minipile.sh --profile smoke --no-run
 bash scripts/compare_minipile.sh --profile small --seeds "42 43 44"
 ```
 
-dataset と upstream checkout は `.comparison/` にcacheされ、runごとのcheckpoint・metric・再実行commandは `out/comparison/<run-id>/` に保存されます。upstream依存関係も準備する場合は専用Python 3.12環境で `INSTALL_UPSTREAM_DEPS=1` を指定してください。MiniPile自身をevalにも使う既定値は配線確認用であり、論文用比較では必ず独立したbinidxを `--eval-data-file /path/to/heldout` で指定します。
+local比較行列には `local_core_baseline`、`local_read_screening`、`local_mechanism`、screeningなしでFFNを広げた `local_param_control` が含まれます。CUDA経路では、これにupstreamのPyTorch/CUDA RWKV-LM-V7を加えて実行できます。runごとのcheckpoint、JSONL/CSV metric、parameter count、protocol、再実行commandは `out/comparison/<run-id>/` に保存されます。
+
+`smoke` は配線確認用であり、研究結果には使いません。`small` は約0.19B規模ですが、既定の2,000 stepsだけで論文に十分な学習量だとは限らないため、予備実験を基にtoken budgetを決めます。datasetとupstream checkoutは `.comparison/` にcacheされます。
+
+#### NVIDIA CUDA環境での例
+
+CUDA extraはNVIDIA driverが利用できるLinux環境を想定しています。導入済みCUDAのmajor versionに合うextraを選び、最初にJAXからGPUが見えることを確認します。
+
+```bash
+uv sync --extra cuda12
+uv run --extra cuda12 python -c "import jax; print(jax.devices())"
+```
+
+local JAXの4変種には独立held-out評価を指定し、それと並行して同一token budgetのupstream PyTorch/CUDA学習参照を実行する例です。
+
+```bash
+LOCAL_PREFIX="uv run --extra cuda12" \
+UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
+bash scripts/compare_minipile.sh \
+  --profile small \
+  --backend cuda \
+  --run-targets both \
+  --seeds "42 43 44" \
+  --steps 10000 \
+  --eval-data-file /data/minipile-heldout \
+  --eval-every 500 \
+  --eval-steps 100
+```
+
+local projectはPython 3.13以上を必要としますが、upstream repositoryは古い依存関係を固定しているため、upstream用には独立したPython 3.12環境を使い、`UPSTREAM_PYTHON`でそのPythonを指定します。次の準備commandはupstream checkoutを取得して依存関係をinstallしますが、学習は開始しません。
+
+```bash
+UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
+INSTALL_UPSTREAM_DEPS=1 \
+bash scripts/compare_minipile.sh --profile smoke --no-run
+```
+
+この準備は一度だけ実行します。複数seedの学習commandに `INSTALL_UPSTREAM_DEPS=1` を指定するとseedごとにinstallが繰り返されます。CUDA 13環境では、両方の `uv` commandと `LOCAL_PREFIX` の `cuda12` を `cuda13` に置き換えます。
+
+#### Google TPU環境での例
+
+TPU VMではTPU extraを導入し、deviceとprocessの認識を確認します。
+
+```bash
+uv sync --extra tpu
+uv run --extra tpu python -c "import jax; print(jax.devices()); print(jax.process_count(), jax.process_index())"
+```
+
+単一TPU hostでlocal比較行列を動かす例です。comparison scriptのTPU向けdevice数の既定値は安全側の1なので、検出したlocal device数を明示します。
+
+```bash
+TPU_DEVICES=$(uv run --extra tpu python -c "import jax; print(jax.local_device_count())")
+
+LOCAL_PREFIX="uv run --extra tpu" \
+bash scripts/compare_minipile.sh \
+  --profile small \
+  --backend tpu \
+  --run-targets local \
+  --devices "$TPU_DEVICES" \
+  --global-batch-size "$TPU_DEVICES" \
+  --seeds "42 43 44" \
+  --steps 10000 \
+  --eval-data-file /data/minipile-heldout \
+  --eval-every 500 \
+  --eval-steps 100
+```
+
+`upstream_rwkv_lm_v7` はCUDA/PyTorch専用であり、このscriptからTPU上では実行できません。backendをまたぐ研究では、TPUでlocal比較行列を、NVIDIA CUDAでupstream targetを別runとして実行します。異なるaccelerator間のthroughputはhardware条件を揃えた比較ではないため、性能値とは分けて報告します。multi-host TPUでは全hostにJAX coordinator環境変数を設定し、[TPU Research Cloud Training](docs/tpu_research_cloud.md) のdistributed CLI手順を使います。上のwrapper例は単一host向けです。
+
+#### 論文向けrunの条件と成果物
+
+研究結果を取る場合は、固定した独立binidxを必ず `--eval-data-file` で指定します。省略時はtrain datasetをevalにも使うため、配線確認にしか使えません。local変種間ではdataset split、tokenizer、token budget、optimizer、dtype、context length、global batch、sampler、評価間隔、評価token数を固定します。
+
+各seedの実行後は次を確認します。
+
+- `parameter_counts.csv`: baseline、mechanism、parameter controlのparameter数。
+- `local_metric_summary.csv`: 最終train/eval metric。
+- `learning_speed_summary.csv`: best/final eval loss、perplexity、tokenに対するeval-loss AUC、throughput。
+- `learning_target_hits.csv`: 共通loss目標への到達step/token数。
+- `parameters.env`、`protocol.md`、`commands.sh`: 実行条件、source commit、再現用command。
+
+`--seeds` はseedごとのrun directoryを作りますが、現行scriptはseed横断集計を行いません。論文へ載せる前に各runのCSVを結合し、seed数と、標準偏差や信頼区間などのばらつき・不確実性を報告します。またupstream runはlocal held-out CSV summaryには含まれず、FLOPs-matched controlとtask-specific long-context benchmarkも未実装です。生成された表からそれらの比較結果まで主張しないようにします。
 
 ### 6. 互換性と主張範囲
 
