@@ -5,6 +5,13 @@ from .flax_checkpoint import (
     load_train_runtime_state,
     save_train_checkpoint,
 )
+from .upstream_rwkv7 import (
+    UpstreamRWKV7ConversionReport,
+    UpstreamRWKV7Spec,
+    convert_upstream_rwkv7_state_dict,
+    infer_upstream_rwkv7_spec,
+    load_upstream_rwkv7_reference_archive,
+)
 from .safetensors import load_model_safetensors, save_model_safetensors
 
 __all__ = [
@@ -16,4 +23,9 @@ __all__ = [
     "save_train_checkpoint",
     "load_model_safetensors",
     "save_model_safetensors",
+    "UpstreamRWKV7ConversionReport",
+    "UpstreamRWKV7Spec",
+    "convert_upstream_rwkv7_state_dict",
+    "infer_upstream_rwkv7_spec",
+    "load_upstream_rwkv7_reference_archive",
 ]

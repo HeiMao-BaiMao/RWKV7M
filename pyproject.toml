@@ -28,6 +28,7 @@ rwkv7m-make-binidx = "rwkv7m.cli.make_binidx:main"
 rwkv7m-bench-binidx = "rwkv7m.cli.bench_binidx:main"
 rwkv7m-eval-binidx = "rwkv7m.cli.eval_binidx:main"
 rwkv7m-generate = "rwkv7m.cli.generate:main"
+rwkv7m-verify-upstream-rwkv7 = "rwkv7m.cli.verify_upstream_rwkv7:main"
 
 [build-system]
 requires = ["hatchling"]

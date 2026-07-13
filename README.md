@@ -181,11 +181,11 @@ Run the local JAX variants with independent held-out evaluation alongside the sa
 
 ```bash
 LOCAL_PREFIX="uv run --extra cuda12" \
-UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
 bash scripts/compare_minipile.sh \
   --profile small \
   --backend cuda \
   --run-targets both \
+  --verify-core-parity \
   --seeds "42 43 44" \
   --steps 10000 \
   --eval-data-file /data/minipile-heldout \
@@ -193,15 +193,29 @@ bash scripts/compare_minipile.sh \
   --eval-steps 100
 ```
 
-The local project requires Python 3.13 or newer, while the upstream repository pins older dependencies and is best kept in a separate Python 3.12 environment. Point `UPSTREAM_PYTHON` at that environment. The following preparation invocation fetches the upstream checkout and installs its requirements without starting training:
+The local project requires Python 3.13 or newer, while the upstream repository pins older dependencies. The comparison script therefore creates `.comparison/venvs/rwkv-lm-v7` as a dedicated Python 3.12 environment with `uv venv` and installs the upstream requirements with `uv pip`. The environment is reused across seeds, and its dependencies are synchronized automatically when upstream `requirements.txt` changes. The following preparation invocation creates the venv without starting training:
 
 ```bash
-UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
-INSTALL_UPSTREAM_DEPS=1 \
 bash scripts/compare_minipile.sh --profile smoke --no-run
 ```
 
-Run this preparation once; setting `INSTALL_UPSTREAM_DEPS=1` on the multi-seed training command repeats installation for every seed. Use `cuda13` instead of `cuda12` in both `uv` commands and `LOCAL_PREFIX` when appropriate.
+Set `UPSTREAM_VENV=/path/to/venv` to change the cache location, `UPSTREAM_PYTHON_VERSION=3.12` to select the Python requested from `uv`, or `INSTALL_UPSTREAM_DEPS=1` to force dependency synchronization. The legacy `UPSTREAM_PYTHON` variable is accepted as the interpreter request used to create the venv, but upstream commands always execute with the venv Python. Use `cuda13` instead of `cuda12` in both `uv` commands and `LOCAL_PREFIX` when appropriate.
+
+`--verify-core-parity` adds a separate implementation-equivalence check before interpreting the training curves. It creates a small deterministic official x070 model, runs the actual upstream fused BF16 CUDA path on a fixed 16-token sequence, exports every official tensor and the reference logits, maps those tensors into the no-screening Flax tree, and runs `rwkv7m-verify-upstream-rwkv7` on the same IDs from zero recurrent state. The machine-readable result is written to `upstream_core_parity/parity_report.json`; any missing/extra/shape-mismatched tensor or logits tolerance failure makes the comparison command fail.
+
+This check establishes fixed-weight, zero-initial-state sequence forward parity for the tested upstream commit. It does not by itself establish optimizer or multi-seed training-dynamics equivalence. The reference capture requires the upstream Python environment, PyTorch/CUDA, and a working compiler for the official extensions. The generated small model avoids copying a multi-billion-parameter training checkpoint solely for the parity check; `scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` can be used separately when a particular official `.pth` must be checked.
+
+The two parity stages can also be replayed directly:
+
+```bash
+.comparison/venvs/rwkv-lm-v7/bin/python scripts/capture_upstream_rwkv7_reference.py \
+  --upstream-repo .comparison/RWKV-LM-V7 \
+  --output out/upstream-core-parity/reference.npz
+
+JAX_PLATFORMS=cuda uv run --extra cuda12 rwkv7m-verify-upstream-rwkv7 \
+  out/upstream-core-parity/reference.npz \
+  --json-out out/upstream-core-parity/report.json
+```
 
 ### Google TPU example
 
@@ -244,6 +258,7 @@ After each seed, inspect:
 - `learning_speed_summary.csv` for best/final eval loss, perplexity, eval-loss AUC over tokens, and throughput.
 - `learning_target_hits.csv` for steps/tokens needed to reach common loss targets.
 - `parameters.env`, `protocol.md`, and `commands.sh` for provenance and replay.
+- `upstream_core_parity/parity_report.json` for official CUDA vs local JAX fixed-weight core parity.
 
 `--seeds` creates one run directory per seed, but the current scripts do not aggregate across seeds. Before placing values in a paper, combine the per-seed files and report at least the number of seeds and a dispersion or uncertainty measure such as standard deviation or a confidence interval. The upstream run is not included in the local held-out CSV summaries, and the repository does not yet provide FLOPs-matched controls or task-specific long-context benchmarks; do not infer those claims from the generated tables.
 
