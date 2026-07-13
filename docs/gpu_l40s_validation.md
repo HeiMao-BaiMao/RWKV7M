@@ -75,3 +75,31 @@ JAX emitted CUDA timer timeout warnings, so the timing values are host-specific
 smoke measurements. The capacity and successful execution results are valid;
 controlled throughput claims still require repeated runs, variance reporting,
 and an uncontended host.
+
+## Full RWKV7M 0.19B training
+
+The full local mechanism was subsequently tested at the same core dimensions as
+the upstream `small` profile: L12-D768, FFN 2688, vocabulary 65,536, context
+length 512, BF16, and global batch 1. State-level screening used 16 slots with
+the read/write phase enabled on layer 6. The resulting model contained
+184,985,222 trainable parameters (approximately 0.185B).
+
+One optimizer step was run from initialization, then the Orbax train-state
+checkpoint was restored and training continued through steps 2 and 3. The loss
+sequence was 11.163989, 10.252852, and 10.743930. Both read and effective-write
+relevance metrics were non-zero at every step, confirming that the full
+read/write screening path participated in the compiled forward and backward
+computation. The final step-3 checkpoint was 1.6 GiB, checkpoint rotation
+removed the older steps, and `rwkv7m-audit-dp-run --require-complete` reported
+zero errors and zero warnings across all three metric records.
+
+Peak observed GPU allocation was 34,621 MiB. The second post-restore training
+step reached 1,042.63 token/s, while the first step in each process included
+JAX compilation and initialization and was approximately 9 token/s. These
+short-run rates are execution diagnostics, not controlled throughput results.
+
+This run exposed an Orbax boundary issue: recent Orbax/TensorStore versions
+require absolute serialization paths, but the CLI allowed a relative
+`--output-dir`. The wrapper now resolves only the internal paths passed to
+Orbax while preserving the public checkpoint path representation. A regression
+test covers save and restore with a relative output directory.
