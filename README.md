@@ -155,6 +155,8 @@ For read/write screening from scratch, the write branch uses slot identity in it
 
 For proof-oriented runs, `write_rel_floor=0` tests true write rejection. Memory-bank update rates can also be specified as interpretable token half-lives with `--short-half-life-tokens`, `--mid-half-life-tokens`, and `--long-half-life-tokens`. The legacy `mu_*_max` behavior remains available when half-lives are omitted.
 
+## Comparison experiments
+
 To download MiniPile, check out `RWKV-Vibe/RWKV-LM-V7`, and build upstream/local comparison checkpoints with a matched token budget:
 
 ```bash
@@ -162,7 +164,88 @@ bash scripts/compare_minipile.sh --profile smoke --no-run
 bash scripts/compare_minipile.sh --profile small --seeds "42 43 44"
 ```
 
-The `smoke` profile validates the pipeline; `small` is approximately the upstream 0.19B scale. Cached data and the upstream checkout live under `.comparison/`, while checkpoints, metrics, parameter counts, protocols, and replay commands are written under `out/comparison/<run-id>/`. Use a dedicated Python 3.12 environment and set `INSTALL_UPSTREAM_DEPS=1` if the script should install the upstream dependencies. The default same-data evaluation is only a plumbing check; pass an independent binidx prefix with `--eval-data-file` for research evidence.
+The local matrix contains `local_core_baseline`, `local_read_screening`, `local_mechanism`, and a widened no-screening `local_param_control`. The CUDA path can additionally run the upstream PyTorch/CUDA RWKV-LM-V7 reference. Each run writes checkpoints, JSONL/CSV metrics, parameter counts, the recorded protocol, and replay commands under `out/comparison/<run-id>/`.
+
+The `smoke` profile validates the pipeline; it is not research evidence. `small` is approximately the upstream 0.19B scale, but its default 2,000 steps should still be treated as a starting point rather than a sufficient paper training budget. Cached data and the upstream checkout live under `.comparison/`.
+
+### NVIDIA CUDA example
+
+The CUDA extras target Linux systems with an NVIDIA driver. Choose the extra matching the installed CUDA major version, then confirm that JAX sees the GPU:
+
+```bash
+uv sync --extra cuda12
+uv run --extra cuda12 python -c "import jax; print(jax.devices())"
+```
+
+Run the local JAX variants with independent held-out evaluation alongside the same-token-budget upstream PyTorch/CUDA training reference:
+
+```bash
+LOCAL_PREFIX="uv run --extra cuda12" \
+UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
+bash scripts/compare_minipile.sh \
+  --profile small \
+  --backend cuda \
+  --run-targets both \
+  --seeds "42 43 44" \
+  --steps 10000 \
+  --eval-data-file /data/minipile-heldout \
+  --eval-every 500 \
+  --eval-steps 100
+```
+
+The local project requires Python 3.13 or newer, while the upstream repository pins older dependencies and is best kept in a separate Python 3.12 environment. Point `UPSTREAM_PYTHON` at that environment. The following preparation invocation fetches the upstream checkout and installs its requirements without starting training:
+
+```bash
+UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
+INSTALL_UPSTREAM_DEPS=1 \
+bash scripts/compare_minipile.sh --profile smoke --no-run
+```
+
+Run this preparation once; setting `INSTALL_UPSTREAM_DEPS=1` on the multi-seed training command repeats installation for every seed. Use `cuda13` instead of `cuda12` in both `uv` commands and `LOCAL_PREFIX` when appropriate.
+
+### Google TPU example
+
+Install the TPU extra on a TPU VM and confirm device discovery:
+
+```bash
+uv sync --extra tpu
+uv run --extra tpu python -c "import jax; print(jax.devices()); print(jax.process_count(), jax.process_index())"
+```
+
+On a single TPU host, run the local comparison matrix as follows. Passing the detected local device count avoids the comparison script's conservative one-device default for TPU:
+
+```bash
+TPU_DEVICES=$(uv run --extra tpu python -c "import jax; print(jax.local_device_count())")
+
+LOCAL_PREFIX="uv run --extra tpu" \
+bash scripts/compare_minipile.sh \
+  --profile small \
+  --backend tpu \
+  --run-targets local \
+  --devices "$TPU_DEVICES" \
+  --global-batch-size "$TPU_DEVICES" \
+  --seeds "42 43 44" \
+  --steps 10000 \
+  --eval-data-file /data/minipile-heldout \
+  --eval-every 500 \
+  --eval-steps 100
+```
+
+`upstream_rwkv_lm_v7` is CUDA/PyTorch-only and cannot run on TPU through this script. A cross-backend study must run the local matrix on TPU and the upstream target on NVIDIA CUDA as separate runs; throughput from different accelerator types should be reported separately, not treated as a hardware-controlled comparison. For multi-host TPU launches, configure the JAX coordinator variables on every host and use the distributed CLI procedure in [TPU Research Cloud Training](docs/tpu_research_cloud.md); the wrapper above is the straightforward single-host comparison path.
+
+### Paper-oriented run requirements and outputs
+
+For research evidence, always provide a fixed, independent binidx prefix with `--eval-data-file`; omitting it evaluates on the training data and is only a plumbing check. Keep the dataset split, tokenizer, token budget, optimizer settings, dtype, context length, global batch size, sampler, evaluation cadence, and evaluation token count fixed across local variants.
+
+After each seed, inspect:
+
+- `parameter_counts.csv` for the baseline, mechanism, and parameter-control sizes.
+- `local_metric_summary.csv` for final train/eval metrics.
+- `learning_speed_summary.csv` for best/final eval loss, perplexity, eval-loss AUC over tokens, and throughput.
+- `learning_target_hits.csv` for steps/tokens needed to reach common loss targets.
+- `parameters.env`, `protocol.md`, and `commands.sh` for provenance and replay.
+
+`--seeds` creates one run directory per seed, but the current scripts do not aggregate across seeds. Before placing values in a paper, combine the per-seed files and report at least the number of seeds and a dispersion or uncertainty measure such as standard deviation or a confidence interval. The upstream run is not included in the local held-out CSV summaries, and the repository does not yet provide FLOPs-matched controls or task-specific long-context benchmarks; do not infer those claims from the generated tables.
 
 Python API:
 
