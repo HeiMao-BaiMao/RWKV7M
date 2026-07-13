@@ -166,6 +166,10 @@ bash scripts/compare_minipile.sh --profile small --seeds "42 43 44"
 
 The local matrix contains `local_core_baseline`, `local_read_screening`, `local_mechanism`, and a widened no-screening `local_param_control`. The CUDA path can additionally run the upstream PyTorch/CUDA RWKV-LM-V7 reference. Each run writes checkpoints, JSONL/CSV metrics, parameter counts, the recorded protocol, and replay commands under `out/comparison/<run-id>/`.
 
+The upstream target now defaults to `--upstream-launcher single_gpu`. This path does not invoke the Lightning trainer or a DeepSpeed distributed strategy. It still imports the pinned official checkout's x070 model, fused CUDA operators, fused L2Wrap cross entropy, `.bin/.idx` reader and cubic sampler, initialization, and `deepspeed.ops.adam.FusedAdam`; it also preserves the official `att.w0` 2x learning-rate group, AdamW decay grouping, gradient clipping, warmup, and cosine schedule. A larger global batch is reproduced on one GPU by gradient accumulation over the official global sample order. The runner writes `run_config.json`, `metrics.jsonl`, `metrics.csv`, `run_summary.json`, `rwkv-init.pth`, and `rwkv-final.pth` under `upstream_rwkv_lm_v7/`.
+
+Use `--upstream-launcher deepspeed` only when the Lightning/DeepSpeed stack itself is part of the experiment or has been validated on the machine. That legacy mode remains available, but is no longer the paper-baseline default.
+
 The `smoke` profile validates the pipeline; it is not research evidence. `small` is approximately the upstream 0.19B scale, but its default 2,000 steps should still be treated as a starting point rather than a sufficient paper training budget. Cached data and the upstream checkout live under `.comparison/`.
 
 ### NVIDIA CUDA example
@@ -192,6 +196,8 @@ bash scripts/compare_minipile.sh \
   --eval-every 500 \
   --eval-steps 100
 ```
+
+The command above uses the direct single-GPU upstream baseline by default. To make the choice explicit, add `--upstream-launcher single_gpu`; to replay the former launcher path, use `--upstream-launcher deepspeed`.
 
 The local project requires Python 3.13 or newer, while the upstream repository pins older dependencies. The comparison script therefore creates `.comparison/venvs/rwkv-lm-v7` as a dedicated Python 3.12 environment with `uv venv` and installs the upstream requirements with `uv pip`. It also constrains `setuptools<81`, because the upstream Lightning 1.9.5 dependency still imports `pkg_resources`. The environment is reused across seeds, and its dependencies are synchronized automatically when either the upstream requirements or this compatibility constraint changes. The following preparation invocation creates the venv without starting training:
 

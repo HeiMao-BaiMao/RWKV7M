@@ -98,6 +98,10 @@ bash scripts/compare_minipile.sh --profile small --seeds "42 43 44"
 
 local比較行列には `local_core_baseline`、`local_read_screening`、`local_mechanism`、screeningなしでFFNを広げた `local_param_control` が含まれます。CUDA経路では、これにupstreamのPyTorch/CUDA RWKV-LM-V7を加えて実行できます。runごとのcheckpoint、JSONL/CSV metric、parameter count、protocol、再実行commandは `out/comparison/<run-id>/` に保存されます。
 
+upstream target の既定は `--upstream-launcher single_gpu` です。この経路は Lightning trainer と DeepSpeed distributed strategy を起動しません。一方で、固定した本家checkoutから x070 model、fused CUDA operator、fused L2Wrap cross entropy、`.bin/.idx` reader と cubic sampler、初期化、`deepspeed.ops.adam.FusedAdam` をそのままimportします。`att.w0` の2倍LR group、AdamW decay group、gradient clipping、warmup、cosine scheduleも本家規則を維持します。global batchが1 GPUのmicro batchより大きい場合は、本家のglobal sample順序を保ったgradient accumulationで再現します。成果物は `upstream_rwkv_lm_v7/` 配下の `run_config.json`、`metrics.jsonl`、`metrics.csv`、`run_summary.json`、`rwkv-init.pth`、`rwkv-final.pth` です。
+
+Lightning/DeepSpeed stack自体を評価する場合、または対象machineでその構成を検証済みの場合に限り `--upstream-launcher deepspeed` を使います。従来経路は残していますが、論文baselineの既定からは外しました。
+
 `smoke` は配線確認用であり、研究結果には使いません。`small` は約0.19B規模ですが、既定の2,000 stepsだけで論文に十分な学習量だとは限らないため、予備実験を基にtoken budgetを決めます。datasetとupstream checkoutは `.comparison/` にcacheされます。
 
 #### NVIDIA CUDA環境での例
@@ -124,6 +128,8 @@ bash scripts/compare_minipile.sh \
   --eval-every 500 \
   --eval-steps 100
 ```
+
+上のcommandでは本家baselineにdirect single-GPU経路を既定で使います。明示する場合は `--upstream-launcher single_gpu`、従来のlauncherを再実行する場合は `--upstream-launcher deepspeed` を追加します。
 
 local projectはPython 3.13以上を必要としますが、upstream repositoryは古い依存関係を固定しています。そのためcomparison scriptは、`uv venv`で専用Python 3.12環境 `.comparison/venvs/rwkv-lm-v7` を作り、`uv pip`でupstream依存関係を導入します。upstreamのLightning 1.9.5が現在も `pkg_resources` をimportするため、`setuptools<81` も互換制約として適用します。venvはseed間で再利用され、upstreamのrequirementsまたはこの互換制約が変わった場合は自動的に再同期されます。次の準備commandはvenvを作成しますが、学習は開始しません。
 

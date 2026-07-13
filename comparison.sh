@@ -52,6 +52,8 @@ Options:
   --no-read-screening-run     Skip the separate read_screening_only screening run.
   --rwkv-lm-v7-ref REF        Git ref for RWKV-LM-V7. Default: main.
   --rwkv-lm-v7-repo PATH      Use an existing checkout instead of cloning/fetching.
+  --upstream-launcher MODE    single_gpu (default) or deepspeed.
+                              single_gpu bypasses Lightning/DeepSpeed launchers.
   --output-root DIR           Output root. Default: out/comparison.
   --download-data             Download default Minipile binidx if missing. Default.
   --no-download-data          Do not download default Minipile binidx.
@@ -73,6 +75,7 @@ Common environment overrides:
   LOCAL_PREFIX="uv run"
   UPSTREAM_VENV=.comparison/venvs/rwkv-lm-v7
   UPSTREAM_PYTHON_VERSION=3.12
+  UPSTREAM_LAUNCHER=single_gpu|deepspeed
   INSTALL_UPSTREAM_DEPS=1  # force dependency resync; initial install is automatic
   CORE_PARITY_ATOL=0.08 CORE_PARITY_RTOL=0.08 CORE_PARITY_TOKENS=16
 USAGE
@@ -157,6 +160,7 @@ UPSTREAM_PYTHON_REQUEST="${UPSTREAM_PYTHON_VERSION:-${UPSTREAM_PYTHON:-3.12}}"
 UPSTREAM_PYTHON=""
 UPSTREAM_VENV_BIN=""
 PYTHON_BIN="${PYTHON_BIN:-}"
+UPSTREAM_LAUNCHER="${UPSTREAM_LAUNCHER:-single_gpu}"
 UPSTREAM_STRATEGY="${UPSTREAM_STRATEGY:-deepspeed_stage_2}"
 UPSTREAM_GRAD_CP="${UPSTREAM_GRAD_CP:-0}"
 UPSTREAM_HEAD_CHUNK="${UPSTREAM_HEAD_CHUNK:-0}"
@@ -192,6 +196,7 @@ while [[ $# -gt 0 ]]; do
     --mechanism-phase) MECHANISM_PHASE="$2"; shift 2 ;;
     --rwkv-lm-v7-ref) RWKV_LM_V7_REF="$2"; shift 2 ;;
     --rwkv-lm-v7-repo) UPSTREAM_DIR="$2"; FETCH_UPSTREAM=0; shift 2 ;;
+    --upstream-launcher) UPSTREAM_LAUNCHER="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
     --download-data) DOWNLOAD_DATA=1; shift ;;
     --no-download-data) DOWNLOAD_DATA=0; shift ;;
@@ -220,6 +225,11 @@ fi
 case "$RUN_TARGETS" in
   both|local|upstream|commands) ;;
   *) die "--run-targets must be both, local, upstream, or commands" ;;
+esac
+
+case "$UPSTREAM_LAUNCHER" in
+  single_gpu|deepspeed) ;;
+  *) die "--upstream-launcher must be single_gpu or deepspeed" ;;
 esac
 
 case "$MECHANISM_PHASE" in
@@ -302,6 +312,19 @@ case "$PRECISION" in
   fp32) LOCAL_DTYPE="float32"; UPSTREAM_PRECISION="fp32" ;;
   *) die "PRECISION must be bf16 or fp32" ;;
 esac
+
+if [[ "$UPSTREAM_LAUNCHER" == "single_gpu" && "$PRECISION" != "bf16" && ( "$RUN_TARGETS" == "both" || "$RUN_TARGETS" == "upstream" || "$RUN_TARGETS" == "commands" ) ]]; then
+  die "the official x070 direct single-GPU runner requires PRECISION=bf16"
+fi
+if [[ "$UPSTREAM_LAUNCHER" == "single_gpu" && "$UPSTREAM_MODEL_TYPE" != "x070" ]]; then
+  die "the direct single-GPU runner currently supports UPSTREAM_MODEL_TYPE=x070 only"
+fi
+if [[ "$UPSTREAM_LAUNCHER" == "single_gpu" && "$UPSTREAM_GRAD_CP" != "0" ]]; then
+  die "the direct single-GPU runner does not silently substitute upstream DeepSpeed gradient checkpointing; use UPSTREAM_GRAD_CP=0"
+fi
+if [[ "$UPSTREAM_LAUNCHER" == "single_gpu" && "$UPSTREAM_HEAD_CHUNK" != "0" ]]; then
+  die "the direct single-GPU runner currently requires UPSTREAM_HEAD_CHUNK=0"
+fi
 
 if [[ "$BACKEND" == "tpu" && ( "$RUN_TARGETS" == "both" || "$RUN_TARGETS" == "upstream" ) ]]; then
   die "RWKV-LM-V7 upstream training is CUDA/PyTorch-only; use --run-targets local on TPU and run the generated upstream command on CUDA"
@@ -743,6 +766,35 @@ upstream_common=(
 )
 upstream_prepare_cmd=("$UPSTREAM_PYTHON" train.py "${upstream_common[@]}" --train_stage 1)
 upstream_train_cmd=("$UPSTREAM_PYTHON" train.py --load_model 0 "${upstream_common[@]}" --train_stage "$UPSTREAM_TRAIN_STAGE")
+upstream_single_gpu_cmd=(
+  env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions"
+  "$UPSTREAM_PYTHON" "$script_dir/scripts/train_upstream_rwkv7_single_gpu.py"
+  --upstream-repo "$UPSTREAM_DIR"
+  --data-file "$DATA_FILE"
+  --output-dir "$upstream_out"
+  --steps "$STEPS"
+  --global-batch-size "$GLOBAL_BATCH_SIZE"
+  --micro-batch-size "$MICRO_BSZ"
+  --ctx-len "$CTX_LEN"
+  --magic-prime "$MAGIC_PRIME"
+  --n-layer "$N_LAYER"
+  --n-embd "$D_MODEL"
+  --dim-att "$D_MODEL"
+  --dim-ffn "$D_FFN"
+  --vocab-size "$VOCAB_SIZE"
+  --head-size "$HEAD_SIZE"
+  --kernel "$UPSTREAM_KERNEL"
+  --precision "$UPSTREAM_PRECISION"
+  --lr-init "$LR_INIT"
+  --lr-final "$LR_FINAL"
+  --warmup-steps "$WARMUP_STEPS"
+  --beta1 "$ADAM_BETA1"
+  --beta2 "$ADAM_BETA2"
+  --adam-eps "$ADAM_EPS"
+  --weight-decay "$WEIGHT_DECAY"
+  --grad-clip "$GRAD_CLIP"
+  --seed "$SEED"
+)
 upstream_parity_cmd=(
   env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions"
   "$UPSTREAM_PYTHON" "$script_dir/scripts/capture_upstream_rwkv7_reference.py"
@@ -781,6 +833,7 @@ quote_cmd() {
   echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT"
   echo "UPSTREAM_VENV=$UPSTREAM_VENV"
   echo "UPSTREAM_PYTHON=$UPSTREAM_PYTHON"
+  echo "UPSTREAM_LAUNCHER=$UPSTREAM_LAUNCHER"
   echo "MINIPILE_IDX_URL=$MINIPILE_IDX_URL"
   echo "MINIPILE_BIN_URL=$MINIPILE_BIN_URL"
   echo "BACKEND=$BACKEND"
@@ -879,6 +932,7 @@ quote_cmd() {
   echo "- Mechanism evidence is strongest when a screening variant beats both local_core_baseline and local_param_control on held-out eval at matched tokens, optimizer settings, dtype, context length, global batch, and data sampler."
   echo "- If --eval-data-file is omitted, eval uses the train dataset; those results are useful for debugging but not proof-grade."
   echo "- upstream_rwkv_lm_v7 is a CUDA RWKV-LM-V7 reference run for external baseline/throughput context. It does not isolate this repository's screening mechanism by itself."
+  echo "- UPSTREAM_LAUNCHER=$UPSTREAM_LAUNCHER. The default single_gpu mode retains the official model, CUDA kernels, loss, sampler, initialization, FusedAdam, optimizer groups, clipping, and schedule while replacing Lightning/DeepSpeed orchestration."
   echo
   echo "Artifacts:"
   echo
@@ -915,12 +969,17 @@ quote_cmd() {
     quote_cmd "${local_control_cmd[@]}"
   fi
   echo
-  echo "# Upstream RWKV-LM-V7 prepare command"
-  echo "cd $(printf '%q' "$UPSTREAM_DIR")"
-  quote_cmd "${upstream_prepare_cmd[@]}"
-  echo
-  echo "# Upstream RWKV-LM-V7 train command"
-  quote_cmd "${upstream_train_cmd[@]}"
+  if [[ "$UPSTREAM_LAUNCHER" == "single_gpu" ]]; then
+    echo "# Upstream RWKV-LM-V7 direct single-GPU command"
+    quote_cmd "${upstream_single_gpu_cmd[@]}"
+  else
+    echo "# Upstream RWKV-LM-V7 Lightning/DeepSpeed prepare command"
+    echo "cd $(printf '%q' "$UPSTREAM_DIR")"
+    quote_cmd "${upstream_prepare_cmd[@]}"
+    echo
+    echo "# Upstream RWKV-LM-V7 Lightning/DeepSpeed train command"
+    quote_cmd "${upstream_train_cmd[@]}"
+  fi
   if [[ "$RUN_CORE_PARITY" == "1" ]]; then
     echo
     echo "# Official fused CUDA core reference capture"
@@ -1192,16 +1251,21 @@ if [[ "$RUN_TARGETS" == "local" || "$RUN_TARGETS" == "both" ]]; then
 fi
 
 if [[ "$RUN_TARGETS" == "upstream" || "$RUN_TARGETS" == "both" ]]; then
-  echo "Running upstream RWKV-LM-V7 prepare target..."
-  (
-    cd "$UPSTREAM_DIR"
-    run_logged "$upstream_out/prepare.log" env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions" "${upstream_prepare_cmd[@]}"
-  )
-  echo "Running upstream RWKV-LM-V7 train target..."
-  (
-    cd "$UPSTREAM_DIR"
-    run_logged "$upstream_out/train.log" env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions" "${upstream_train_cmd[@]}"
-  )
+  if [[ "$UPSTREAM_LAUNCHER" == "single_gpu" ]]; then
+    echo "Running upstream RWKV-LM-V7 direct single-GPU target..."
+    run_logged "$upstream_out/train.log" "${upstream_single_gpu_cmd[@]}"
+  else
+    echo "Running upstream RWKV-LM-V7 Lightning/DeepSpeed prepare target..."
+    (
+      cd "$UPSTREAM_DIR"
+      run_logged "$upstream_out/prepare.log" env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions" "${upstream_prepare_cmd[@]}"
+    )
+    echo "Running upstream RWKV-LM-V7 Lightning/DeepSpeed train target..."
+    (
+      cd "$UPSTREAM_DIR"
+      run_logged "$upstream_out/train.log" env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions" "${upstream_train_cmd[@]}"
+    )
+  fi
   if [[ "$RUN_CORE_PARITY" == "1" ]]; then
     echo "Capturing official fused CUDA RWKV-7 core reference..."
     run_logged "$core_parity_out/capture.log" "${upstream_parity_cmd[@]}"
