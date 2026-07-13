@@ -71,9 +71,9 @@ screening module は RWKV block の代わりではありません。まず RWKV 
 
 RWKV7M には `read_screening_only` と `read_write` の2つの主要phaseがあります。
 
-`read_screening_only` では、read relevance は使いますが、write relevance branch は使いません。slot は bank別の小さい更新率でゆっくり更新されます。これは、まずread側の効果と安定性を見るための保守的な構成です。
+`read_screening_only` では、read relevance は使いますが、write relevance branch は使いません。slot は bank別の小さい更新率で全slotがゆっくり更新されます。厳密な read-only ではなく「screened read + uniform slow write」です。
 
-`read_write` では、`use_write_screening=True` の場合に write専用の query/key branch が有効になります。write branch は、どのslotをどれだけ更新するかを別途screeningします。初期slotがゼロに近い状態でwrite branchが死なないよう、slot identity と小さい `write_rel_floor` を使います。
+`read_write` では、`use_write_screening=True` の場合に write専用の query/key branch が有効になります。write branch は、どのslotをどれだけ更新するかを別途screeningします。`write_rel_floor` は初期slotがゼロに近い場合の互換用設定で、学術比較では `0` を指定して完全なwrite棄却を評価できます。bank更新率は従来の `mu_*_max` に加え、`--short-half-life-tokens` / `--mid-half-life-tokens` / `--long-half-life-tokens` でtoken半減期として明示できます。
 
 ### 5. Parameter 増加との分離
 
@@ -88,6 +88,15 @@ screening module は追加parameterを持つため、単に「RWKV7M が RWKV-7 
 | `local_param_control` | screeningなしでFFN幅を増やし、`local_mechanism` 以上のparameter数にしたcontrol。 |
 
 `local_mechanism` が `local_core_baseline` だけでなく `local_param_control` にも held-out validation loss / perplexity で勝つ場合、機構そのものの寄与を示す材料になります。さらに、同じlossへ到達するstep/token数や eval loss curve のAUCが小さければ、state-level screening memory が学習を速くしている材料になります。`comparison.sh` はこの比較行列、parameter count、run protocol、metrics summary、learning speed summary を出すための入口です。
+
+指定の MiniPile と `RWKV-Vibe/RWKV-LM-V7` を自動取得して比較モデルを作る推奨入口は次です。`smoke` は配線確認、`small` は約0.19B規模です。
+
+```bash
+bash scripts/compare_minipile.sh --profile smoke --no-run
+bash scripts/compare_minipile.sh --profile small --seeds "42 43 44"
+```
+
+dataset と upstream checkout は `.comparison/` にcacheされ、runごとのcheckpoint・metric・再実行commandは `out/comparison/<run-id>/` に保存されます。upstream依存関係も準備する場合は専用Python 3.12環境で `INSTALL_UPSTREAM_DEPS=1` を指定してください。MiniPile自身をevalにも使う既定値は配線確認用であり、論文用比較では必ず独立したbinidxを `--eval-data-file /path/to/heldout` で指定します。
 
 ### 6. 互換性と主張範囲
 

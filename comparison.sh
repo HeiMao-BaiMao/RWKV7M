@@ -12,7 +12,7 @@ separate architectural/mechanism gains from trainable-parameter-count gains.
 Default matrix:
   1. upstream_rwkv_lm_v7       CUDA PyTorch RWKV-LM-V7 baseline
   2. local_core_baseline       this repo, RWKV core only, no screening mechanism
-  3. local_read_screening      this repo, same core params, read-only screening memory
+  3. local_read_screening      this repo, screened reads with uniform slow writes
   4. local_mechanism           this repo, same core params, selected screening mechanism phase
   5. local_param_control       this repo, no mechanism, FFN widened until params >= mechanism
 
@@ -37,6 +37,7 @@ Options:
   --loss-targets CSV          Optional explicit eval-loss targets for time-to-loss metrics.
   --ctx-len N                 Context length. Default: 512.
   --steps N                   Local train steps and upstream token budget. Default: 20.
+  --seed N                    Random seed passed to both implementations. Default: 42.
   --per-device-batch-size N   Per accelerator batch size. Default: 1.
   --global-batch-size N       Override global batch size.
   --devices N                 Devices per node/host. Default: nvidia-smi count for cuda, else 1.
@@ -66,7 +67,8 @@ Common environment overrides:
   LOSS_TARGETS="3.2,3.0"
   MINIPILE_BIN_URL, MINIPILE_IDX_URL
   PYTHON_BIN=python3
-  D_SLOT, D_K, D_V, N_SLOTS
+  D_SLOT, D_K, D_V, N_SLOTS, WRITE_REL_FLOOR
+  SHORT_HALF_LIFE_TOKENS, MID_HALF_LIFE_TOKENS, LONG_HALF_LIFE_TOKENS
   LOCAL_PREFIX="uv run"
   UPSTREAM_PYTHON=python
   INSTALL_UPSTREAM_DEPS=1
@@ -105,6 +107,7 @@ EVAL_STEPS="${EVAL_STEPS:-10}"
 LOSS_TARGETS="${LOSS_TARGETS:-}"
 CTX_LEN="${CTX_LEN:-512}"
 STEPS="${STEPS:-20}"
+SEED="${SEED:-42}"
 NUM_NODES="${NUM_NODES:-1}"
 DEVICES="${DEVICES:-}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-1}"
@@ -120,6 +123,10 @@ D_SLOT="${D_SLOT:-256}"
 D_K="${D_K:-64}"
 D_V="${D_V:-128}"
 N_SLOTS="${N_SLOTS:-16}"
+WRITE_REL_FLOOR="${WRITE_REL_FLOOR:-0}"
+SHORT_HALF_LIFE_TOKENS="${SHORT_HALF_LIFE_TOKENS:-64}"
+MID_HALF_LIFE_TOKENS="${MID_HALF_LIFE_TOKENS:-512}"
+LONG_HALF_LIFE_TOKENS="${LONG_HALF_LIFE_TOKENS:-4096}"
 PRECISION="${PRECISION:-bf16}"
 LR_INIT="${LR_INIT:-1e-3}"
 LR_FINAL="${LR_FINAL:-1e-5}"
@@ -143,6 +150,7 @@ UPSTREAM_GRAD_CP="${UPSTREAM_GRAD_CP:-0}"
 UPSTREAM_HEAD_CHUNK="${UPSTREAM_HEAD_CHUNK:-0}"
 UPSTREAM_KERNEL="${UPSTREAM_KERNEL:-@rwkv3}"
 UPSTREAM_MODEL_TYPE="${UPSTREAM_MODEL_TYPE:-x070}"
+UPSTREAM_TRAIN_STAGE="${UPSTREAM_TRAIN_STAGE:-3}"
 UPSTREAM_DS_BUCKET_MB="${UPSTREAM_DS_BUCKET_MB:-200}"
 INSTALL_UPSTREAM_DEPS="${INSTALL_UPSTREAM_DEPS:-0}"
 ENABLE_PROGRESS_BAR="${ENABLE_PROGRESS_BAR:-True}"
@@ -158,6 +166,7 @@ while [[ $# -gt 0 ]]; do
     --loss-targets) LOSS_TARGETS="$2"; shift 2 ;;
     --ctx-len) CTX_LEN="$2"; shift 2 ;;
     --steps) STEPS="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
     --per-device-batch-size) PER_DEVICE_BATCH_SIZE="$2"; shift 2 ;;
     --global-batch-size) GLOBAL_BATCH_SIZE="$2"; shift 2 ;;
     --devices) DEVICES="$2"; shift 2 ;;
@@ -292,17 +301,18 @@ download_file() {
   local url="$1"
   local target="$2"
   mkdir -p "$(dirname "$target")"
-  if [[ -f "$target" ]]; then
+  if [[ -s "$target" ]]; then
     echo "Using existing $target"
     return
   fi
+  local partial="$target.part"
   echo "Downloading $url"
   if command -v curl >/dev/null 2>&1; then
-    curl -L --fail --continue-at - --output "$target" "$url"
+    curl -L --fail --continue-at - --output "$partial" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -c -O "$target" "$url"
+    wget -c -O "$partial" "$url"
   else
-    "${PYTHON_BIN_ARRAY[@]}" - "$url" "$target" <<'PY'
+    "${PYTHON_BIN_ARRAY[@]}" - "$url" "$partial" <<'PY'
 import shutil
 import sys
 import urllib.request
@@ -312,6 +322,7 @@ with urllib.request.urlopen(url) as response, open(target, "wb") as out:
     shutil.copyfileobj(response, out)
 PY
   fi
+  mv "$partial" "$target"
 }
 
 OUTPUT_ROOT="$(abs_path "${OUTPUT_ROOT%/}")"
@@ -554,7 +565,7 @@ make_local_cmd() {
     --steps "$STEPS"
     --magic-prime "$MAGIC_PRIME"
     --sampling-mode magic
-    --seed 42
+    --seed "$SEED"
     --phase "$phase"
     --dtype "$LOCAL_DTYPE"
     --lr-init "$LR_INIT"
@@ -593,6 +604,10 @@ make_local_cmd() {
       --d-v "$D_V"
       --n-slots "$N_SLOTS"
       --screened-layers "${SCREENED_LAYERS_ARRAY[@]}"
+      --write-rel-floor "$WRITE_REL_FLOOR"
+      --short-half-life-tokens "$SHORT_HALF_LIFE_TOKENS"
+      --mid-half-life-tokens "$MID_HALF_LIFE_TOKENS"
+      --long-half-life-tokens "$LONG_HALF_LIFE_TOKENS"
     )
   else
     cmd_ref+=(--no-screening)
@@ -652,9 +667,10 @@ upstream_common=(
   --grad_cp "$UPSTREAM_GRAD_CP"
   --ds_bucket_mb "$UPSTREAM_DS_BUCKET_MB"
   --enable_progress_bar "$ENABLE_PROGRESS_BAR"
+  --random_seed "$SEED"
 )
 upstream_prepare_cmd=("$UPSTREAM_PYTHON" train.py "${upstream_common[@]}" --train_stage 1)
-upstream_train_cmd=("$UPSTREAM_PYTHON" train.py --load_model 0 "${upstream_common[@]}" --train_stage 2)
+upstream_train_cmd=("$UPSTREAM_PYTHON" train.py --load_model 0 "${upstream_common[@]}" --train_stage "$UPSTREAM_TRAIN_STAGE")
 
 quote_cmd() {
   printf '%q ' "$@"
@@ -681,6 +697,7 @@ quote_cmd() {
   echo "DATA_TOKENS=$DATA_TOKENS"
   echo "CTX_LEN=$CTX_LEN"
   echo "STEPS=$STEPS"
+  echo "SEED=$SEED"
   echo "GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE"
   echo "PER_DEVICE_BATCH_SIZE=$PER_DEVICE_BATCH_SIZE"
   echo "NUM_NODES=$NUM_NODES"
@@ -699,6 +716,10 @@ quote_cmd() {
   echo "D_K=$D_K"
   echo "D_V=$D_V"
   echo "N_SLOTS=$N_SLOTS"
+  echo "WRITE_REL_FLOOR=$WRITE_REL_FLOOR"
+  echo "SHORT_HALF_LIFE_TOKENS=$SHORT_HALF_LIFE_TOKENS"
+  echo "MID_HALF_LIFE_TOKENS=$MID_HALF_LIFE_TOKENS"
+  echo "LONG_HALF_LIFE_TOKENS=$LONG_HALF_LIFE_TOKENS"
   echo "PRECISION=$PRECISION"
   echo "LR_INIT=$LR_INIT"
   echo "LR_FINAL=$LR_FINAL"
@@ -730,7 +751,7 @@ quote_cmd() {
   echo "upstream_rwkv_lm_v7_estimate,$LOCAL_BASELINE_PARAMS,$D_FFN,0,read_screening_only,core architecture estimate"
   echo "local_core_baseline,$LOCAL_BASELINE_PARAMS,$D_FFN,0,read_screening_only,no mechanism"
   if [[ "$RUN_READ_SCREENING" == "1" ]]; then
-    echo "local_read_screening,$LOCAL_READ_SCREENING_PARAMS,$D_FFN,1,read_screening_only,Multi Screening read branch only"
+    echo "local_read_screening,$LOCAL_READ_SCREENING_PARAMS,$D_FFN,1,read_screening_only,screened reads with uniform slow writes"
   fi
   echo "local_mechanism,$LOCAL_MECHANISM_PARAMS,$D_FFN,1,$MECHANISM_PHASE,same core width plus screening mechanism"
   if [[ "$RUN_PARAM_CONTROL" == "1" ]]; then
@@ -746,7 +767,7 @@ quote_cmd() {
   echo "Primary evidence should compare held-out eval curves for:"
   echo
   echo "1. local_core_baseline: no screening mechanism."
-  echo "2. local_read_screening: same RWKV core width plus read-only state-level screening memory."
+  echo "2. local_read_screening: same RWKV core width, screened reads, and uniform slow writes."
   echo "3. local_mechanism: same RWKV core width plus the selected screening phase, read_write by default."
   echo "4. local_param_control: no screening mechanism, widened FFN, trainable params >= the largest screening variant."
   echo
@@ -776,7 +797,7 @@ quote_cmd() {
   quote_cmd "${local_baseline_cmd[@]}"
   if [[ "$RUN_READ_SCREENING" == "1" ]]; then
     echo
-    echo "# Local read-only state-level screening"
+    echo "# Local screened-read / uniform-slow-write control"
     quote_cmd "${local_read_screening_cmd[@]}"
   fi
   echo
@@ -1042,7 +1063,7 @@ if [[ "$RUN_TARGETS" == "local" || "$RUN_TARGETS" == "both" ]]; then
   echo "Running local core baseline..."
   run_logged "$local_baseline_out/train.log" env "${local_env[@]}" "${local_baseline_cmd[@]}"
   if [[ "$RUN_READ_SCREENING" == "1" ]]; then
-    echo "Running local read-only state-level screening..."
+    echo "Running local screened-read / uniform-slow-write control..."
     run_logged "$local_read_screening_out/train.log" env "${local_env[@]}" "${local_read_screening_cmd[@]}"
   fi
   echo "Running local mechanism variant..."

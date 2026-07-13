@@ -119,6 +119,10 @@ def test_invalid_config_validation():
         ScreeningConfig(n_slots=4, bank_ids=(0, 1))
     with pytest.raises(ValueError, match="bank_ids values"):
         ScreeningConfig(n_slots=4, bank_ids=(0, 1, 2, 3))
+    with pytest.raises(ValueError, match="half-life"):
+        ScreeningConfig(long_half_life_tokens=0)
+    with pytest.raises(ValueError, match="usage_ema_decay"):
+        ScreeningConfig(usage_ema_decay=1.0)
     with pytest.raises(ValueError, match="d_model must equal"):
         ModelConfig(d_model=33, n_heads=2, head_size=16, use_screening=False)
     with pytest.raises(ValueError, match="screening.d_model"):
@@ -191,6 +195,8 @@ def test_read_write_training_uses_effective_write_updates():
     state, metrics = train_batch(state, batch, runtime, phase="read_write")
     assert jnp.isfinite(metrics["loss"])
     assert metrics["rel_write_effective_mean"] > 0.0
+    assert metrics["slot_update_norm_mean"] >= 0.0
+    assert metrics["slot_usage_ema_mean"] >= 0.0
 
 
 def test_train_batch_resets_recurrent_state_by_default():

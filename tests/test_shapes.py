@@ -1,8 +1,11 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from flax.core import freeze, unfreeze
 from flax.traverse_util import flatten_dict
 from rwkv7m.model.screening import ScreeningConfig
+from rwkv7m.model.screening import StateLevelScreening, theta_from_tau
+from rwkv7m.model.state import LayerScreenState
 from rwkv7m.model.state import init_screen_state, tuple_set
 from rwkv7m.model.screened_rwkv import (
     ModelConfig,
@@ -145,25 +148,43 @@ class TestShapes:
         assert max_diff < 1e-4, f"Scan consistency failed: max_diff={max_diff}"
 
     def test_all_irrelevant_yields_zero_readout(self):
-        """When tau is very high and sim < tau, read-out should be near zero."""
-        cfg = make_tiny_config()
-        cfg.screening.tau_init = 0.99
-        # Override tau by directly setting it high
-
-        key, subkey = jax.random.split(self.key)
-        variables, model = create_model_variables(subkey, cfg, self.batch_size)
-
-        # Manually set tau_r_raw to a very high value
-        flat_params = variables["params"]
-        # We can't easily override tau in compact mode, so we test via stats
-        # Instead, verify that the model runs and stats are computed
-        rwkv_state = init_rwkv_state(self.batch_size, cfg)
-        screen_state = init_screen_state(self.batch_size, cfg.screening)
-        input_ids = jnp.ones((self.batch_size, 4), dtype=jnp.int32)
-
-        _, _, _, stats = model.apply(
-            variables, input_ids, rwkv_state, screen_state,
-            phase="read_screening_only", deterministic=True,
+        """A zero query below tau must produce no screening residual."""
+        cfg = ScreeningConfig(
+            d_model=8,
+            d_slot=4,
+            d_k=4,
+            d_v=4,
+            n_slots=2,
+            screened_layers=(0,),
+            bank_ids=(0, 2),
         )
-        assert "u_norm_mean" in stats
-        assert "rel_read_mean" in stats
+        module = StateLevelScreening(cfg)
+        x = jnp.ones((1, 3, 8), dtype=jnp.float32)
+        h_base = jax.random.normal(jax.random.PRNGKey(8), (1, 3, 8))
+        state = LayerScreenState(
+            slots=jax.random.normal(jax.random.PRNGKey(9), (1, 2, 4)),
+            ages=jnp.zeros((1, 2)),
+            usage_ema=jnp.zeros((1, 2)),
+        )
+        variables = module.init(
+            jax.random.PRNGKey(10),
+            x,
+            h_base,
+            state,
+            phase="read_screening_only",
+        )
+        mutable = unfreeze(variables)
+        mutable["params"]["q_proj_r"]["kernel"] = jnp.zeros_like(
+            mutable["params"]["q_proj_r"]["kernel"]
+        )
+        mutable["params"]["tau_r_raw"] = theta_from_tau(0.5)
+        h, _, stats = module.apply(
+            freeze(mutable),
+            x,
+            h_base,
+            state,
+            phase="read_screening_only",
+        )
+        assert jnp.allclose(h, h_base)
+        assert jnp.allclose(stats["rel_read_mean"], 0.0)
+        assert jnp.allclose(stats["u_norm_mean"], 0.0)

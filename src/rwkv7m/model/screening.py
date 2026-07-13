@@ -52,6 +52,12 @@ def tanh_norm(z, cap=1.0, eps=1e-6):
     return scale * z
 
 
+def update_rate_from_half_life(half_life_tokens):
+    """Return the EMA update rate whose retained weight halves after H tokens."""
+    half_life_tokens = jnp.asarray(half_life_tokens, dtype=jnp.float32)
+    return -jnp.expm1(-jnp.log(2.0) / half_life_tokens)
+
+
 @dataclass
 class ScreeningConfig:
     d_model: int = 512
@@ -76,6 +82,10 @@ class ScreeningConfig:
     mu_short_max: float = 0.05
     mu_mid_max: float = 0.02
     mu_long_max: float = 0.005
+    short_half_life_tokens: float | None = None
+    mid_half_life_tokens: float | None = None
+    long_half_life_tokens: float | None = None
+    usage_ema_decay: float = 0.99
     age_ref: float = 32.0
     age_sigma: float = 8.0
 
@@ -89,6 +99,15 @@ class ScreeningConfig:
             raise ValueError("bank_ids values must be only 0, 1, or 2")
         if self.write_rel_floor < 0.0:
             raise ValueError("write_rel_floor must be non-negative")
+        half_lives = (
+            self.short_half_life_tokens,
+            self.mid_half_life_tokens,
+            self.long_half_life_tokens,
+        )
+        if any(value is not None and value <= 0.0 for value in half_lives):
+            raise ValueError("memory half-life values must be positive when provided")
+        if not 0.0 <= self.usage_ema_decay < 1.0:
+            raise ValueError("usage_ema_decay must be in [0, 1)")
 
 
 class StateLevelScreening(nn.Module):
@@ -156,6 +175,7 @@ class StateLevelScreening(nn.Module):
 
         slots = state.slots.astype(jnp.float32)
         ages = state.ages
+        usage_ema = state.usage_ema.astype(jnp.float32)
 
         # --- Pre-compute projections and params for all time steps ---
         x_ln_seq = self.screen_ln(x_seq.astype(jnp.float32))  # [B, T, C]
@@ -206,7 +226,7 @@ class StateLevelScreening(nn.Module):
 
         def step(carry, t):
             """Pure function - no Flax modules called here."""
-            slots_t, ages_t = carry
+            slots_t, ages_t, usage_t = carry
 
             # Read branch
             k_r = jnp.einsum("bms,sk->bmk", slots_t, k_w)
@@ -241,6 +261,7 @@ class StateLevelScreening(nn.Module):
                 new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
                 new_ages = ages_t
                 rel_w = jnp.zeros_like(rel_r)
+                rel_w_effective = jnp.ones_like(rel_r)
             else:
                 slots_for_write_key = slots_t + slot_embed[None, :, :]
                 k_w_t = jnp.einsum("bms,sk->bmk", slots_for_write_key, k_w_w)
@@ -251,6 +272,13 @@ class StateLevelScreening(nn.Module):
                 update_strength = mu[None, :, None] * rel_w_effective[:, :, None]
                 new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
                 new_ages = jnp.where(rel_w > 1e-3, 0.0, ages_t + 1.0)
+
+            update_delta = new_slots - slots_t
+            activity = jnp.maximum(rel_r, rel_w if write_enabled else rel_r)
+            new_usage = (
+                cfg.usage_ema_decay * usage_t
+                + (1.0 - cfg.usage_ema_decay) * activity
+            )
 
             # Stats
             eta_active = 1e-3
@@ -266,15 +294,19 @@ class StateLevelScreening(nn.Module):
                 "rel_write_effective_mean": jnp.mean(
                     jnp.maximum(rel_w, cfg.write_rel_floor)
                 ) if write_enabled else jnp.mean(rel_w),
+                "slot_update_norm_mean": jnp.mean(
+                    jnp.linalg.norm(update_delta, axis=-1)
+                ),
+                "slot_usage_ema_mean": jnp.mean(new_usage),
                 "tau_w": tau_w,
             }
 
-            return (new_slots, new_ages), (h_t, stats_t)
+            return (new_slots, new_ages, new_usage), (h_t, stats_t)
 
         # lax.scan over time
-        (final_slots, final_ages), (h_seq, stats_seq) = jax.lax.scan(
+        (final_slots, final_ages, final_usage), (h_seq, stats_seq) = jax.lax.scan(
             step,
-            (slots, ages),
+            (slots, ages, usage_ema),
             jnp.arange(T),
         )
 
@@ -283,7 +315,7 @@ class StateLevelScreening(nn.Module):
         new_state = LayerScreenState(
             slots=final_slots.astype(state.slots.dtype),
             ages=final_ages,
-            usage_ema=state.usage_ema,
+            usage_ema=final_usage.astype(state.usage_ema.dtype),
         )
 
         # Aggregate stats over time (scan stacks dict values into arrays)
@@ -294,7 +326,20 @@ class StateLevelScreening(nn.Module):
     def _compute_mu(self, p, cfg):
         mu_by_bank_raw = p["mu_by_bank_raw"]
         mu_max = jnp.array([cfg.mu_short_max, cfg.mu_mid_max, cfg.mu_long_max])
-        mu_per_bank = mu_max * jax.nn.sigmoid(mu_by_bank_raw)
+        legacy_mu = mu_max * jax.nn.sigmoid(mu_by_bank_raw)
+        half_lives = (
+            cfg.short_half_life_tokens,
+            cfg.mid_half_life_tokens,
+            cfg.long_half_life_tokens,
+        )
+        mu_per_bank = jnp.stack(
+            [
+                legacy_mu[index]
+                if half_life is None
+                else update_rate_from_half_life(half_life)
+                for index, half_life in enumerate(half_lives)
+            ]
+        )
         bank_ids = jnp.array(cfg.bank_ids)
         return mu_per_bank[bank_ids]  # [M]
 

@@ -31,6 +31,11 @@ def build_config(args):
             screened_layers=screened_layers,
             bank_ids=bank_ids,
             use_write_screening=args.phase == "read_write",
+            write_rel_floor=args.write_rel_floor,
+            short_half_life_tokens=args.short_half_life_tokens,
+            mid_half_life_tokens=args.mid_half_life_tokens,
+            long_half_life_tokens=args.long_half_life_tokens,
+            usage_ema_decay=args.usage_ema_decay,
         )
     else:
         screening = ScreeningConfig()
@@ -104,6 +109,11 @@ def parse_args(argv=None):
     parser.add_argument("--n-slots", type=int, default=4)
     parser.add_argument("--bank-ids", type=int, nargs="+", default=None)
     parser.add_argument("--screened-layers", type=int, nargs="*", default=[])
+    parser.add_argument("--write-rel-floor", type=float, default=1e-3)
+    parser.add_argument("--short-half-life-tokens", type=float, default=None)
+    parser.add_argument("--mid-half-life-tokens", type=float, default=None)
+    parser.add_argument("--long-half-life-tokens", type=float, default=None)
+    parser.add_argument("--usage-ema-decay", type=float, default=0.99)
     parser.add_argument("--carry-state", action="store_true")
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--output-dir", default=None)

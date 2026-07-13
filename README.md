@@ -153,6 +153,17 @@ uv run rwkv7m-train-binidx `
 
 For read/write screening from scratch, the write branch uses slot identity in its write key and a tiny `write_rel_floor` update floor. This avoids a dead write branch when slots are all zero at initialization.
 
+For proof-oriented runs, `write_rel_floor=0` tests true write rejection. Memory-bank update rates can also be specified as interpretable token half-lives with `--short-half-life-tokens`, `--mid-half-life-tokens`, and `--long-half-life-tokens`. The legacy `mu_*_max` behavior remains available when half-lives are omitted.
+
+To download MiniPile, check out `RWKV-Vibe/RWKV-LM-V7`, and build upstream/local comparison checkpoints with a matched token budget:
+
+```bash
+bash scripts/compare_minipile.sh --profile smoke --no-run
+bash scripts/compare_minipile.sh --profile small --seeds "42 43 44"
+```
+
+The `smoke` profile validates the pipeline; `small` is approximately the upstream 0.19B scale. Cached data and the upstream checkout live under `.comparison/`, while checkpoints, metrics, parameter counts, protocols, and replay commands are written under `out/comparison/<run-id>/`. Use a dedicated Python 3.12 environment and set `INSTALL_UPSTREAM_DEPS=1` if the script should install the upstream dependencies. The default same-data evaluation is only a plumbing check; pass an independent binidx prefix with `--eval-data-file` for research evidence.
+
 Python API:
 
 ```python

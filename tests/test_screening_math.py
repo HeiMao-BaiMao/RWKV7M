@@ -8,6 +8,7 @@ from rwkv7m.model.screening import (
     trim_square,
     relevance_with_warmup,
     tanh_norm,
+    update_rate_from_half_life,
 )
 
 
@@ -85,3 +86,10 @@ class TestTanhNorm:
         cap = 1.0
         u = tanh_norm(z, cap=cap)
         assert jnp.allclose(u, z, atol=1e-4)
+
+
+def test_update_rate_matches_requested_half_life():
+    for half_life in (32.0, 512.0, 4096.0):
+        rate = update_rate_from_half_life(half_life)
+        retained = jnp.power(1.0 - rate, half_life)
+        assert jnp.allclose(retained, 0.5, rtol=1e-4, atol=1e-5)

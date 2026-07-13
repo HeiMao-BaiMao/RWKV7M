@@ -55,6 +55,14 @@ def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screeni
                 "rel_write_effective_mean",
                 jnp.zeros(()),
             ),
+            "slot_update_norm_mean": stats.get(
+                "slot_update_norm_mean",
+                jnp.zeros(()),
+            ),
+            "slot_usage_ema_mean": stats.get(
+                "slot_usage_ema_mean",
+                jnp.zeros(()),
+            ),
         }
         return loss, (metrics, new_rwkv_state, new_screen_state)
 
