@@ -267,6 +267,8 @@ def verify_archive(
         "scope": scope,
         "archive": str(Path(path)),
         "upstream_commit": metadata.get("upstream_commit"),
+        "upstream_dirty": metadata.get("upstream_dirty"),
+        "upstream_diff_sha256": metadata.get("upstream_diff_sha256"),
         "checkpoint": metadata.get("checkpoint"),
         "checkpoint_sha256": metadata.get("checkpoint_sha256"),
         "dtype": local_dtype,

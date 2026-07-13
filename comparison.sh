@@ -76,6 +76,7 @@ Common environment overrides:
   UPSTREAM_VENV=.comparison/venvs/rwkv-lm-v7
   UPSTREAM_PYTHON_VERSION=3.12
   UPSTREAM_LAUNCHER=single_gpu|deepspeed
+  APPLY_UPSTREAM_ADA_PATCH=1  # tracked sm_89 scalar-atomic fallback
   INSTALL_UPSTREAM_DEPS=1  # force dependency resync; initial install is automatic
   CORE_PARITY_ATOL=0.08 CORE_PARITY_RTOL=0.08 CORE_PARITY_TOKENS=16
 USAGE
@@ -97,6 +98,7 @@ UPSTREAM_VENV="${UPSTREAM_VENV:-$COMPARE_ROOT/venvs/rwkv-lm-v7}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-out/comparison}"
 MINIPILE_DATA_DIR="${MINIPILE_DATA_DIR:-$COMPARE_ROOT/data/rwkv_vocab_v20230424}"
 MINIPILE_PREFIX="${MINIPILE_PREFIX:-$MINIPILE_DATA_DIR/minipile}"
+MINIPILE_SINGLE_PREFIX="${MINIPILE_SINGLE_PREFIX:-$MINIPILE_DATA_DIR/minipile-single}"
 MINIPILE_IDX_URL="${MINIPILE_IDX_URL:-https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.idx}"
 MINIPILE_BIN_URL="${MINIPILE_BIN_URL:-https://huggingface.co/datasets/BlinkDL/minipile-tokenized/resolve/main/rwkv_vocab_v20230424/minipile.bin}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -170,6 +172,8 @@ UPSTREAM_TRAIN_STAGE="${UPSTREAM_TRAIN_STAGE:-3}"
 UPSTREAM_DS_BUCKET_MB="${UPSTREAM_DS_BUCKET_MB:-200}"
 INSTALL_UPSTREAM_DEPS="${INSTALL_UPSTREAM_DEPS:-0}"
 ENABLE_PROGRESS_BAR="${ENABLE_PROGRESS_BAR:-True}"
+APPLY_UPSTREAM_ADA_PATCH="${APPLY_UPSTREAM_ADA_PATCH:-1}"
+UPSTREAM_ADA_PATCH="${UPSTREAM_ADA_PATCH:-$script_dir/patches/upstream_rwkv7_ada_atomic.patch}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -368,10 +372,15 @@ PY
 }
 
 OUTPUT_ROOT="$(abs_path "${OUTPUT_ROOT%/}")"
+MINIPILE_PREFIX="$(abs_path "${MINIPILE_PREFIX%/}")"
 DATA_FILE="$(abs_path "${DATA_FILE%/}")"
 if [[ "$DATA_FILE" == "$MINIPILE_PREFIX" && "$DOWNLOAD_DATA" == "1" ]]; then
   download_file "$MINIPILE_IDX_URL" "$MINIPILE_PREFIX.idx"
   download_file "$MINIPILE_BIN_URL" "$MINIPILE_PREFIX.bin"
+  MINIPILE_SINGLE_PREFIX="$(abs_path "${MINIPILE_SINGLE_PREFIX%/}")"
+  "${PYTHON_BIN_ARRAY[@]}" "$script_dir/scripts/prepare_upstream_binidx.py" \
+    "$MINIPILE_PREFIX" "$MINIPILE_SINGLE_PREFIX"
+  DATA_FILE="$MINIPILE_SINGLE_PREFIX"
 fi
 [[ -f "$DATA_FILE.bin" ]] || die "missing dataset file: $DATA_FILE.bin"
 [[ -f "$DATA_FILE.idx" ]] || die "missing dataset file: $DATA_FILE.idx"
@@ -398,10 +407,29 @@ prepare_upstream() {
   elif [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
     die "--rwkv-lm-v7-repo must point to a git checkout"
   fi
+
+  if [[ "$APPLY_UPSTREAM_ADA_PATCH" == "1" ]]; then
+    [[ -f "$UPSTREAM_ADA_PATCH" ]] || die "missing upstream Ada patch: $UPSTREAM_ADA_PATCH"
+    if git -C "$UPSTREAM_DIR" apply --reverse --check "$UPSTREAM_ADA_PATCH" >/dev/null 2>&1; then
+      echo "Using already-applied upstream Ada CUDA compatibility patch"
+    else
+      if [[ -n "$(git -C "$UPSTREAM_DIR" status --porcelain)" ]]; then
+        die "upstream checkout has unrelated changes; cannot apply the Ada compatibility patch safely"
+      fi
+      git -C "$UPSTREAM_DIR" apply --check "$UPSTREAM_ADA_PATCH" \
+        || die "upstream Ada CUDA compatibility patch does not apply to $RWKV_LM_V7_REF"
+      git -C "$UPSTREAM_DIR" apply "$UPSTREAM_ADA_PATCH"
+      echo "Applied upstream Ada CUDA compatibility patch"
+    fi
+  elif [[ "$APPLY_UPSTREAM_ADA_PATCH" != "0" ]]; then
+    die "APPLY_UPSTREAM_ADA_PATCH must be 0 or 1"
+  fi
 }
 
 prepare_upstream
 UPSTREAM_COMMIT="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
+UPSTREAM_DIFF_BLOB="$(git -C "$UPSTREAM_DIR" diff --binary | git hash-object --stdin)"
+UPSTREAM_PATCH_BLOB="$(git hash-object "$UPSTREAM_ADA_PATCH")"
 LOCAL_COMMIT="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 
 upstream_venv_python() {
@@ -831,6 +859,9 @@ quote_cmd() {
   echo "UPSTREAM_URL=$RWKV_LM_V7_URL"
   echo "UPSTREAM_REF=$RWKV_LM_V7_REF"
   echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT"
+  echo "UPSTREAM_DIFF_BLOB=$UPSTREAM_DIFF_BLOB"
+  echo "UPSTREAM_ADA_PATCH=$UPSTREAM_ADA_PATCH"
+  echo "UPSTREAM_PATCH_BLOB=$UPSTREAM_PATCH_BLOB"
   echo "UPSTREAM_VENV=$UPSTREAM_VENV"
   echo "UPSTREAM_PYTHON=$UPSTREAM_PYTHON"
   echo "UPSTREAM_LAUNCHER=$UPSTREAM_LAUNCHER"
@@ -933,6 +964,7 @@ quote_cmd() {
   echo "- If --eval-data-file is omitted, eval uses the train dataset; those results are useful for debugging but not proof-grade."
   echo "- upstream_rwkv_lm_v7 is a CUDA RWKV-LM-V7 reference run for external baseline/throughput context. It does not isolate this repository's screening mechanism by itself."
   echo "- UPSTREAM_LAUNCHER=$UPSTREAM_LAUNCHER. The default single_gpu mode retains the official model, CUDA kernels, loss, sampler, initialization, FusedAdam, optimizer groups, clipping, and schedule while replacing Lightning/DeepSpeed orchestration."
+  echo "- Upstream provenance is the recorded commit plus UPSTREAM_DIFF_BLOB; the tracked Ada patch preserves vector atomics on sm_90+ and uses scalar atomics below sm_90."
   echo
   echo "Artifacts:"
   echo

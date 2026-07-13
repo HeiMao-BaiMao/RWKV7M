@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -127,13 +128,19 @@ def validate_args(args):
     return upstream, data_file
 
 
-def git_commit(repo: Path) -> str:
-    return subprocess.run(
+def git_provenance(repo: Path) -> tuple[str, bool, str]:
+    commit = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+    diff = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--binary"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return commit, bool(diff), hashlib.sha256(diff).hexdigest()
 
 
 def write_json(path: Path, payload):
@@ -265,13 +272,15 @@ def main(argv=None):
         model = model.to(device="cuda", dtype=torch.bfloat16).train()
         optimizer, optimizer_groups = make_optimizer(model, args)
 
-        commit = git_commit(upstream)
+        commit, upstream_dirty, upstream_diff_sha256 = git_provenance(upstream)
         config = {
             **vars(args),
             "upstream_repo": str(upstream),
             "data_file": str(data_file),
             "output_dir": str(output_dir),
             "upstream_commit": commit,
+            "upstream_dirty": upstream_dirty,
+            "upstream_diff_sha256": upstream_diff_sha256,
             "initial_checkpoint": initial_checkpoint,
             "launcher": "direct_single_gpu",
             "gradient_accumulation_steps": args.global_batch_size // args.micro_batch_size,
@@ -313,7 +322,9 @@ def main(argv=None):
                 group["lr"] = lr * group["my_lr_scale"]
                 if group["weight_decay"] > 0:
                     group["weight_decay"] = args.weight_decay
-            optimizer.zero_grad(set_to_none=True)
+            # DeepSpeed FusedAdam exposes zero_grad() without PyTorch's
+            # set_to_none keyword on supported upstream versions.
+            optimizer.zero_grad()
             torch.cuda.synchronize()
             step_started = time.perf_counter()
             loss_sum = 0.0

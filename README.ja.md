@@ -100,6 +100,8 @@ local比較行列には `local_core_baseline`、`local_read_screening`、`local_
 
 upstream target の既定は `--upstream-launcher single_gpu` です。この経路は Lightning trainer と DeepSpeed distributed strategy を起動しません。一方で、固定した本家checkoutから x070 model、fused CUDA operator、fused L2Wrap cross entropy、`.bin/.idx` reader と cubic sampler、初期化、`deepspeed.ops.adam.FusedAdam` をそのままimportします。`att.w0` の2倍LR group、AdamW decay group、gradient clipping、warmup、cosine scheduleも本家規則を維持します。global batchが1 GPUのmicro batchより大きい場合は、本家のglobal sample順序を保ったgradient accumulationで再現します。成果物は `upstream_rwkv_lm_v7/` 配下の `run_config.json`、`metrics.jsonl`、`metrics.csv`、`run_summary.json`、`rwkv-init.pth`、`rwkv-final.pth` です。
 
+downloadしたMiniPileについては、本家samplerが必要とするsingle-item binidx viewをtoken byteのcopyなしで自動生成します。また、追跡済みのAda CUDA互換patch `patches/upstream_rwkv7_ada_atomic.patch` を適用し、本家commitと実際のdiff hashをrunへ記録します。未変更の本家sourceを、それがcompileできるhardwareで意図的に試す場合だけ `APPLY_UPSTREAM_ADA_PATCH=0` を指定します。
+
 Lightning/DeepSpeed stack自体を評価する場合、または対象machineでその構成を検証済みの場合に限り `--upstream-launcher deepspeed` を使います。従来経路は残していますが、論文baselineの既定からは外しました。
 
 `smoke` は配線確認用であり、研究結果には使いません。`small` は約0.19B規模ですが、既定の2,000 stepsだけで論文に十分な学習量だとは限らないため、予備実験を基にtoken budgetを決めます。datasetとupstream checkoutは `.comparison/` にcacheされます。
@@ -131,7 +133,7 @@ bash scripts/compare_minipile.sh \
 
 上のcommandでは本家baselineにdirect single-GPU経路を既定で使います。明示する場合は `--upstream-launcher single_gpu`、従来のlauncherを再実行する場合は `--upstream-launcher deepspeed` を追加します。
 
-local projectはPython 3.13以上を必要としますが、upstream repositoryは古い依存関係を固定しています。そのためcomparison scriptは、`uv venv`で専用Python 3.12環境 `.comparison/venvs/rwkv-lm-v7` を作り、`uv pip`でupstream依存関係を導入します。upstreamのLightning 1.9.5が現在も `pkg_resources` をimportするため、`setuptools<81` も互換制約として適用します。venvはseed間で再利用され、upstreamのrequirementsまたはこの互換制約が変わった場合は自動的に再同期されます。次の準備commandはvenvを作成しますが、学習は開始しません。
+local projectはPython 3.13以上を必要としますが、upstream repositoryは古い依存関係を固定しています。そのためcomparison scriptは、`uv venv`で専用Python 3.12環境 `.comparison/venvs/rwkv-lm-v7` を作り、`uv pip`でupstream依存関係を導入します。upstreamのLightning 1.9.5が現在も `pkg_resources` をimportするため、`setuptools<81` も互換制約として適用します。OS側にはPython 3.12 development header（Ubuntuでは`python3.12-dev`）、C++ build toolchain、CUDA toolkitも必要です。venvはseed間で再利用され、upstreamのrequirementsまたはこの互換制約が変わった場合は自動的に再同期されます。次の準備commandはvenvを作成しますが、学習は開始しません。
 
 ```bash
 bash scripts/compare_minipile.sh --profile smoke --no-run
@@ -141,7 +143,7 @@ bash scripts/compare_minipile.sh --profile smoke --no-run
 
 `--verify-core-parity` は、学習曲線を解釈する前に実装同等性を別途検証します。小型で決定的な公式x070 modelを生成し、固定16-token系列を本家の実fused BF16 CUDA forward/backward経路へ通して、公式FusedAdamを1 step実行します。全公式tensor、logits、gradient、更新後weightを出力し、screeningなしのFlax treeへ変換して、ゼロrecurrent stateから同じloss・gradient・optimizer規則を検証します。機械可読な結果は `upstream_core_parity/parity_report.json` に保存され、tensor coverage、許容誤差、cosine similarity、relative L2のいずれかが基準を外れると比較command全体が失敗します。
 
-この検証が確認するのは、記録されたupstream commitに対する「固定weight・ゼロ初期state・系列forward/backward」とBF16 optimizer 1 stepの互換性です。複数step・複数seedのtraining dynamicsまで同一だと証明するものではありません。captureには、本家fused operatorを曖昧なくbindingする公式JIT経路を使います。実機検証したupstream commitでは、名前衝突を機械的に解消したnon-JIT wrapperとreference logitsが完全一致しました。reference captureにはupstream用Python環境、PyTorch/CUDA、本家extensionをbuildできるcompilerが必要です。既定ではparity確認だけのために巨大checkpointを複製しないよう小型modelを使います。特定の公式 `.pth` を検査する場合は、`scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` を別途使用できます。実測値と制約は [NVIDIA Blackwell実機検証](docs/gpu_blackwell_validation.md) に記録しています。
+この検証が確認するのは、記録されたupstream commitとdiffに対する「固定weight・ゼロ初期state・系列forward/backward」とBF16 optimizer 1 stepの互換性です。複数step・複数seedのtraining dynamicsまで同一だと証明するものではありません。captureには、本家fused operatorを曖昧なくbindingする公式JIT経路を使います。実機検証したupstream commitでは、名前衝突を機械的に解消したnon-JIT wrapperとreference logitsが完全一致しました。reference captureにはupstream用Python環境、PyTorch/CUDA、本家extensionをbuildできるcompilerが必要です。既定ではparity確認だけのために巨大checkpointを複製しないよう小型modelを使います。特定の公式 `.pth` を検査する場合は、`scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` を別途使用できます。実測値と制約は [NVIDIA Blackwell実機検証](docs/gpu_blackwell_validation.md) と [NVIDIA L40S実機検証](docs/gpu_l40s_validation.md) に記録しています。
 
 parityの2段階だけを直接再実行する例です。
 
