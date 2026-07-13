@@ -56,6 +56,7 @@ Options:
   --download-data             Download default Minipile binidx if missing. Default.
   --no-download-data          Do not download default Minipile binidx.
   --no-param-control          Skip the widened no-mechanism control.
+  --verify-core-parity       Run official CUDA vs local JAX fixed-weight core parity.
   --no-run                    Only fetch, validate, and write commands.
   --help                      Show this help.
 
@@ -70,8 +71,10 @@ Common environment overrides:
   D_SLOT, D_K, D_V, N_SLOTS, WRITE_REL_FLOOR
   SHORT_HALF_LIFE_TOKENS, MID_HALF_LIFE_TOKENS, LONG_HALF_LIFE_TOKENS
   LOCAL_PREFIX="uv run"
-  UPSTREAM_PYTHON=python
-  INSTALL_UPSTREAM_DEPS=1
+  UPSTREAM_VENV=.comparison/venvs/rwkv-lm-v7
+  UPSTREAM_PYTHON_VERSION=3.12
+  INSTALL_UPSTREAM_DEPS=1  # force dependency resync; initial install is automatic
+  CORE_PARITY_ATOL=0.08 CORE_PARITY_RTOL=0.08 CORE_PARITY_TOKENS=16
 USAGE
 }
 
@@ -87,6 +90,7 @@ RWKV_LM_V7_URL="${RWKV_LM_V7_URL:-https://github.com/RWKV-Vibe/RWKV-LM-V7.git}"
 RWKV_LM_V7_REF="${RWKV_LM_V7_REF:-main}"
 COMPARE_ROOT="${COMPARE_ROOT:-$script_dir/.comparison}"
 UPSTREAM_DIR="${UPSTREAM_DIR:-$COMPARE_ROOT/RWKV-LM-V7}"
+UPSTREAM_VENV="${UPSTREAM_VENV:-$COMPARE_ROOT/venvs/rwkv-lm-v7}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-out/comparison}"
 MINIPILE_DATA_DIR="${MINIPILE_DATA_DIR:-$COMPARE_ROOT/data/rwkv_vocab_v20230424}"
 MINIPILE_PREFIX="${MINIPILE_PREFIX:-$MINIPILE_DATA_DIR/minipile}"
@@ -98,6 +102,7 @@ RUN_TARGETS="${RUN_TARGETS:-}"
 FETCH_UPSTREAM="${FETCH_UPSTREAM:-1}"
 RUN_PARAM_CONTROL="${RUN_PARAM_CONTROL:-1}"
 RUN_READ_SCREENING="${RUN_READ_SCREENING:-1}"
+RUN_CORE_PARITY="${RUN_CORE_PARITY:-0}"
 DOWNLOAD_DATA="${DOWNLOAD_DATA:-1}"
 
 DATA_FILE="${DATA_FILE:-$MINIPILE_PREFIX}"
@@ -143,7 +148,13 @@ LOCAL_LR_SCHEDULE="${LOCAL_LR_SCHEDULE:-rwkv}"
 LOCAL_CHECKPOINT_BACKEND="${LOCAL_CHECKPOINT_BACKEND:-orbax}"
 LOCAL_PREFETCH_SIZE="${LOCAL_PREFETCH_SIZE:-2}"
 LOCAL_PARAM_AXIS_NAME="${LOCAL_PARAM_AXIS_NAME:-}"
-UPSTREAM_PYTHON="${UPSTREAM_PYTHON:-python}"
+CORE_PARITY_ATOL="${CORE_PARITY_ATOL:-0.08}"
+CORE_PARITY_RTOL="${CORE_PARITY_RTOL:-0.08}"
+CORE_PARITY_TOKENS="${CORE_PARITY_TOKENS:-16}"
+# UPSTREAM_PYTHON previously selected the runtime directly. Keep accepting it as
+# the uv interpreter request, but always execute upstream inside UPSTREAM_VENV.
+UPSTREAM_PYTHON_REQUEST="${UPSTREAM_PYTHON_VERSION:-${UPSTREAM_PYTHON:-3.12}}"
+UPSTREAM_PYTHON=""
 PYTHON_BIN="${PYTHON_BIN:-}"
 UPSTREAM_STRATEGY="${UPSTREAM_STRATEGY:-deepspeed_stage_2}"
 UPSTREAM_GRAD_CP="${UPSTREAM_GRAD_CP:-0}"
@@ -185,6 +196,7 @@ while [[ $# -gt 0 ]]; do
     --no-download-data) DOWNLOAD_DATA=0; shift ;;
     --no-param-control) RUN_PARAM_CONTROL=0; shift ;;
     --no-read-screening-run) RUN_READ_SCREENING=0; shift ;;
+    --verify-core-parity) RUN_CORE_PARITY=1; shift ;;
     --no-run) RUN_TARGETS="commands"; shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -293,6 +305,12 @@ esac
 if [[ "$BACKEND" == "tpu" && ( "$RUN_TARGETS" == "both" || "$RUN_TARGETS" == "upstream" ) ]]; then
   die "RWKV-LM-V7 upstream training is CUDA/PyTorch-only; use --run-targets local on TPU and run the generated upstream command on CUDA"
 fi
+if [[ "$RUN_CORE_PARITY" == "1" && ( "$BACKEND" != "cuda" || ( "$RUN_TARGETS" != "both" && "$RUN_TARGETS" != "upstream" && "$RUN_TARGETS" != "commands" ) ) ]]; then
+  die "--verify-core-parity requires CUDA and an upstream/both target (or --no-run to emit commands)"
+fi
+if (( CORE_PARITY_TOKENS <= 0 || CORE_PARITY_TOKENS % 16 != 0 )); then
+  die "CORE_PARITY_TOKENS must be positive and divisible by the official x070 chunk length 16"
+fi
 if [[ "$RUN_TARGETS" != "commands" && "$RUN_TARGETS" != "local" && "$STEPS" -le "$WARMUP_STEPS" ]]; then
   die "upstream my_exit_tokens exits before training when STEPS <= WARMUP_STEPS; increase --steps or lower WARMUP_STEPS"
 fi
@@ -362,8 +380,52 @@ prepare_upstream
 UPSTREAM_COMMIT="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
 LOCAL_COMMIT="$(git rev-parse HEAD 2>/dev/null || printf unknown)"
 
-if [[ "$INSTALL_UPSTREAM_DEPS" == "1" ]]; then
-  (cd "$UPSTREAM_DIR" && "$UPSTREAM_PYTHON" -m pip install -r requirements.txt)
+upstream_venv_python() {
+  local candidate
+  for candidate in "$UPSTREAM_VENV/bin/python" "$UPSTREAM_VENV/Scripts/python.exe"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  die "uv created an upstream venv without a usable Python executable: $UPSTREAM_VENV"
+}
+
+prepare_upstream_venv() {
+  command -v uv >/dev/null 2>&1 || die "uv is required to create the upstream RWKV-LM-V7 venv"
+  local created=0
+  if [[ ! -f "$UPSTREAM_VENV/pyvenv.cfg" ]]; then
+    mkdir -p "$(dirname "$UPSTREAM_VENV")"
+    echo "Creating upstream RWKV-LM-V7 venv with uv: $UPSTREAM_VENV"
+    uv venv --no-project --python "$UPSTREAM_PYTHON_REQUEST" "$UPSTREAM_VENV"
+    created=1
+  fi
+
+  UPSTREAM_PYTHON="$(upstream_venv_python)"
+  local python_version
+  python_version="$("$UPSTREAM_PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  [[ "$python_version" == "3.12" ]] || die "upstream venv must use Python 3.12, found $python_version at $UPSTREAM_PYTHON"
+
+  local requirements_file="$UPSTREAM_DIR/requirements.txt"
+  [[ -f "$requirements_file" ]] || die "missing upstream requirements file: $requirements_file"
+  local requirements_hash
+  requirements_hash="$(git -C "$UPSTREAM_DIR" hash-object requirements.txt)"
+  local requirements_marker="$UPSTREAM_VENV/.rwkv7m-requirements.hash"
+  local installed_hash=""
+  if [[ -f "$requirements_marker" ]]; then
+    installed_hash="$(<"$requirements_marker")"
+  fi
+  if [[ "$created" == "1" || "$INSTALL_UPSTREAM_DEPS" == "1" || "$installed_hash" != "$requirements_hash" ]]; then
+    echo "Syncing upstream RWKV-LM-V7 dependencies into $UPSTREAM_VENV"
+    uv pip install --python "$UPSTREAM_PYTHON" -r "$requirements_file"
+    printf '%s\n' "$requirements_hash" > "$requirements_marker"
+  else
+    echo "Using cached upstream RWKV-LM-V7 venv: $UPSTREAM_VENV"
+  fi
+}
+
+if [[ "$RUN_TARGETS" == "both" || "$RUN_TARGETS" == "upstream" || "$RUN_TARGETS" == "commands" || "$RUN_CORE_PARITY" == "1" ]]; then
+  prepare_upstream_venv
 fi
 
 dataset_metadata() {
@@ -539,7 +601,11 @@ local_read_screening_out="$run_root/local_read_screening"
 local_mechanism_out="$run_root/local_mechanism"
 local_control_out="$run_root/local_param_control"
 upstream_out="$run_root/upstream_rwkv_lm_v7"
+core_parity_out="$run_root/upstream_core_parity"
 mkdir -p "$local_baseline_out" "$local_mechanism_out" "$upstream_out"
+if [[ "$RUN_CORE_PARITY" == "1" ]]; then
+  mkdir -p "$core_parity_out"
+fi
 if [[ "$RUN_READ_SCREENING" == "1" ]]; then
   mkdir -p "$local_read_screening_out"
 fi
@@ -671,6 +737,22 @@ upstream_common=(
 )
 upstream_prepare_cmd=("$UPSTREAM_PYTHON" train.py "${upstream_common[@]}" --train_stage 1)
 upstream_train_cmd=("$UPSTREAM_PYTHON" train.py --load_model 0 "${upstream_common[@]}" --train_stage "$UPSTREAM_TRAIN_STAGE")
+upstream_parity_cmd=(
+  env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions"
+  "$UPSTREAM_PYTHON" "$script_dir/scripts/capture_upstream_rwkv7_reference.py"
+  --upstream-repo "$UPSTREAM_DIR"
+  --output "$core_parity_out/official_reference.npz"
+  --tokens "$CORE_PARITY_TOKENS"
+  --seed "$SEED"
+  --kernel "$UPSTREAM_KERNEL"
+)
+local_parity_cmd=(
+  "${LOCAL_PREFIX_ARRAY[@]}" rwkv7m-verify-upstream-rwkv7
+  "$core_parity_out/official_reference.npz"
+  --atol "$CORE_PARITY_ATOL"
+  --rtol "$CORE_PARITY_RTOL"
+  --json-out "$core_parity_out/parity_report.json"
+)
 
 quote_cmd() {
   printf '%q ' "$@"
@@ -684,6 +766,8 @@ quote_cmd() {
   echo "UPSTREAM_URL=$RWKV_LM_V7_URL"
   echo "UPSTREAM_REF=$RWKV_LM_V7_REF"
   echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT"
+  echo "UPSTREAM_VENV=$UPSTREAM_VENV"
+  echo "UPSTREAM_PYTHON=$UPSTREAM_PYTHON"
   echo "MINIPILE_IDX_URL=$MINIPILE_IDX_URL"
   echo "MINIPILE_BIN_URL=$MINIPILE_BIN_URL"
   echo "BACKEND=$BACKEND"
@@ -694,6 +778,10 @@ quote_cmd() {
   echo "EVAL_EVERY=$EVAL_EVERY"
   echo "EVAL_STEPS=$EVAL_STEPS"
   echo "LOSS_TARGETS=$LOSS_TARGETS"
+  echo "RUN_CORE_PARITY=$RUN_CORE_PARITY"
+  echo "CORE_PARITY_ATOL=$CORE_PARITY_ATOL"
+  echo "CORE_PARITY_RTOL=$CORE_PARITY_RTOL"
+  echo "CORE_PARITY_TOKENS=$CORE_PARITY_TOKENS"
   echo "DATA_TOKENS=$DATA_TOKENS"
   echo "CTX_LEN=$CTX_LEN"
   echo "STEPS=$STEPS"
@@ -744,6 +832,7 @@ quote_cmd() {
   echo "LOCAL_MECHANISM_OUT=$local_mechanism_out"
   echo "LOCAL_CONTROL_OUT=$local_control_out"
   echo "UPSTREAM_OUT=$upstream_out"
+  echo "CORE_PARITY_OUT=$core_parity_out"
 } > "$run_root/parameters.env"
 
 {
@@ -786,6 +875,7 @@ quote_cmd() {
   echo "- learning_speed_summary.csv records best/final eval, eval-loss AUC over tokens, improvement per token, and throughput."
   echo "- learning_target_hits.csv records steps/tokens/estimated seconds needed to reach baseline/control/explicit loss targets."
   echo "- commands.sh records the exact commands for replay."
+  echo "- upstream_core_parity/parity_report.json records fixed-weight official CUDA vs local JAX logits parity when requested."
 } > "$run_root/protocol.md"
 
 {
@@ -815,6 +905,16 @@ quote_cmd() {
   echo
   echo "# Upstream RWKV-LM-V7 train command"
   quote_cmd "${upstream_train_cmd[@]}"
+  if [[ "$RUN_CORE_PARITY" == "1" ]]; then
+    echo
+    echo "# Official fused CUDA core reference capture"
+    echo "cd $(printf '%q' "$script_dir")"
+    quote_cmd "${upstream_parity_cmd[@]}"
+    echo
+    echo "# Local JAX core parity verification"
+    printf 'JAX_PLATFORMS=cuda '
+    quote_cmd "${local_parity_cmd[@]}"
+  fi
 } > "$run_root/commands.sh"
 chmod +x "$run_root/commands.sh"
 
@@ -1086,6 +1186,12 @@ if [[ "$RUN_TARGETS" == "upstream" || "$RUN_TARGETS" == "both" ]]; then
     cd "$UPSTREAM_DIR"
     run_logged "$upstream_out/train.log" env TORCH_EXTENSIONS_DIR="$COMPARE_ROOT/torch_extensions" "${upstream_train_cmd[@]}"
   )
+  if [[ "$RUN_CORE_PARITY" == "1" ]]; then
+    echo "Capturing official fused CUDA RWKV-7 core reference..."
+    run_logged "$core_parity_out/capture.log" "${upstream_parity_cmd[@]}"
+    echo "Verifying local JAX RWKV-7 core parity..."
+    run_logged "$core_parity_out/verify.log" env JAX_PLATFORMS=cuda "${local_parity_cmd[@]}"
+  fi
 fi
 
 echo "Comparison artifacts written under: $run_root"

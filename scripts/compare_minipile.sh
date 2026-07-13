@@ -23,9 +23,9 @@ Examples:
   bash scripts/compare_minipile.sh --profile small --steps 10000 \
       --eval-data-file /data/heldout
 
-Set INSTALL_UPSTREAM_DEPS=1 for the script to install the upstream requirements
-into the active Python environment. A dedicated Python 3.12 environment is
-recommended because upstream pins pytorch-lightning==1.9.5.
+The upstream PyTorch runtime is created automatically with uv under
+.comparison/venvs/rwkv-lm-v7 using Python 3.12. Set INSTALL_UPSTREAM_DEPS=1 to
+force a dependency resync, or UPSTREAM_VENV to change the venv location.
 USAGE
 }
 

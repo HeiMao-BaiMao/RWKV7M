@@ -113,11 +113,11 @@ local JAXの4変種には独立held-out評価を指定し、それと並行し�
 
 ```bash
 LOCAL_PREFIX="uv run --extra cuda12" \
-UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
 bash scripts/compare_minipile.sh \
   --profile small \
   --backend cuda \
   --run-targets both \
+  --verify-core-parity \
   --seeds "42 43 44" \
   --steps 10000 \
   --eval-data-file /data/minipile-heldout \
@@ -125,15 +125,29 @@ bash scripts/compare_minipile.sh \
   --eval-steps 100
 ```
 
-local projectはPython 3.13以上を必要としますが、upstream repositoryは古い依存関係を固定しているため、upstream用には独立したPython 3.12環境を使い、`UPSTREAM_PYTHON`でそのPythonを指定します。次の準備commandはupstream checkoutを取得して依存関係をinstallしますが、学習は開始しません。
+local projectはPython 3.13以上を必要としますが、upstream repositoryは古い依存関係を固定しています。そのためcomparison scriptは、`uv venv`で専用Python 3.12環境 `.comparison/venvs/rwkv-lm-v7` を作り、`uv pip`でupstream依存関係を導入します。venvはseed間で再利用され、upstreamの `requirements.txt` が変わった場合は自動的に再同期されます。次の準備commandはvenvを作成しますが、学習は開始しません。
 
 ```bash
-UPSTREAM_PYTHON=/opt/venvs/rwkv-v7-py312/bin/python \
-INSTALL_UPSTREAM_DEPS=1 \
 bash scripts/compare_minipile.sh --profile smoke --no-run
 ```
 
-この準備は一度だけ実行します。複数seedの学習commandに `INSTALL_UPSTREAM_DEPS=1` を指定するとseedごとにinstallが繰り返されます。CUDA 13環境では、両方の `uv` commandと `LOCAL_PREFIX` の `cuda12` を `cuda13` に置き換えます。
+保存先を変える場合は `UPSTREAM_VENV=/path/to/venv`、`uv`に要求するPythonを指定する場合は `UPSTREAM_PYTHON_VERSION=3.12`、依存関係を強制的に再同期する場合は `INSTALL_UPSTREAM_DEPS=1` を使います。従来の `UPSTREAM_PYTHON` もvenv作成時のinterpreter指定として受理しますが、本家commandは常にvenv内のPythonで実行されます。CUDA 13環境では、両方の `uv` commandと `LOCAL_PREFIX` の `cuda12` を `cuda13` に置き換えます。
+
+`--verify-core-parity` は、学習曲線を解釈する前に実装同等性を別途検証します。小型で決定的な公式x070 modelを生成し、固定16-token系列を本家の実fused BF16 CUDA経路へ通し、全公式tensorとreference logitsを出力します。次にそのweightをscreeningなしのFlax treeへ変換し、ゼロrecurrent stateと同じIDで `rwkv7m-verify-upstream-rwkv7` を実行します。機械可読な結果は `upstream_core_parity/parity_report.json` に保存され、tensorの欠落、余分なtensor、shape不一致、logitsの許容誤差超過があれば比較command全体が失敗します。
+
+この検証が確認するのは、記録されたupstream commitに対する「固定weight・ゼロ初期state・系列forward」のparityです。optimizerや複数seedのtraining dynamicsまで同等だと証明するものではありません。reference captureにはupstream用Python環境、PyTorch/CUDA、本家extensionをbuildできるcompilerが必要です。既定ではparity確認だけのために巨大checkpointを複製しないよう小型modelを使います。特定の公式 `.pth` を検査する場合は、`scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` を別途使用できます。
+
+parityの2段階だけを直接再実行する例です。
+
+```bash
+.comparison/venvs/rwkv-lm-v7/bin/python scripts/capture_upstream_rwkv7_reference.py \
+  --upstream-repo .comparison/RWKV-LM-V7 \
+  --output out/upstream-core-parity/reference.npz
+
+JAX_PLATFORMS=cuda uv run --extra cuda12 rwkv7m-verify-upstream-rwkv7 \
+  out/upstream-core-parity/reference.npz \
+  --json-out out/upstream-core-parity/report.json
+```
 
 #### Google TPU環境での例
 
@@ -176,6 +190,7 @@ bash scripts/compare_minipile.sh \
 - `learning_speed_summary.csv`: best/final eval loss、perplexity、tokenに対するeval-loss AUC、throughput。
 - `learning_target_hits.csv`: 共通loss目標への到達step/token数。
 - `parameters.env`、`protocol.md`、`commands.sh`: 実行条件、source commit、再現用command。
+- `upstream_core_parity/parity_report.json`: 本家CUDAとlocal JAXの固定weight core parity。
 
 `--seeds` はseedごとのrun directoryを作りますが、現行scriptはseed横断集計を行いません。論文へ載せる前に各runのCSVを結合し、seed数と、標準偏差や信頼区間などのばらつき・不確実性を報告します。またupstream runはlocal held-out CSV summaryには含まれず、FLOPs-matched controlとtask-specific long-context benchmarkも未実装です。生成された表からそれらの比較結果まで主張しないようにします。
 
