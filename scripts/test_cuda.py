@@ -133,13 +133,18 @@ def test_backward_gpu():
     screen_state = init_screen_state(2, cfg.screening)
 
     # Time training step (train_step is already JITted with static_argnames)
-    jax.block_until_ready(train_step(train_state, batch, rwkv_state, screen_state, "read_screening_only"))
+    train_state, rwkv_state, screen_state, metrics = train_step(
+        train_state, batch, rwkv_state, screen_state, "read_screening_only"
+    )
+    jax.block_until_ready((train_state, rwkv_state, screen_state, metrics))
 
     times = []
     for _ in range(5):
         start = time.perf_counter()
-        out = train_step(train_state, batch, rwkv_state, screen_state, "read_screening_only")
-        jax.block_until_ready(out)
+        train_state, rwkv_state, screen_state, metrics = train_step(
+            train_state, batch, rwkv_state, screen_state, "read_screening_only"
+        )
+        jax.block_until_ready((train_state, rwkv_state, screen_state, metrics))
         times.append(time.perf_counter() - start)
 
     avg_time = sum(times) / len(times)

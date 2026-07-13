@@ -133,16 +133,17 @@ bash scripts/compare_minipile.sh --profile smoke --no-run
 
 保存先を変える場合は `UPSTREAM_VENV=/path/to/venv`、`uv`に要求するPythonを指定する場合は `UPSTREAM_PYTHON_VERSION=3.12`、依存関係を強制的に再同期する場合は `INSTALL_UPSTREAM_DEPS=1` を使います。従来の `UPSTREAM_PYTHON` もvenv作成時のinterpreter指定として受理しますが、本家commandは常にvenv内のPythonで実行されます。CUDA 13環境では、両方の `uv` commandと `LOCAL_PREFIX` の `cuda12` を `cuda13` に置き換えます。本家fused extensionのbuildにはNVIDIA driverだけでなく、PyTorchのCUDA buildと互換性のあるCUDA compilerおよびdevelopment headerも必要です。Blackwellでの実機検証では、PyTorch CUDA 13.0にCUDA 13.0 compiler/development librariesを組み合わせました。
 
-`--verify-core-parity` は、学習曲線を解釈する前に実装同等性を別途検証します。小型で決定的な公式x070 modelを生成し、固定16-token系列を本家の実fused BF16 CUDA経路へ通し、全公式tensorとreference logitsを出力します。次にそのweightをscreeningなしのFlax treeへ変換し、ゼロrecurrent stateと同じIDで `rwkv7m-verify-upstream-rwkv7` を実行します。機械可読な結果は `upstream_core_parity/parity_report.json` に保存され、tensorの欠落、余分なtensor、shape不一致、logitsの許容誤差超過があれば比較command全体が失敗します。
+`--verify-core-parity` は、学習曲線を解釈する前に実装同等性を別途検証します。小型で決定的な公式x070 modelを生成し、固定16-token系列を本家の実fused BF16 CUDA forward/backward経路へ通して、公式FusedAdamを1 step実行します。全公式tensor、logits、gradient、更新後weightを出力し、screeningなしのFlax treeへ変換して、ゼロrecurrent stateから同じloss・gradient・optimizer規則を検証します。機械可読な結果は `upstream_core_parity/parity_report.json` に保存され、tensor coverage、許容誤差、cosine similarity、relative L2のいずれかが基準を外れると比較command全体が失敗します。
 
-この検証が確認するのは、記録されたupstream commitに対する「固定weight・ゼロ初期state・系列forward」のparityです。optimizerや複数seedのtraining dynamicsまで同等だと証明するものではありません。captureには、本家fused operatorを曖昧なくbindingする公式JIT経路を使います。実機検証したupstream commitでは、名前衝突を機械的に解消したnon-JIT wrapperとreference logitsが完全一致しました。reference captureにはupstream用Python環境、PyTorch/CUDA、本家extensionをbuildできるcompilerが必要です。既定ではparity確認だけのために巨大checkpointを複製しないよう小型modelを使います。特定の公式 `.pth` を検査する場合は、`scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` を別途使用できます。
+この検証が確認するのは、記録されたupstream commitに対する「固定weight・ゼロ初期state・系列forward/backward」とBF16 optimizer 1 stepの互換性です。複数step・複数seedのtraining dynamicsまで同一だと証明するものではありません。captureには、本家fused operatorを曖昧なくbindingする公式JIT経路を使います。実機検証したupstream commitでは、名前衝突を機械的に解消したnon-JIT wrapperとreference logitsが完全一致しました。reference captureにはupstream用Python環境、PyTorch/CUDA、本家extensionをbuildできるcompilerが必要です。既定ではparity確認だけのために巨大checkpointを複製しないよう小型modelを使います。特定の公式 `.pth` を検査する場合は、`scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` を別途使用できます。実測値と制約は [NVIDIA Blackwell実機検証](docs/gpu_blackwell_validation.md) に記録しています。
 
 parityの2段階だけを直接再実行する例です。
 
 ```bash
 .comparison/venvs/rwkv-lm-v7/bin/python scripts/capture_upstream_rwkv7_reference.py \
   --upstream-repo .comparison/RWKV-LM-V7 \
-  --output out/upstream-core-parity/reference.npz
+  --output out/upstream-core-parity/reference.npz \
+  --optimizer-step
 
 JAX_PLATFORMS=cuda uv run --extra cuda12 rwkv7m-verify-upstream-rwkv7 \
   out/upstream-core-parity/reference.npz \

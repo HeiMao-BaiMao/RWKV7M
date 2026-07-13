@@ -51,6 +51,13 @@ def parse_args(argv=None):
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--kernel", default="@rwkv3")
+    parser.add_argument("--optimizer-step", action="store_true")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.001)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--adam-eps", type=float, default=1e-8)
     return parser.parse_args(argv)
 
 
@@ -97,7 +104,7 @@ def main(argv=None):
     sys.path.insert(0, str(upstream))
     try:
         os.chdir(upstream)
-        from src.model import RWKV
+        from src.model import RWKV, l2wrap_cross_entropy
 
         model_args = SimpleNamespace(
             my_testing="x070",
@@ -107,6 +114,7 @@ def main(argv=None):
             n_layer=args.n_layer,
             dim_ffn=args.d_ffn,
             vocab_size=args.vocab_size,
+            ctx_len=args.tokens,
             grad_cp=0,
             weight_decay=0.0,
         )
@@ -128,10 +136,88 @@ def main(argv=None):
                 x, v_first = block(x, v_first)
                 layer_outputs.append(x.float().cpu().numpy())
             logits = model.head(model.ln_out(x)).float().cpu().numpy()
+        model.zero_grad(set_to_none=True)
+        training_logits = model(input_ids)
+        targets = torch.as_tensor(target_ids_np, device="cuda", dtype=torch.long)
+        reference_loss = l2wrap_cross_entropy(training_logits, targets)
+        reference_loss.backward()
         official_state = {
             name: tensor.detach().float().cpu().numpy()
             for name, tensor in model.state_dict().items()
         }
+        parameters = dict(model.named_parameters())
+        missing_gradient_names = sorted(
+            name for name in official_state
+            if name not in parameters or parameters[name].grad is None
+        )
+        normalized_missing_gradient_names = {
+            name.removeprefix("_forward_module.") for name in missing_gradient_names
+        }
+        expected_missing_gradient_names = {
+            "blocks.0.att.v0",
+            "blocks.0.att.v1",
+            "blocks.0.att.v2",
+        }
+        if normalized_missing_gradient_names != expected_missing_gradient_names:
+            raise RuntimeError(
+                "unexpected parameters without gradients: "
+                f"{sorted(normalized_missing_gradient_names)}"
+            )
+        official_gradients = {
+            name: (
+                parameters[name].grad.detach().float().cpu().numpy()
+                if name in parameters and parameters[name].grad is not None
+                else np.zeros_like(value)
+            )
+            for name, value in official_state.items()
+        }
+        reference_loss_value = float(reference_loss.detach().cpu())
+        updated_state = None
+        if args.optimizer_step:
+            from deepspeed.ops.adam import FusedAdam
+
+            decay_parameters = []
+            regular_parameters = []
+            double_lr_parameters = []
+            for name, parameter in model.named_parameters():
+                normalized_name = name.removeprefix("_forward_module.")
+                if "att.w0" in normalized_name:
+                    double_lr_parameters.append(parameter)
+                elif (
+                    len(parameter.squeeze().shape) >= 2
+                    and ".weight" in normalized_name
+                    and args.weight_decay > 0
+                ):
+                    decay_parameters.append(parameter)
+                else:
+                    regular_parameters.append(parameter)
+            optimizer_groups = [
+                {"params": regular_parameters, "lr": args.lr, "weight_decay": 0.0},
+                {"params": double_lr_parameters, "lr": 2 * args.lr, "weight_decay": 0.0},
+            ]
+            if decay_parameters:
+                optimizer_groups.append(
+                    {
+                        "params": decay_parameters,
+                        "lr": args.lr,
+                        "weight_decay": args.weight_decay,
+                    }
+                )
+            optimizer = FusedAdam(
+                optimizer_groups,
+                lr=args.lr,
+                betas=(args.adam_beta1, args.adam_beta2),
+                eps=args.adam_eps,
+                bias_correction=True,
+                adam_w_mode=args.weight_decay > 0,
+                amsgrad=False,
+            )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            updated_state = {
+                name: tensor.detach().float().cpu().numpy()
+                for name, tensor in model.state_dict().items()
+            }
     finally:
         os.chdir(old_cwd)
 
@@ -143,7 +229,7 @@ def main(argv=None):
     ).stdout.strip()
     metadata = {
         "format": "rwkv7m-upstream-x070-parity",
-        "format_version": 1,
+        "format_version": 2,
         "upstream_commit": commit,
         "checkpoint": str(checkpoint) if checkpoint else None,
         "checkpoint_sha256": sha256_file(checkpoint) if checkpoint else None,
@@ -157,15 +243,38 @@ def main(argv=None):
         "seed": args.seed,
         "official_dtype": "bfloat16",
         "local_dtype": "bfloat16",
-        "scope": "official fused CUDA zero-initial-state sequence forward",
+        "scope": "official fused CUDA zero-initial-state sequence forward and backward",
+        "gradient_loss": "mean cross entropy plus RWKV L2Wrap factor 1e-4",
+        "missing_gradient_names": sorted(normalized_missing_gradient_names),
+        "optimizer_step": (
+            {
+                "name": "deepspeed.ops.adam.FusedAdam",
+                "lr": args.lr,
+                "w0_lr_scale": 2.0,
+                "weight_decay": args.weight_decay,
+                "grad_clip": args.grad_clip,
+                "betas": [args.adam_beta1, args.adam_beta2],
+                "eps": args.adam_eps,
+            }
+            if args.optimizer_step
+            else None
+        ),
     }
     payload = {
         "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
         "input_ids": input_ids_np,
         "target_ids": target_ids_np,
         "reference_logits": logits,
+        "reference_loss": np.asarray(reference_loss_value, dtype=np.float32),
     }
     payload.update({f"weight::{name}": value for name, value in official_state.items()})
+    payload.update(
+        {f"gradient::{name}": value for name, value in official_gradients.items()}
+    )
+    if updated_state is not None:
+        payload.update(
+            {f"updated_weight::{name}": value for name, value in updated_state.items()}
+        )
     payload.update({f"layer::{i}": value for i, value in enumerate(layer_outputs)})
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

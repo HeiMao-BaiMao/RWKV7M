@@ -751,6 +751,13 @@ upstream_parity_cmd=(
   --tokens "$CORE_PARITY_TOKENS"
   --seed "$SEED"
   --kernel "$UPSTREAM_KERNEL"
+  --optimizer-step
+  --lr "$LR_INIT"
+  --weight-decay "$WEIGHT_DECAY"
+  --grad-clip "$GRAD_CLIP"
+  --adam-beta1 "$ADAM_BETA1"
+  --adam-beta2 "$ADAM_BETA2"
+  --adam-eps "$ADAM_EPS"
 )
 local_parity_cmd=(
   "${LOCAL_PREFIX_ARRAY[@]}" rwkv7m-verify-upstream-rwkv7
@@ -881,7 +888,7 @@ quote_cmd() {
   echo "- learning_speed_summary.csv records best/final eval, eval-loss AUC over tokens, improvement per token, and throughput."
   echo "- learning_target_hits.csv records steps/tokens/estimated seconds needed to reach baseline/control/explicit loss targets."
   echo "- commands.sh records the exact commands for replay."
-  echo "- upstream_core_parity/parity_report.json records fixed-weight official CUDA vs local JAX logits parity when requested."
+  echo "- upstream_core_parity/parity_report.json records fixed-weight official CUDA vs local JAX forward, backward, and one-step optimizer parity when requested."
 } > "$run_root/protocol.md"
 
 {
