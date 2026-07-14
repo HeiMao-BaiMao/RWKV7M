@@ -13,7 +13,7 @@ from ..model import (
     ScreeningConfig,
     model_preset,
 )
-from .config import parse_args_with_config
+from .config import apply_execution_overrides, parse_args_with_config
 
 
 def default_bank_ids(n_slots):
@@ -41,7 +41,7 @@ def build_config(args, variant):
         config.use_screening = use_screening
         if use_screening:
             config.screening.use_write_screening = variant == "read_write"
-        return config
+        return apply_execution_overrides(config, args)
     screening = ScreeningConfig()
     if use_screening:
         screened_layers = tuple(args.screened_layers)
@@ -57,7 +57,7 @@ def build_config(args, variant):
             bank_ids=default_bank_ids(args.n_slots),
             use_write_screening=variant == "read_write",
         )
-    return ModelConfig(
+    config = ModelConfig(
         d_model=args.d_model,
         d_ffn=args.d_ffn,
         n_layers=args.n_layers,
@@ -66,9 +66,13 @@ def build_config(args, variant):
         vocab_size=args.vocab_size,
         max_seq_len=args.ctx_len,
         dtype=args.dtype,
+        remat_blocks=bool(args.remat_blocks),
+        sequence_chunk_size=args.sequence_chunk_size,
+        head_chunk_size=args.head_chunk_size,
         use_screening=use_screening,
         screening=screening,
     )
+    return apply_execution_overrides(config, args)
 
 
 def run_variant(args, variant):
@@ -131,6 +135,24 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--variants", nargs="+", default=["baseline", "screening", "read_write"])
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    remat_group = parser.add_mutually_exclusive_group()
+    remat_group.add_argument(
+        "--remat-blocks",
+        dest="remat_blocks",
+        action="store_true",
+    )
+    remat_group.add_argument(
+        "--no-remat-blocks",
+        dest="remat_blocks",
+        action="store_false",
+    )
+    parser.set_defaults(remat_blocks=None)
+    chunk_group = parser.add_mutually_exclusive_group()
+    chunk_group.add_argument("--sequence-chunk-size", type=int, default=None)
+    chunk_group.add_argument("--no-sequence-chunking", action="store_true")
+    head_chunk_group = parser.add_mutually_exclusive_group()
+    head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
+    head_chunk_group.add_argument("--no-head-chunking", action="store_true")
     parser.add_argument("--vocab-size", type=int, default=65536)
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--d-ffn", type=int, default=128)

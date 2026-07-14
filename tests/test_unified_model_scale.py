@@ -108,9 +108,10 @@ def test_exact_sequence_chunking_and_block_remat_match_unchunked_update():
     expected = _run_step(unchunked, accumulation_steps=1, batch=batch)
     expected_params = _parameter_values(expected[0].model)
 
-    for chunk_size in (2, 3):
+    for recurrent_chunk_size, head_chunk_size in ((2, 4), (3, 2)):
         chunked = copy.deepcopy(unchunked)
-        chunked.sequence_chunk_size = chunk_size
+        chunked.sequence_chunk_size = recurrent_chunk_size
+        chunked.head_chunk_size = head_chunk_size
         chunked.remat_blocks = True
         actual = _run_step(chunked, accumulation_steps=1, batch=batch)
 
@@ -124,7 +125,7 @@ def test_exact_sequence_chunking_and_block_remat_match_unchunked_update():
                 expected_value,
                 rtol=2e-5,
                 atol=2e-6,
-            ), (chunk_size, path)
+            ), (recurrent_chunk_size, head_chunk_size, path)
 
 
 def test_microbatch_accumulation_matches_full_batch_optimizer_update():
@@ -189,3 +190,53 @@ def test_tracked_7b_config_is_shared_by_planner_and_distributed_cli():
     assert build_config(run_args) == config
     assert run_args.gradient_accumulation_steps == 8
     assert run_args.mesh_axis_names == ["data", "model"]
+
+
+def test_preset_execution_controls_are_explicit_opt_in_overrides():
+    base_args = [
+        "--data-file",
+        "unused",
+        "--model-preset",
+        "0.185b",
+        "--ctx-len",
+        "512",
+        "--global-batch-size",
+        "1",
+        "--steps",
+        "0",
+    ]
+
+    preset_config = build_config(parse_args(base_args))
+    assert preset_config.remat_blocks is True
+    assert preset_config.sequence_chunk_size == 128
+    assert preset_config.head_chunk_size is None
+
+    unchunked_config = build_config(
+        parse_args(
+            base_args
+            + [
+                "--no-remat-blocks",
+                "--no-sequence-chunking",
+                "--no-head-chunking",
+            ]
+        )
+    )
+    assert unchunked_config.remat_blocks is False
+    assert unchunked_config.sequence_chunk_size is None
+    assert unchunked_config.head_chunk_size == 512
+
+    comparison_config = build_config(
+        parse_args(
+            base_args
+            + [
+                "--remat-blocks",
+                "--sequence-chunk-size",
+                "256",
+                "--head-chunk-size",
+                "512",
+            ]
+        )
+    )
+    assert comparison_config.remat_blocks is True
+    assert comparison_config.sequence_chunk_size == 256
+    assert comparison_config.head_chunk_size == 512

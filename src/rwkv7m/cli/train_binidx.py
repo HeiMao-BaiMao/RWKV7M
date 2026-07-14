@@ -14,7 +14,7 @@ from ..io import (
     save_train_checkpoint,
 )
 from ..model import MODEL_PRESET_NAMES, ModelConfig, ScreeningConfig, model_preset
-from .config import parse_args_with_config
+from .config import apply_execution_overrides, parse_args_with_config
 from .eval_binidx import evaluate_binidx, parse_args as parse_eval_args
 
 
@@ -33,7 +33,7 @@ def build_config(args):
             raise ValueError(
                 f"ctx_len={args.ctx_len} exceeds model max_seq_len={config.max_seq_len}"
             )
-        return config
+        return apply_execution_overrides(config, args)
     if args.use_screening:
         screened_layers = tuple(args.screened_layers)
         if not screened_layers and args.n_layers > 1:
@@ -56,7 +56,7 @@ def build_config(args):
         )
     else:
         screening = ScreeningConfig()
-    return ModelConfig(
+    config = ModelConfig(
         d_model=args.d_model,
         d_ffn=args.d_ffn,
         n_layers=args.n_layers,
@@ -71,8 +71,9 @@ def build_config(args):
         gradient_accum_dtype=args.gradient_accum_dtype,
         lm_head_init=args.lm_head_init,
         vocab_parallel=args.vocab_parallel,
-        remat_blocks=args.remat_blocks,
+        remat_blocks=bool(args.remat_blocks),
         sequence_chunk_size=args.sequence_chunk_size,
+        head_chunk_size=args.head_chunk_size,
         use_screening=args.use_screening,
         screening=screening,
         lr_init=args.lr_init,
@@ -85,6 +86,7 @@ def build_config(args):
         adam_beta2=args.adam_beta2,
         adam_eps=args.adam_eps,
     )
+    return apply_execution_overrides(config, args)
 
 
 def default_bank_ids(n_slots):
@@ -107,7 +109,7 @@ def parse_args(argv=None):
     model_source.add_argument(
         "--model-config",
         default=None,
-        help="Shared ModelConfig JSON used unchanged by small and large models",
+        help="Shared ModelConfig JSON; execution-only overrides may be applied",
     )
     model_source.add_argument(
         "--model-preset",
@@ -129,8 +131,24 @@ def parse_args(argv=None):
     parser.add_argument("--gradient-accum-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--lm-head-init", choices=["orthogonal", "variance_scaled"], default="orthogonal")
     parser.add_argument("--vocab-parallel", action="store_true")
-    parser.add_argument("--remat-blocks", action="store_true")
-    parser.add_argument("--sequence-chunk-size", type=int, default=None)
+    remat_group = parser.add_mutually_exclusive_group()
+    remat_group.add_argument(
+        "--remat-blocks",
+        dest="remat_blocks",
+        action="store_true",
+    )
+    remat_group.add_argument(
+        "--no-remat-blocks",
+        dest="remat_blocks",
+        action="store_false",
+    )
+    parser.set_defaults(remat_blocks=None)
+    chunk_group = parser.add_mutually_exclusive_group()
+    chunk_group.add_argument("--sequence-chunk-size", type=int, default=None)
+    chunk_group.add_argument("--no-sequence-chunking", action="store_true")
+    head_chunk_group = parser.add_mutually_exclusive_group()
+    head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
+    head_chunk_group.add_argument("--no-head-chunking", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)

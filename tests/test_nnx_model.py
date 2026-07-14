@@ -11,9 +11,14 @@ from rwkv7m.model.nnx_conversion import load_linen_params_into_nnx
 from rwkv7m.model.nnx_model import (
     NNXScreenedRWKVModel,
     NNXShardingConfig,
+    _apply_norm_in_float32,
     initialize_nnx_model,
 )
-from rwkv7m.model.screened_rwkv import create_model_variables, cross_entropy_loss
+from rwkv7m.model.screened_rwkv import (
+    create_model_variables,
+    cross_entropy_components,
+    cross_entropy_loss,
+)
 from rwkv7m.model.state import init_rwkv_state, init_screen_state
 
 
@@ -35,6 +40,21 @@ def _states(config):
         init_rwkv_state(1, config),
         init_screen_state(1, config.screening),
     )
+
+
+def _bfloat16_config():
+    config = tiny_config(
+        vocab_size=16,
+        d_model=8,
+        n_layers=1,
+        n_heads=1,
+        head_size=8,
+        use_screening=False,
+    )
+    config.dtype = "bfloat16"
+    config.param_dtype = "bfloat16"
+    config.lm_head_init = "variance_scaled"
+    return config
 
 
 def _nnx_flat(state):
@@ -68,6 +88,30 @@ def test_nnx_full_model_matches_linen_reference_for_read_and_write():
             screen_state,
             phase=phase,
         )
+        hidden, split_rwkv, split_screen, split_stats = (
+            nnx_model.compute_recurrent_hidden(
+                input_ids,
+                rwkv_state,
+                screen_state,
+                phase=phase,
+            )
+        )
+        split_logits = nnx_model.compute_logits(hidden)
+        assert jnp.allclose(split_logits, actual[0], rtol=1e-5, atol=1e-6)
+        assert all(
+            jax.tree.leaves(
+                jax.tree.map(
+                    lambda left, right: jnp.allclose(
+                        left, right, rtol=1e-5, atol=1e-6
+                    ),
+                    (split_rwkv, split_screen),
+                    actual[1:3],
+                )
+            )
+        )
+        assert set(split_stats) == set(actual[3])
+        for key in split_stats:
+            assert jnp.allclose(split_stats[key], actual[3][key])
         assert jnp.allclose(actual[0], expected[0], rtol=1e-5, atol=1e-6)
         assert all(
             jax.tree.leaves(
@@ -126,6 +170,102 @@ def test_nnx_full_model_gradient_matches_linen_reference():
         assert jnp.allclose(
             nnx_grads[path], expected, rtol=3e-5, atol=3e-6
         ), path
+
+
+def test_bfloat16_compute_boundaries_keep_state_and_loss_statistics_in_fp32():
+    config = _bfloat16_config()
+    model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(10))
+    input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+    targets = jnp.asarray([[2, 3, 4]], dtype=jnp.int32)
+    rwkv_state, screen_state = _states(config)
+
+    logits, new_rwkv_state, _, _ = model(
+        input_ids,
+        rwkv_state,
+        screen_state,
+    )
+    assert logits.dtype == jnp.bfloat16
+    assert new_rwkv_state[0].time_mix_x.dtype == jnp.float32
+    assert new_rwkv_state[0].channel_mix_x.dtype == jnp.float32
+    assert new_rwkv_state[0].wkv.dtype == jnp.float32
+
+    block = model.layer_0.rwkv_block_0
+    hidden = model.token_embedding(input_ids).astype(jnp.bfloat16)
+    normalized = _apply_norm_in_float32(
+        block.ln1,
+        hidden,
+        output_dtype=jnp.bfloat16,
+    )
+    assert normalized.dtype == jnp.bfloat16
+    time_mix_output, _, _, wkv = block.att(
+        normalized,
+        jnp.zeros_like(normalized),
+        rwkv_state[0],
+    )
+    assert time_mix_output.dtype == jnp.bfloat16
+    assert wkv.dtype == jnp.float32
+    projection_output = block.att.output(hidden.astype(jnp.float32))
+    assert projection_output.dtype == jnp.bfloat16
+
+    ce_total, ce_count = cross_entropy_components(
+        logits,
+        targets,
+        jnp.ones_like(targets, dtype=jnp.bfloat16),
+    )
+    loss = cross_entropy_loss(logits, targets)
+    assert ce_total.dtype == jnp.float32
+    assert ce_count.dtype == jnp.float32
+    assert loss.dtype == jnp.float32
+    recurrent_hidden, *_ = model.compute_recurrent_hidden(
+        input_ids,
+        rwkv_state,
+        screen_state,
+    )
+    training_components = model.compute_training_loss(
+        recurrent_hidden,
+        targets,
+    )
+    assert set(training_components) == {
+        "ce_total",
+        "ce_count",
+        "l2_total",
+        "l2_count",
+    }
+    assert all(
+        value.dtype == jnp.float32 for value in training_components.values()
+    )
+    assert jnp.allclose(
+        loss,
+        training_components["ce_total"]
+        / jnp.maximum(training_components["ce_count"], 1.0),
+    )
+    expected_loss = -jnp.mean(
+        jnp.take_along_axis(
+            jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1),
+            targets[..., None],
+            axis=-1,
+        )
+    )
+    assert jnp.allclose(loss, expected_loss)
+    logits_grad = jax.grad(cross_entropy_loss)(logits, targets)
+    assert jnp.all(jnp.isfinite(logits_grad))
+
+    graphdef, params = nnx.split(model, nnx.Param)
+
+    def model_loss(active_params):
+        active_model = nnx.merge(graphdef, active_params)
+        active_logits, *_ = active_model(
+            input_ids,
+            rwkv_state,
+            screen_state,
+        )
+        return cross_entropy_loss(active_logits, targets)
+
+    model_grads = jax.grad(model_loss)(params)
+    assert all(
+        bool(jnp.all(jnp.isfinite(value)))
+        for value in jax.tree.leaves(model_grads)
+    )
 
 
 def test_explicit_nnx_forward_matches_linen_reference():

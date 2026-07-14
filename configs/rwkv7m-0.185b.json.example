@@ -15,6 +15,7 @@
   "vocab_parallel": false,
   "remat_blocks": true,
   "sequence_chunk_size": 128,
+  "head_chunk_size": null,
   "use_screening": true,
   "screening": {
     "d_model": 768,

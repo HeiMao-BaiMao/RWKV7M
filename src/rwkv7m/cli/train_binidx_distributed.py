@@ -1,4 +1,5 @@
 import argparse
+import gc
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
@@ -68,8 +69,24 @@ def parse_args(argv=None):
     parser.add_argument("--gradient-accum-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--lm-head-init", choices=["orthogonal", "variance_scaled"], default="orthogonal")
     parser.add_argument("--vocab-parallel", action="store_true")
-    parser.add_argument("--remat-blocks", action="store_true")
-    parser.add_argument("--sequence-chunk-size", type=int, default=None)
+    remat_group = parser.add_mutually_exclusive_group()
+    remat_group.add_argument(
+        "--remat-blocks",
+        dest="remat_blocks",
+        action="store_true",
+    )
+    remat_group.add_argument(
+        "--no-remat-blocks",
+        dest="remat_blocks",
+        action="store_false",
+    )
+    parser.set_defaults(remat_blocks=None)
+    chunk_group = parser.add_mutually_exclusive_group()
+    chunk_group.add_argument("--sequence-chunk-size", type=int, default=None)
+    chunk_group.add_argument("--no-sequence-chunking", action="store_true")
+    head_chunk_group = parser.add_mutually_exclusive_group()
+    head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
+    head_chunk_group.add_argument("--no-head-chunking", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)
@@ -114,6 +131,14 @@ def parse_args(argv=None):
     parser.add_argument("--log-csv", default=None)
     parser.add_argument("--summary-json", default=None)
     parser.add_argument("--summary-every", type=int, default=10)
+    parser.add_argument(
+        "--disable-python-gc",
+        action="store_true",
+        help=(
+            "disable CPython cyclic GC during the training process; reference "
+            "counting remains active and the prior GC state is restored on exit"
+        ),
+    )
     parser.add_argument("--save-best-checkpoint", action="store_true")
     parser.add_argument("--best-metric", default="loss")
     parser.add_argument("--best-mode", choices=["min", "max"], default="min")
@@ -738,7 +763,14 @@ def run_distributed_training(args):
 
 def main(argv=None):
     args = parse_args(argv)
-    run_distributed_training(args)
+    gc_was_enabled = gc.isenabled()
+    if args.disable_python_gc and gc_was_enabled:
+        gc.disable()
+    try:
+        run_distributed_training(args)
+    finally:
+        if args.disable_python_gc and gc_was_enabled:
+            gc.enable()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from .state import LayerRWKVState, LayerScreenState, ModelScreenState, init_scre
 from .screening import ScreeningConfig, StateLevelScreening, normalize_phase
 from .screened_rwkv import ScreenedRWKVLayer, ScreenedRWKVModel, ModelConfig
 from .rwkv_core import RWKV7Block, RWKV7TimeMix, RWKV7ChannelMix, RWKV7Config
+from .wkv import wkv7, wkv7_reference, wkv7_sharded
 from .nnx_model import (
     NNXShardingConfig,
     NNXRWKV7Block,
@@ -41,6 +42,9 @@ __all__ = [
     "RWKV7TimeMix",
     "RWKV7ChannelMix",
     "RWKV7Config",
+    "wkv7",
+    "wkv7_reference",
+    "wkv7_sharded",
     "NNXShardingConfig",
     "NNXRWKV7Block",
     "NNXRWKV7ChannelMix",

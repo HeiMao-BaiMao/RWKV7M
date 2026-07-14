@@ -2,6 +2,42 @@ import argparse
 import json
 
 
+def apply_execution_overrides(config, args):
+    """Apply opt-in remat/chunk controls without replacing model presets."""
+    remat_blocks = getattr(args, "remat_blocks", None)
+    if remat_blocks is not None:
+        config.remat_blocks = bool(remat_blocks)
+
+    sequence_chunk_size = getattr(args, "sequence_chunk_size", None)
+    no_sequence_chunking = getattr(args, "no_sequence_chunking", False)
+    if no_sequence_chunking and sequence_chunk_size is not None:
+        raise ValueError(
+            "--sequence-chunk-size and --no-sequence-chunking are mutually exclusive"
+        )
+    if no_sequence_chunking:
+        config.sequence_chunk_size = None
+    elif sequence_chunk_size is not None:
+        if sequence_chunk_size <= 0:
+            raise ValueError("--sequence-chunk-size must be positive")
+        config.sequence_chunk_size = int(sequence_chunk_size)
+
+    head_chunk_size = getattr(args, "head_chunk_size", None)
+    no_head_chunking = getattr(args, "no_head_chunking", False)
+    if no_head_chunking and head_chunk_size is not None:
+        raise ValueError(
+            "--head-chunk-size and --no-head-chunking are mutually exclusive"
+        )
+    if no_head_chunking:
+        config.head_chunk_size = int(
+            getattr(args, "ctx_len", config.max_seq_len)
+        )
+    elif head_chunk_size is not None:
+        if head_chunk_size <= 0:
+            raise ValueError("--head-chunk-size must be positive")
+        config.head_chunk_size = int(head_chunk_size)
+    return config
+
+
 def parse_args_with_config(parser: argparse.ArgumentParser, argv=None):
     parser.add_argument("--config", default=None, help="JSON config file with CLI option defaults")
 

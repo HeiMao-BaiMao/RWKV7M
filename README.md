@@ -215,6 +215,35 @@ Set `UPSTREAM_VENV=/path/to/venv` to change the cache location, `UPSTREAM_PYTHON
 
 This check establishes fixed-weight, zero-initial-state sequence forward/backward parity and one-step BF16 optimizer compatibility for the tested upstream commit and recorded diff. It does not establish identical multi-step or multi-seed training dynamics. The capture uses the official JIT path, which binds the upstream fused operators unambiguously; on the validated upstream commit it produced exactly the same reference logits as the mechanically disambiguated non-JIT wrappers. The reference capture requires the upstream Python environment, PyTorch/CUDA, and a working compiler for the official extensions. The generated small model avoids copying a multi-billion-parameter training checkpoint solely for the parity check; `scripts/capture_upstream_rwkv7_reference.py --checkpoint ...` can be used separately when a particular official `.pth` must be checked. See [NVIDIA Blackwell validation](docs/gpu_blackwell_validation.md) and [NVIDIA L40S validation](docs/gpu_l40s_validation.md) for measured results and limitations.
 
+The backend split, dtype contract, staged Pallas work, and performance gate are
+recorded in the [accelerator kernel roadmap](docs/accelerator_kernel_roadmap.md).
+The real TPU v5e correctness gate, WKV microbenchmark, limitations, and cleanup
+record are in the
+[TPU Pallas performance report](docs/tpu_pallas_performance.md).
+The real L40S correctness gate, four-shape WKV benchmark, complete train-step
+measurements, upstream RWKV comparison, TPU comparison, and two-GPU scaling
+record are in the
+[L40S Pallas performance report](docs/gpu_l40s_pallas_performance.md).
+WKV now dispatches to persistent Pallas forward/backward kernels by default on
+TPU and NVIDIA GPU, while CPU uses the reference recurrence. L40S/Ada selects
+the Triton Pallas lowering explicitly; recognized Hopper/Blackwell devices use
+Mosaic GPU. FFI is an unbundled, explicitly registered escape hatch and is
+never selected automatically.
+
+Run the synchronized accelerator/reference WKV benchmark with:
+
+```bash
+uv run python scripts/benchmark_wkv_accelerator.py \
+  --time 128 --batch 1 --heads 12 --head-size 64 \
+  --warmup 5 --iterations 100 --output out/wkv-benchmark.json
+```
+
+For controlled long-running throughput experiments, the distributed trainer
+also accepts `--disable-python-gc`. This opt-in flag disables only CPython's
+cyclic collector while the command runs and restores its prior state on exit;
+reference counting remains active. It is not enabled by default because long-
+duration heap growth still depends on the selected training configuration.
+
 The two parity stages can also be replayed directly:
 
 ```bash
@@ -531,8 +560,10 @@ uv run rwkv7m-train-binidx-dp `
 Edit the example's dataset paths and mesh sizes for the target TPU topology.
 Its model config enables BF16 parameter storage and compute, FP32 parameter
 updates/Adam moments/gradient accumulation, vocabulary-parallel logits and
-loss, block rematerialization, exact state-carrying sequence chunks, and
-microbatch gradient accumulation. Chunk boundaries do not stop gradients.
+loss, block rematerialization, exact state-carrying recurrent chunks, and
+microbatch gradient accumulation. Recurrent and LM-head chunk sizes are
+independent; `head_chunk_size: null` inherits `sequence_chunk_size` for
+backward-compatible memory behavior. Chunk boundaries do not stop gradients.
 These features are integrated and covered by small-model equivalence tests;
 the tracked 7B shape has not yet been executed end-to-end on TPU.
 
@@ -573,7 +604,8 @@ uv run rwkv7m-audit-nnx-model-parallel `
   --write-screening `
   --vocab-parallel `
   --remat-blocks `
-  --sequence-chunk-size 2
+  --sequence-chunk-size 2 `
+  --head-chunk-size 4
 ```
 
 The forced CPU run is a deterministic local contract test. A real TPU v5e
@@ -649,11 +681,15 @@ Lower-level modules:
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
 - Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, carry-state runtime checkpoint/resume, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and an optional NNX Explicit data/model mesh path.
+- Persistent TPU and NVIDIA Pallas WKV forward/backward kernels with FP32
+  interval checkpoints, a Pallas-first dispatcher, and CPU interpret-mode
+  forward/gradient parity tests.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
 
-- production fused RWKV kernels,
+- production accelerator profiling and shape-specific Pallas autotuning beyond
+  the validated L40S shapes,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,
@@ -669,4 +705,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 optimizer dtype contracts, exact sequence-chunk and microbatch equivalence, vocabulary-parallel loss, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 134 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 140 tests.

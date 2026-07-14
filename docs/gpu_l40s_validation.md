@@ -4,6 +4,10 @@ This record covers the direct upstream training runner and the Ada compatibility
 path. Generated datasets, checkpoints, extension binaries, and logs remained on
 the disposable server and are not repository dependencies.
 
+> **Historical baseline:** the main throughput section below predates the
+> persistent Pallas WKV implementation. See the
+> [post-Pallas L40S report](gpu_l40s_pallas_performance.md) for current results.
+
 ## Environment
 
 - GPU: NVIDIA L40S, 46,068 MiB visible memory, compute capability 8.9.
@@ -38,9 +42,11 @@ The distributed CLI starts each step timer after yielding the prefetched batch
 and blocks on the complete updated model and optimizer state before stopping
 it. Step 1 was excluded because it includes XLA compilation. The mean retains
 all later stalls; the median better represents the normal step. The official
-row has the same L12-D768-FFN2688 core dimensions as the local 0.185B rows, but
-it is not the state-level-screening architecture and has a different model
-implementation and parameterization.
+wrapper requested FFN 2688, but the validated upstream x070 `ChannelMix`
+implementation actually constructs FFN 3072 matrices directly. It is not the
+state-level-screening architecture and has a different model implementation
+and parameterization. The post-Pallas comparison corrects this shape mismatch
+and records the actual parameter count.
 
 | Implementation and model | Context | Global batch | Mesh | Measured steps | Median token/s | Mean token/s | Post-step-1 range |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
@@ -98,13 +104,12 @@ Main findings:
   direction, but controlled repetitions and profiler traces are still needed
   for publication-grade claims.
 
-The practical conclusion is that the current architecture is sufficient for
-functional research experiments and for fitting the tested 1B preset on two
-L40S GPUs, but the current GPU execution path is not performance-sufficient.
-The highest-priority GPU work is a fused or custom-lowered RWKV recurrence,
-followed by fused screening operations and profiler-guided launch/collective
-tuning. On this particular host, data parallelism should be preferred whenever
-the model fits on each GPU; two-way model parallelism crosses a slow `SYS` link.
+At this historical revision, the architecture was sufficient for functional
+research experiments and for fitting the tested 1B preset on two L40S GPUs,
+but the generic GPU recurrence was not performance-sufficient. The subsequent
+Pallas work resolved that primary bottleneck for the tested 0.185B shapes and
+made screening the largest measured remaining cost. On this particular host,
+two-way model parallelism still crosses a slow `SYS` link.
 
 ## Compatibility findings
 
