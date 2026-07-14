@@ -15,6 +15,8 @@ portable `lax.scan` recurrence on a Google Cloud TPU v5e. For the tested
 These are WKV-only kernel measurements on one TPU device. They are not
 complete-model tokens-per-second results and must not be combined with the
 older end-to-end preset measurements as if they used the same workload.
+The matching L40S shape and full GPU training results are recorded separately
+in the [L40S Pallas performance report](gpu_l40s_pallas_performance.md).
 
 ## Implementation change
 

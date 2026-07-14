@@ -220,11 +220,29 @@ recorded in the [accelerator kernel roadmap](docs/accelerator_kernel_roadmap.md)
 The real TPU v5e correctness gate, WKV microbenchmark, limitations, and cleanup
 record are in the
 [TPU Pallas performance report](docs/tpu_pallas_performance.md).
+The real L40S correctness gate, four-shape WKV benchmark, complete train-step
+measurements, upstream RWKV comparison, TPU comparison, and two-GPU scaling
+record are in the
+[L40S Pallas performance report](docs/gpu_l40s_pallas_performance.md).
 WKV now dispatches to persistent Pallas forward/backward kernels by default on
 TPU and NVIDIA GPU, while CPU uses the reference recurrence. L40S/Ada selects
 the Triton Pallas lowering explicitly; recognized Hopper/Blackwell devices use
 Mosaic GPU. FFI is an unbundled, explicitly registered escape hatch and is
 never selected automatically.
+
+Run the synchronized accelerator/reference WKV benchmark with:
+
+```bash
+uv run python scripts/benchmark_wkv_accelerator.py \
+  --time 128 --batch 1 --heads 12 --head-size 64 \
+  --warmup 5 --iterations 100 --output out/wkv-benchmark.json
+```
+
+For controlled long-running throughput experiments, the distributed trainer
+also accepts `--disable-python-gc`. This opt-in flag disables only CPython's
+cyclic collector while the command runs and restores its prior state on exit;
+reference counting remains active. It is not enabled by default because long-
+duration heap growth still depends on the selected training configuration.
 
 The two parity stages can also be replayed directly:
 
@@ -670,7 +688,8 @@ Lower-level modules:
 
 Not yet included:
 
-- production accelerator profiling and shape-specific Pallas autotuning,
+- production accelerator profiling and shape-specific Pallas autotuning beyond
+  the validated L40S shapes,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,

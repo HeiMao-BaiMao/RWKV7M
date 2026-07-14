@@ -120,8 +120,10 @@ not accepted as proof of the limiting resource.
 4. **Implemented:** common WKV API, Pallas-first dispatch, custom VJP boundary,
    reference implementation, dtype/shape validation, checkpointed dedicated
    backward, and forward/gradient parity tests.
-5. **Partial:** persistent Triton/Mosaic Pallas GPU forward/backward are
-   implemented and pass Pallas interpret-mode parity. Real-GPU lowering,
+5. **Implemented functional and performance gate on Ada:** persistent Triton
+   Pallas GPU forward/backward pass interpret-mode parity, real L40S lowering,
+   all-input gradient parity, a two-way model-sharding step, and controlled WKV
+   and train-step benchmarks. Mosaic real-hardware validation, privileged GPU
    profiling, and independent autotuning remain pending.
 6. **Implemented functional gate:** TPU-specific Pallas forward/backward pass
    interpret-mode parity, real TPU v5e lowering, full-model BF16 gradient, and
@@ -132,7 +134,9 @@ not accepted as proof of the limiting resource.
 8. **Implemented foundation:** optional FFI registration and explicit dispatch
    contracts exist; no native FFI implementation is bundled or selected by
    default.
-9. **Pending:** architecture- and shape-specific measured dispatch records.
+9. **Partial:** an L40S/Ada measured dispatch record now covers four WKV shapes
+   and tracked 0.185B train-step configurations. Hopper/Blackwell and broader
+   production-shape records remain pending.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:
@@ -145,6 +149,26 @@ flags make comparison runs explicit:
 ```
 
 Record the resolved `model_config` from `run_config.json` with every result.
+
+## L40S Pallas validation record
+
+The complete environment, correctness gates, WKV timings, full training-step
+results, upstream RWKV comparison, TPU comparison, two-GPU scaling, and
+profiling limitation are documented in
+[NVIDIA L40S Pallas performance validation](gpu_l40s_pallas_performance.md).
+
+For `T=128, B=1, H=12, N=64`, the real Triton-Pallas path was 8.77x faster in
+forward and 15.09x faster in forward plus backward than the local `lax.scan`
+reference. In an identical memory-safe 0.185B training configuration, Pallas
+increased median complete-step throughput by 4.17x. A matched FFN-3072,
+screening-free local run sustained 9,413 token/s versus 8,516 token/s for the
+directly executed upstream fused RWKV-LM-V7 runner, subject to the different
+wrapper/loss/optimizer limitations recorded in the report.
+
+This changes the tuning priority for the tested small shape. The canonical
+FFN-2688 read-only screening path reduced time-weighted throughput by 58.7%
+relative to its screening-free core; read/write reduced it by 60.0%. Screening
+fusion and layout work now precede further WKV replacement work on Ada.
 
 ## TPU v5e Pallas validation record
 
