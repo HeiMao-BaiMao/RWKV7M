@@ -2,7 +2,10 @@
 
 ## 1. Purpose
 
-`rwkv7m` is a JAX/Flax reference implementation for experimenting with RWKV-7 style recurrent language models plus optional state-level screening memory.
+`rwkv7m` is a JAX/Flax NNX research implementation for experimenting with
+RWKV-7 style recurrent language models plus optional state-level screening
+memory. The former Linen implementation is retained as a numerical and
+upstream-conversion reference rather than the training source of truth.
 
 The implementation follows the research design in `RWKV7M.paper.md`, but this document is the concrete engineering contract for the current repository.
 
@@ -10,7 +13,8 @@ The implementation follows the research design in `RWKV7M.paper.md`, but this do
 
 Implemented:
 
-1. Flax Linen model modules.
+1. Flax NNX model, runtime, optimizer, and distributed training modules, with
+   Linen reference modules and full-model parity tests.
 2. RWKV-7 inspired TimeMix / ChannelMix blocks.
 3. Reference recurrent state carry for chunked inference:
    - previous TimeMix hidden input,
@@ -32,13 +36,27 @@ Implemented:
 10. Safetensors export/import for Flax params with model config and tokenizer metadata.
 11. PyTorch-readable safetensors loading helper for external runtime projects.
 12. Single-process train checkpoints with optional runtime state for carry-state resume.
-13. Local-testable distributed data-parallel training layer with mesh/sharding helpers.
-14. Process-aware Flax and Orbax train-state checkpoints, carry-state runtime checkpoints, metrics, summaries, validation hooks, checkpoint rotation, and run artifact audit tooling.
-15. Installable library API: `from rwkv7m import ...`.
+13. Local-testable distributed data/model-parallel training layer with explicit
+    NNX sharding contracts and post-SPMD HLO collective auditing.
+14. Process-aware local and Orbax train-state checkpoints, carry-state runtime
+    checkpoints, metrics, summaries, validation hooks, checkpoint rotation, and
+    run artifact audit tooling.
+15. Functional Phase 3 validation on a four-device TPU v5e slice for a small
+    complete-model forward/backward/optimizer step, plus a separate-process
+    small NNX Orbax lifecycle probe.
+16. Installable library API: `from rwkv7m import ...`.
 
 Important limitation:
 
-The current code is still a JAX/Flax reference path. It is suitable for correctness testing, small experiments, portable artifact validation, and local distributed smoke tests. It does not yet provide production fused RWKV kernels, pretrained RWKV checkpoint conversion, tuned TPU sharding policy, real TPU pod checkpoint validation, or a PyTorch/non-JAX runtime. The external recurrent state carry is implemented for this reference model, but it should not be treated as compatibility with upstream RWKV-7 production checkpoints.
+The current code is a JAX/Flax NNX research path with real-TPU functional
+coverage for a small model, not a production-scale 7B trainer. It is suitable
+for correctness testing, small experiments, portable artifact validation, and
+distributed smoke tests. It does not yet provide production fused RWKV kernels,
+pretrained RWKV checkpoint conversion, XProf-tuned TPU sharding, full RWKV7M
+train/runtime-state checkpoint validation on TPU pods, 7B or multi-host TPU
+evidence, or a PyTorch/non-JAX runtime. The external recurrent state carry is
+implemented for this research model, but it should not be treated as
+compatibility with upstream RWKV-7 production checkpoints.
 
 ## 3. Package Layout
 
@@ -450,9 +468,14 @@ Prefer:
 
 Next engineering steps:
 
-1. Validate Orbax train-state and runtime-state checkpoint save/resume on real TPU pods, including sharded optimizer/parameter/recurrent states.
-2. Tune per-parameter TPU sharding rules beyond the current rule-based placement hooks.
-3. Tune TPU pod throughput and document failure recovery drills.
+1. Validate full RWKV7M Orbax train-state and runtime-state checkpoint
+   save/resume on real TPU pods, including sharded optimizer, parameter,
+   recurrent, and screening states. The independent small NNX lifecycle probe
+   is already validated.
+2. Use XProf to tune the explicit sharding contracts and the three all-to-all
+   collectives observed in the four-device TPU v5e smoke test.
+3. Validate the 7B configuration and multi-host execution, then tune TPU pod
+   throughput and document failure recovery drills.
 4. Implement task-specific long-context evaluation harnesses beyond stateful binidx validation.
 5. Add causal intervention hooks for slot ablation/patching, read shuffle, write suppression, and frozen-slot controls.
 6. Implement upstream RWKV-7 checkpoint mapping only after conversion tests prove compatibility.

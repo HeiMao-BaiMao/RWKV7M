@@ -51,6 +51,52 @@ class NNXShardingConfig:
     def named(self, *axes: str | None) -> NamedSharding:
         return NamedSharding(self.mesh, P(*axes))
 
+    @property
+    def uses_explicit_axes(self) -> bool:
+        return any(
+            axis_type == jax.sharding.AxisType.Explicit
+            for axis_type in self.mesh.axis_types
+        )
+
+    def activation(self, rank: int, *, model_sharded: bool) -> NamedSharding:
+        if rank < 1:
+            raise ValueError(f"activation rank must be positive, got {rank}")
+        axes: list[str | None] = [self.data_axis]
+        axes.extend([None] * (rank - 1))
+        if model_sharded:
+            axes[-1] = self.model_axis
+        return self.named(*axes)
+
+
+class _NNXParallelLinear(nnx.Linear):
+    """NNX Linear that makes its output feature placement explicit.
+
+    Row-parallel kernels produce a replicated feature dimension and
+    column-parallel kernels produce a model-sharded feature dimension. JAX
+    cannot infer the former when both contracting dimensions are sharded, so
+    Phase 3 treats the output placement as part of the layer contract.
+    """
+
+    def __init__(
+        self,
+        *args,
+        sharding: NNXShardingConfig | None,
+        output_model_sharded: bool,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._rwkv7m_sharding = sharding
+        self._rwkv7m_output_model_sharded = output_model_sharded
+
+    def __call__(self, inputs, out_sharding=None):
+        sharding = self._rwkv7m_sharding
+        if out_sharding is None and sharding is not None and sharding.uses_explicit_axes:
+            out_sharding = sharding.activation(
+                inputs.ndim,
+                model_sharded=self._rwkv7m_output_model_sharded,
+            )
+        return super().__call__(inputs, out_sharding=out_sharding)
+
 
 def _partitioned_init(
     initializer: Initializer,
@@ -87,9 +133,16 @@ def _linear(
     bias_axes: tuple[str | None, ...] | None = None,
     sharding: NNXShardingConfig | None = None,
 ) -> nnx.Linear:
-    return nnx.Linear(
+    output_model_sharded = bool(
+        sharding is not None
+        and kernel_axes is not None
+        and kernel_axes[-1] == sharding.model_axis
+    )
+    return _NNXParallelLinear(
         in_features,
         out_features,
+        sharding=sharding,
+        output_model_sharded=output_model_sharded,
         use_bias=use_bias,
         kernel_init=_partitioned_init(kernel_init, kernel_axes, sharding),
         bias_init=_partitioned_init(bias_init, bias_axes, sharding),
@@ -129,12 +182,81 @@ def _constrain_hidden(x, sharding: NNXShardingConfig | None):
 
 
 def _apply_activation_sharding(x, named_sharding, sharding):
-    if any(
-        axis_type == jax.sharding.AxisType.Explicit
-        for axis_type in sharding.mesh.axis_types
-    ):
+    if sharding.uses_explicit_axes:
         return jax.reshard(x, named_sharding)
     return jax.lax.with_sharding_constraint(x, named_sharding)
+
+
+def _dot_last(
+    lhs,
+    rhs,
+    *,
+    sharding: NNXShardingConfig | None,
+    output_model_sharded: bool,
+    leading_data_axis: bool = True,
+):
+    """Contract the last/first axes with an explicit output placement."""
+    if sharding is None or not sharding.uses_explicit_axes:
+        return lhs @ rhs
+    if leading_data_axis:
+        out_sharding = sharding.activation(
+            lhs.ndim,
+            model_sharded=output_model_sharded,
+        )
+    else:
+        axes: list[str | None] = [None] * lhs.ndim
+        if output_model_sharded:
+            axes[-1] = sharding.model_axis
+        out_sharding = sharding.named(*axes)
+    return jax.lax.dot_general(
+        lhs,
+        rhs,
+        (((lhs.ndim - 1,), (0,)), ((), ())),
+        out_sharding=out_sharding,
+    )
+
+
+def _compute_slot_delta(
+    x,
+    h_base,
+    slot_embed,
+    kernel,
+    bias,
+    sharding: NNXShardingConfig | None,
+):
+    """Screening delta projection with a model-sharded d_slot output."""
+    if sharding is None or not sharding.uses_explicit_axes:
+        return compute_slot_delta(x, h_base, slot_embed, kernel, bias)
+    C = x.shape[-1]
+    d_slot = slot_embed.shape[-1]
+    x_kernel = kernel[:C, :]
+    h_kernel = kernel[C : 2 * C, :]
+    slot_kernel = kernel[2 * C : 2 * C + d_slot, :]
+    x_term = _dot_last(
+        x,
+        x_kernel,
+        sharding=sharding,
+        output_model_sharded=True,
+    )
+    h_term = _dot_last(
+        h_base,
+        h_kernel,
+        sharding=sharding,
+        output_model_sharded=True,
+    )
+    slot_term = _dot_last(
+        slot_embed,
+        slot_kernel,
+        sharding=sharding,
+        output_model_sharded=True,
+        leading_data_axis=False,
+    )
+    return jnp.tanh(
+        x_term[:, None, :]
+        + h_term[:, None, :]
+        + slot_term[None, :, :]
+        + bias
+    )
 
 
 def _constrain_wkv(x, sharding: NNXShardingConfig | None):
@@ -154,6 +276,100 @@ def _constrain_slots(x, sharding: NNXShardingConfig | None):
         x,
         sharding.named(sharding.data_axis, None, sharding.model_axis),
         sharding,
+    )
+
+
+def _reshape_heads(x, shape, sharding: NNXShardingConfig | None):
+    """Reshape hidden features while assigning model shards to RWKV heads."""
+    if sharding is None or not sharding.uses_explicit_axes:
+        return jnp.reshape(x, shape)
+    if len(shape) != 4:
+        raise ValueError(f"RWKV head shape must have rank 4, got {shape}")
+    return jax.lax.reshape(
+        x,
+        shape,
+        out_sharding=sharding.named(
+            sharding.data_axis,
+            None,
+            sharding.model_axis,
+            None,
+        ),
+    )
+
+
+def _flatten_heads(x, shape, sharding: NNXShardingConfig | None):
+    """Flatten RWKV heads back into the model-sharded hidden dimension."""
+    if sharding is None or not sharding.uses_explicit_axes:
+        return jnp.reshape(x, shape)
+    return jax.lax.reshape(
+        x,
+        shape,
+        out_sharding=sharding.activation(len(shape), model_sharded=True),
+    )
+
+
+def _reshape_hidden(x, shape, sharding: NNXShardingConfig | None):
+    """Reshape token axes without changing the hidden-axis contract."""
+    if sharding is None or not sharding.uses_explicit_axes:
+        return jnp.reshape(x, shape)
+    return jax.lax.reshape(
+        x,
+        shape,
+        out_sharding=sharding.activation(len(shape), model_sharded=True),
+    )
+
+
+def _group_norm(
+    module: nnx.GroupNorm,
+    x,
+    sharding: NNXShardingConfig | None,
+):
+    """Run NNX GroupNorm with an explicit hidden output contract."""
+    if sharding is None or not sharding.uses_explicit_axes:
+        return module(x)
+    if x.ndim != 2:
+        raise ValueError(f"explicit RWKV GroupNorm expects rank 2, got {x.ndim}")
+    grouped_sharding = sharding.named(
+        sharding.data_axis,
+        sharding.model_axis,
+        None,
+    )
+    grouped = jax.lax.reshape(
+        x,
+        (x.shape[0], module.num_groups, module.group_size),
+        out_sharding=grouped_sharding,
+    )
+    stats = grouped.astype(jnp.promote_types(grouped.dtype, jnp.float32))
+    mean = jnp.mean(stats, axis=-1, keepdims=True)
+    if module.use_fast_variance:
+        mean_square = jnp.mean(jnp.abs(stats) ** 2, axis=-1, keepdims=True)
+        variance = jnp.maximum(0.0, mean_square - jnp.abs(mean) ** 2)
+    else:
+        variance = jnp.mean(
+            jnp.abs(stats - mean) ** 2,
+            axis=-1,
+            keepdims=True,
+        )
+    normalized = (stats - mean) * jax.lax.rsqrt(variance + module.epsilon)
+    parameter_sharding = sharding.named(sharding.model_axis, None)
+    if module.scale is not None:
+        scale = jax.lax.reshape(
+            _value(module.scale),
+            (module.num_groups, module.group_size),
+            out_sharding=parameter_sharding,
+        )
+        normalized *= scale[None, :, :]
+    if module.bias is not None:
+        bias = jax.lax.reshape(
+            _value(module.bias),
+            (module.num_groups, module.group_size),
+            out_sharding=parameter_sharding,
+        )
+        normalized += bias[None, :, :]
+    return jax.lax.reshape(
+        normalized,
+        x.shape,
+        out_sharding=sharding.activation(x.ndim, model_sharded=True),
     )
 
 
@@ -337,32 +553,77 @@ class NNXRWKV7TimeMix(nnx.Module):
         x_g = x + xx * _value(self.x_g)
 
         r = self.receptance(x_r)
-        w_raw = _value(self.w0) + jnp.tanh(x_w @ _value(self.w1)) @ _value(self.w2)
+        w_hidden = _dot_last(
+            x_w,
+            _value(self.w1),
+            sharding=self.sharding,
+            output_model_sharded=False,
+        )
+        w_raw = _value(self.w0) + _dot_last(
+            jnp.tanh(w_hidden),
+            _value(self.w2),
+            sharding=self.sharding,
+            output_model_sharded=True,
+        )
         w_clamped = -jax.nn.softplus(-w_raw) - 0.5
         k = self.key(x_k)
         v = self.value(x_v)
         if self.layer_idx == 0:
             v_first = v
         else:
-            v12 = (x_v @ _value(self.v1)) @ _value(self.v2)
+            v12 = _dot_last(
+                _dot_last(
+                    x_v,
+                    _value(self.v1),
+                    sharding=self.sharding,
+                    output_model_sharded=False,
+                ),
+                _value(self.v2),
+                sharding=self.sharding,
+                output_model_sharded=True,
+            )
             v = v + (v_first - v) * jax.nn.sigmoid(_value(self.v0) + v12)
 
-        a = jax.nn.sigmoid(
-            _value(self.a0) + (x_a @ _value(self.a1)) @ _value(self.a2)
+        a_hidden = _dot_last(
+            x_a,
+            _value(self.a1),
+            sharding=self.sharding,
+            output_model_sharded=False,
         )
-        g = jax.nn.sigmoid(x_g @ _value(self.g1)) @ _value(self.g2)
+        a = jax.nn.sigmoid(
+            _value(self.a0)
+            + _dot_last(
+                a_hidden,
+                _value(self.a2),
+                sharding=self.sharding,
+                output_model_sharded=True,
+            )
+        )
+        g = _dot_last(
+            jax.nn.sigmoid(
+                _dot_last(
+                    x_g,
+                    _value(self.g1),
+                    sharding=self.sharding,
+                    output_model_sharded=False,
+                )
+            ),
+            _value(self.g2),
+            sharding=self.sharding,
+            output_model_sharded=True,
+        )
         kk = k * _value(self.k_k)
-        kk_h = kk.reshape(B, T, H, N)
+        kk_h = _reshape_heads(kk, (B, T, H, N), self.sharding)
         kk_h /= jnp.sqrt(jnp.sum(kk_h * kk_h, axis=-1, keepdims=True) + 1e-12**2)
-        kk = kk_h.reshape(B, T, C)
+        kk = _flatten_heads(kk_h, (B, T, C), self.sharding)
         k = k * (1.0 + (a - 1.0) * _value(self.k_a))
 
-        r_h = r.reshape(B, T, H, N)
-        w_h = w_clamped.reshape(B, T, H, N)
-        k_h = k.reshape(B, T, H, N)
-        v_h = v.reshape(B, T, H, N)
-        neg_kk_h = (-kk).reshape(B, T, H, N)
-        kka_h = (kk * a).reshape(B, T, H, N)
+        r_h = _reshape_heads(r, (B, T, H, N), self.sharding)
+        w_h = _reshape_heads(w_clamped, (B, T, H, N), self.sharding)
+        k_h = _reshape_heads(k, (B, T, H, N), self.sharding)
+        v_h = _reshape_heads(v, (B, T, H, N), self.sharding)
+        neg_kk_h = _reshape_heads(-kk, (B, T, H, N), self.sharding)
+        kka_h = _reshape_heads(kk * a, (B, T, H, N), self.sharding)
         inputs = tuple(
             jnp.swapaxes(value, 0, 1)
             for value in (r_h, w_h, k_h, v_h, neg_kk_h, kka_h)
@@ -370,10 +631,23 @@ class NNXRWKV7TimeMix(nnx.Module):
         final_state, y_h = jax.lax.scan(
             lambda carry, values: wkv_step(carry, *values), initial_state, inputs
         )
-        y = jnp.swapaxes(y_h, 0, 1).reshape(B, T, C)
-        y = self.ln_x(y.reshape(B * T, C)).reshape(B, T, C)
+        y = _flatten_heads(jnp.swapaxes(y_h, 0, 1), (B, T, C), self.sharding)
+        y = _reshape_hidden(
+            _group_norm(
+                self.ln_x,
+                _reshape_hidden(y, (B * T, C), self.sharding),
+                self.sharding,
+            ),
+            (B, T, C),
+            self.sharding,
+        )
         rk = r_h * k_h * _value(self.r_k)
-        y = y + (jnp.sum(rk, axis=-1, keepdims=True) * v_h).reshape(B, T, C)
+        recurrent_bonus = _flatten_heads(
+            jnp.sum(rk, axis=-1, keepdims=True) * v_h,
+            (B, T, C),
+            self.sharding,
+        )
+        y = y + recurrent_bonus
         y = self.output(y * g)
         y = _constrain_hidden(y, self.sharding)
         return y, v_first, x[:, -1, :].astype(jnp.float32), final_state
@@ -510,7 +784,17 @@ class NNXStateLevelScreening(nnx.Module):
         self.v_proj = _linear(config.d_slot, config.d_v, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding)
         self.out_proj = _linear(config.d_v, C, use_bias=False, kernel_axes=column, rngs=rngs, sharding=sharding)
         self.gate_proj = _linear(C, C, kernel_axes=row, rngs=rngs, sharding=sharding)
-        self.delta_proj = _linear(2 * C + config.d_slot, config.d_slot, kernel_axes=row, rngs=rngs, sharding=sharding)
+        # Keep the portable concatenated kernel shape, but shard its d_slot
+        # output. Sharding the concatenated input would make x/h/slot slices
+        # cross device boundaries and introduce avoidable reshard collectives.
+        self.delta_proj = _linear(
+            2 * C + config.d_slot,
+            config.d_slot,
+            kernel_axes=column,
+            bias_axes=vector,
+            rngs=rngs,
+            sharding=sharding,
+        )
         self.screen_ln = _layer_norm(C, dtype=jnp.float32, rngs=rngs, sharding=sharding)
         self.tau_r_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding)
         lambda_init = math.log(math.expm1(config.lambda_screen_init))
@@ -600,12 +884,13 @@ class NNXStateLevelScreening(nnx.Module):
             h_t = h_base_seq[:, t, :] + lambda_screen * gate * read_out.astype(
                 h_base_seq.dtype
             )
-            delta_s_t = compute_slot_delta(
+            delta_s_t = _compute_slot_delta(
                 x_ln_seq[:, t, :],
                 h_base_seq[:, t, :].astype(jnp.float32),
                 _value(self.slot_embed),
                 _value(self.delta_proj.kernel),
                 _value(self.delta_proj.bias),
+                self.sharding,
             )
             if not write_enabled:
                 strength = mu[None, :, None]
@@ -782,8 +1067,17 @@ class NNXScreenedRWKVModel(nnx.Module):
         cfg = self.config
         phase = normalize_phase(phase)
         batch_size = input_ids.shape[0]
+        embedding_out_sharding = None
+        if self.sharding is not None and self.sharding.uses_explicit_axes:
+            embedding_out_sharding = self.sharding.activation(
+                input_ids.ndim + 1,
+                model_sharded=True,
+            )
         x = _constrain_hidden(
-            self.token_embedding(input_ids).astype(_get_model_dtype(cfg)),
+            self.token_embedding(
+                input_ids,
+                out_sharding=embedding_out_sharding,
+            ).astype(_get_model_dtype(cfg)),
             self.sharding,
         )
         screened_idx = {

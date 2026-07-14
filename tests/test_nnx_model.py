@@ -8,7 +8,11 @@ from rwkv7m.distributed import (
     save_orbax_train_state,
 )
 from rwkv7m.model.nnx_conversion import load_linen_params_into_nnx
-from rwkv7m.model.nnx_model import NNXScreenedRWKVModel, NNXShardingConfig
+from rwkv7m.model.nnx_model import (
+    NNXScreenedRWKVModel,
+    NNXShardingConfig,
+    initialize_nnx_model,
+)
 from rwkv7m.model.screened_rwkv import create_model_variables, cross_entropy_loss
 from rwkv7m.model.state import init_rwkv_state, init_screen_state
 
@@ -122,6 +126,56 @@ def test_nnx_full_model_gradient_matches_linen_reference():
         assert jnp.allclose(
             nnx_grads[path], expected, rtol=3e-5, atol=3e-6
         ), path
+
+
+def test_explicit_nnx_forward_matches_linen_reference():
+    config = _screened_config()
+    config.lm_head_init = "variance_scaled"
+    linen_variables, linen_model = create_model_variables(
+        jax.random.key(20), config, 1
+    )
+    mesh = make_mesh(
+        ("data", "model"),
+        axis_sizes=(1, 1),
+        axis_types=(
+            jax.sharding.AxisType.Explicit,
+            jax.sharding.AxisType.Explicit,
+        ),
+    )
+    sharding = NNXShardingConfig(mesh)
+    nnx_model = initialize_nnx_model(
+        jax.random.key(21),
+        config,
+        sharding=sharding,
+    )
+    load_linen_params_into_nnx(nnx_model, linen_variables["params"])
+    input_ids = jnp.asarray([[1, 2]], dtype=jnp.int32)
+    rwkv_state, screen_state = _states(config)
+    expected = linen_model.apply(
+        linen_variables,
+        input_ids,
+        rwkv_state,
+        screen_state,
+        phase="read_write",
+    )
+    actual = nnx_model(
+        jax.device_put(input_ids, sharding.named("data", None)),
+        rwkv_state,
+        screen_state,
+        phase="read_write",
+    )
+    assert jnp.allclose(actual[0], expected[0], rtol=1e-5, atol=1e-6)
+    assert all(
+        jax.tree.leaves(
+            jax.tree.map(
+                lambda left, right: jnp.allclose(
+                    left, right, rtol=1e-5, atol=1e-6
+                ),
+                actual[1:3],
+                expected[1:3],
+            )
+        )
+    )
 
 
 def test_nnx_sharded_init_optimizer_orbax_restore_and_next_step(tmp_path):

@@ -344,15 +344,48 @@ def _runtime_state_payload(runtime_or_dist):
     }
 
 
+def _validate_model_parallel_shapes(config, mesh, axis_name):
+    axis_index = tuple(mesh.axis_names).index(axis_name)
+    axis_size = int(mesh.devices.shape[axis_index])
+    required = {
+        "d_model": config.d_model,
+        "n_heads": config.n_heads,
+    }
+    if config.use_screening and config.screening.screened_layers:
+        required["d_slot"] = config.screening.d_slot
+    invalid = {
+        name: value for name, value in required.items() if value % axis_size != 0
+    }
+    if invalid:
+        details = ", ".join(f"{name}={value}" for name, value in invalid.items())
+        raise ValueError(
+            f"model-parallel dimensions must be divisible by axis "
+            f"{axis_name!r} size {axis_size}: {details}"
+        )
+
+
 def run_distributed_training(args):
     info = initialize_jax_distributed()
-    if "data" not in tuple(args.mesh_axis_names):
+    mesh_axis_names = tuple(args.mesh_axis_names)
+    if "data" not in mesh_axis_names:
         raise ValueError("mesh_axis_names must include 'data'")
+    if args.param_axis_name is not None and args.param_axis_name not in mesh_axis_names:
+        raise ValueError(
+            f"param_axis_name {args.param_axis_name!r} is not present in "
+            f"mesh_axis_names={mesh_axis_names!r}"
+        )
     if args.carry_state and args.sampling_mode != "sequential":
         raise ValueError("--carry-state requires --sampling-mode sequential")
+    uses_explicit_model_parallel = args.param_axis_name not in (None, "data")
+    axis_type = (
+        jax.sharding.AxisType.Explicit
+        if uses_explicit_model_parallel
+        else jax.sharding.AxisType.Auto
+    )
     mesh = make_mesh(
-        tuple(args.mesh_axis_names),
+        mesh_axis_names,
         axis_sizes=args.mesh_axis_sizes,
+        axis_types=(axis_type,) * len(mesh_axis_names),
     )
     if args.resume:
         checkpoint_payload = load_distributed_checkpoint_metadata(args.resume)
@@ -361,6 +394,8 @@ def run_distributed_training(args):
     else:
         config = build_config(args)
         start_step = 0
+    if uses_explicit_model_parallel:
+        _validate_model_parallel_shapes(config, mesh, args.param_axis_name)
 
     dataset = create_host_binidx_dataset(
         args.data_file,

@@ -27,6 +27,12 @@ from .checkpoint import (
 )
 from .metrics import aggregate_metrics, mean_metric_dict, metrics_to_host_dict, write_metric_record
 from .environment import runtime_version_manifest
+from .collectives import (
+    CollectiveAudit,
+    audit_collectives,
+    audit_lowered_collectives,
+    compiler_ir_text,
+)
 from .scaling import (
     DTypePolicy,
     ParameterSummary,
@@ -98,6 +104,10 @@ __all__ = [
     "metrics_to_host_dict",
     "write_metric_record",
     "runtime_version_manifest",
+    "CollectiveAudit",
+    "audit_collectives",
+    "audit_lowered_collectives",
+    "compiler_ir_text",
     "DTypePolicy",
     "ParameterSummary",
     "TrainingMemoryEstimate",

@@ -4,9 +4,11 @@ This document describes the TPU path for `rwkv7m`. Flax NNX now owns the
 runtime, optimizer, distributed train/eval, and checkpoint lifecycle. The Linen
 implementation is frozen as the numerical and upstream-conversion reference.
 
-Still pending: Phase 3 explicit model-parallel matmul/collective design, Orbax
-checkpoint policy validation on real TPU pods, and production-scale throughput
-tuning.
+Phase 3 now provides an executable Explicit model-parallel path and post-SPMD
+HLO collective audit. Its small complete-model path has been functionally
+validated on a four-device TPU v5e slice. Still pending: XProf-based collective
+tuning, full RWKV7M train/runtime-state checkpoint validation on TPU pods, and
+production-scale throughput tuning.
 
 ## Install
 
@@ -61,6 +63,51 @@ The repository also runs the same lifecycle against the complete NNX RWKV7M
 model: Linen-to-NNX parameter conversion, forward/gradient parity, sharded
 model and Adam initialization, update, Orbax save/restore, and a post-restore
 update. Use `tests/test_nnx_model.py` as the Phase 2 acceptance test.
+
+Run the Phase 3 full-model contract and HLO audit with at least two devices:
+
+```powershell
+$env:JAX_NUM_CPU_DEVICES="2"
+uv run rwkv7m-audit-nnx-model-parallel `
+  --model-axis-size 2 `
+  --screening `
+  --write-screening
+```
+
+This compiles the complete forward path, counts collectives in the compiled
+post-SPMD HLO, executes RWKV and screening state updates, and completes one NNX
+optimizer step. On TPU, omit the forced CPU environment variable and select a
+model-axis size that divides `d_model`, `n_heads`, and `d_slot`.
+
+## Real TPU Verification Record
+
+The Phase 3 functional gate was run on 2026-07-14 on a single-host TPU v5e
+`v5litepod-4` slice with four devices and a `data=1, model=4` mesh. The validated
+environment was Python 3.13.14, JAX/jaxlib 0.10.0, Flax 0.12.7, Optax 0.2.8,
+Orbax-checkpoint 0.11.39, and libtpu 0.0.40.
+
+```bash
+uv run --python 3.13 rwkv7m-audit-nnx-model-parallel \
+  --model-axis-size 4 \
+  --d-model 32 \
+  --n-heads 4 \
+  --head-size 8 \
+  --screening \
+  --write-screening
+```
+
+The small complete-model smoke configuration completed finite forward/backward
+computation and optimizer step 1. The audit confirmed the row/column kernel
+contracts, WKV state `P("data", "model", None, None)`, screening slots
+`P("data", None, "model")`, and 16 post-SPMD collectives: 13 all-reduces,
+3 all-to-alls, and no all-gathers.
+
+The independent small NNX lifecycle probe was then run as separate `create` and
+`restore` processes on the same slice. It restored the Orbax checkpoint and
+completed optimizer step 2 with finite loss. This result validates the isolated
+NNX/Optax/Orbax lifecycle only. It does not validate the full RWKV7M distributed
+train-state checkpoint, carried recurrent/screening runtime-state checkpoint,
+a 7B model, or multi-host TPU execution.
 
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
 
@@ -137,8 +184,8 @@ uv run rwkv7m-train-binidx-dp `
 The default remains replicated parameters over a 1D `data` mesh.
 `--param-axis-name model` constructs the NNX model and Adam state directly under
 the target mesh using declared row/column logical axes; it does not first build
-a full unsharded model. Explicit matmul output shardings and collective tuning
-remain Phase 3 work.
+a full unsharded model. It also selects Explicit mesh axes, validates model-axis
+divisibility, and carries RWKV heads and screening slots in model-sharded state.
 
 ## Current Implementation Boundary
 
@@ -154,6 +201,17 @@ Implemented:
 - exact package/runtime manifest in distributed run configuration.
 - declared row/column NNX parameter axes for embeddings, RWKV projections,
   screening projections, norms, states, and LM head.
+- explicit output shardings for embedding gather, row/column linear operations,
+  RWKV head reshapes, and screening delta projection.
+- activation placement `P("data", None, "model")`, RWKV state placement
+  `P("data", "model", None, None)`, and screening slot placement
+  `P("data", None, "model")` on the Phase 3 path.
+- compiled post-SPMD HLO collective audit and a forced two-CPU full-model
+  forward/backward/optimizer regression test.
+- real four-device TPU v5e functional validation of the small complete-model
+  Phase 3 forward/backward/optimizer path and its compiled collective audit.
+- real TPU validation of the independent small NNX Orbax lifecycle probe across
+  separate create/restore processes.
 - process-aware host binidx sampling.
 - data-parallel batch placement with `jax.make_array_from_process_local_data`.
 - train/eval step boundaries for local distributed tests.
@@ -169,11 +227,14 @@ Implemented:
 
 Pending:
 
-- Phase 3 explicit model-parallel `dot_general` output shardings, collective
-  placement, and HLO audit on a multi-device accelerator.
-- tuned activation/state sharding and vocabulary-sharded loss.
-- real TPU pod validation of sharded runtime-state checkpoint/resume for carried recurrent/screening state.
-- real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
+- XProf profiling and throughput tuning on multi-device TPU, including the
+  three observed all-to-all collectives.
+- vocabulary-sharded loss and distributed L2Wrap.
+- real TPU pod validation of full RWKV7M sharded runtime-state checkpoint/resume
+  for carried recurrent/screening state.
+- real TPU pod validation of full RWKV7M Orbax checkpoint save/resume under
+  sharded train states.
+- 7B and multi-host TPU execution.
 - TPU pod throughput tuning and failure recovery drills.
 - task-specific long-context evaluation harnesses beyond stateful binidx validation.
 

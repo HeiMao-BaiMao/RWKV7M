@@ -2,7 +2,9 @@
 
 [English README](README.md)
 
-RWKV-7 風の recurrent language model に、任意で state-level screening memory を追加した JAX/Flax リファレンス実装です。
+RWKV-7風のrecurrent language modelに、任意でstate-level screening memoryを
+追加したJAX/Flax NNX研究実装です。Linenは数値比較とupstream変換のreference
+として維持しています。
 
 このリポジトリは研究用途を主目的にしています。現時点では custom kernel や既存 checkpoint 互換性よりも、正しさ、テスト、API の使いやすさを優先しています。
 
@@ -31,7 +33,7 @@ RWKV-7 風の recurrent language model に、任意で state-level screening mem
 
 ## RWKV7M と RWKV-7 のアーキテクチャ差分
 
-この repository の RWKV7M は、RWKV-7 風の recurrent core を置き換えるものではなく、その上に任意の state-level screening memory を追加して検証する研究用アーキテクチャです。`--no-screening` を指定した場合は、この実装内で最も RWKV-7 baseline に近い構成になります。ただし現時点の実装は JAX/Flax reference path であり、upstream RWKV-LM-V7 の fused CUDA kernel や既存 `.pth` checkpoint との互換性を主張するものではありません。
+この repository の RWKV7M は、RWKV-7 風の recurrent core を置き換えるものではなく、その上に任意の state-level screening memory を追加して検証する研究用アーキテクチャです。`--no-screening` を指定した場合は、この実装内で最も RWKV-7 baseline に近い構成になります。ただし現時点の実装は JAX/Flax NNX研究経路であり、upstream RWKV-LM-V7 の fused CUDA kernel や既存 `.pth` checkpoint との互換性を主張するものではありません。
 
 | 観点 | RWKV-7 | この repository の RWKV7M | 評価上の注意 |
 | --- | --- | --- | --- |
@@ -588,7 +590,7 @@ uv run rwkv7m-train-binidx-dp `
 | `--summary-every` | `run_summary.json` を更新する間隔です。 |
 | `--prefetch-size` | deviceへ先読みするbatch数です。 |
 | `--mesh-axis-names`, `--mesh-axis-sizes` | multi-axis mesh 実験用です。 |
-| `--param-axis-name` | rule-based parameter placement を有効にするmesh axis名です。 |
+| `--param-axis-name` | NNX Explicit model parallelを有効にするmesh axis名です。 |
 
 出力先には次の成果物ができます:
 
@@ -639,9 +641,33 @@ uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
 
 distributed CLIもNNX-nativeとなり、TPU-scale checkpointにはOrbaxを使います。
 topology-awareな`jax.make_mesh()`を使い、timing window終了時に更新済みNNX
-model/optimizer state全体の完了を待ちます。明示的model-parallel `dot_general`
-output shardingとcollective/HLO tuningはPhase 3に残し、Phase 2ではAuto mesh上で
-row/column parameter axesとactivation constraintを記録します。
+model/optimizer state全体の完了を待ちます。独立した`--param-axis-name`を指定した
+場合、Phase 3経路はExplicit mesh、row/column `dot_general`の明示的出力配置、
+hidden activationとRWKV head、screening slotのmodel shardingを使用します。
+post-SPMD executable HLOのcollective監査とoptimizer 1 stepは次で実行できます。
+
+```powershell
+$env:JAX_NUM_CPU_DEVICES="2"
+uv run rwkv7m-audit-nnx-model-parallel `
+  --model-axis-size 2 `
+  --screening `
+  --write-screening
+```
+
+強制2 CPU実行はlocalで再現可能な契約試験です。2026-07-14には実TPU v5e
+（`v5litepod-4`、4 devices）でも、`data=1, model=4` meshとread/write
+screeningを有効にした小型の完全RWKV7M構成を検証しました。finiteな
+forward/backwardとoptimizer 1 stepが完了し、WKV stateは
+`P("data", "model", None, None)`、screening slotは
+`P("data", None, "model")`を維持しました。compiled collectiveは16個で、
+all-reduce 13、all-to-all 3、all-gather 0でした。
+
+同じTPU sliceでは、独立した小型NNX lifecycle probeについても、別processでの
+Orbax create/restoreと、restore後のoptimizer step 1から2への進行を確認しました。
+これはframework lifecycle probeの検証であり、RWKV7M本体のdistributed
+train-stateやrecurrent/screening runtime-state checkpoint経路の検証では
+ありません。7B実行、multi-host、3個のall-to-allに対するXProf tuning、
+production throughput、failure recoveryは未検証です。
 
 ## Python API
 
@@ -689,7 +715,7 @@ from rwkv7m import (
 
 ## 現在の対応範囲
 
-- Flax Linen 実装。
+- Flax NNX runtime/training実装。Linenは数値比較とupstream変換のreferenceとして維持。
 - recurrent component 内の `jax.lax.scan` による full-sequence training path。
 - RWKV-LM-V7 互換 `.bin/.idx` dataset reader と sampler。
 - reference RWKV state の chunked inference state carry。
@@ -703,7 +729,7 @@ from rwkv7m import (
 - 単一プロセス用 reference training checkpoint save/load。
 - binidx validation loss/perplexity CLI。
 - TPU 作業向けのローカルテスト可能な distributed mesh/sharding helper。
-- process-aware Flax checkpoint、Orbax train-state checkpoint、carry-state runtime checkpoint/resume、best-eval protection 付き checkpoint rotation、structured JSONL/CSV logs、run summary、validation hook、run artifact audit CLI、device prefetching、optional multi-axis mesh / rule-based parameter placement hook を持つ data-parallel distributed binidx training CLI。
+- process-aware Flax checkpoint、Orbax train-state checkpoint、carry-state runtime checkpoint/resume、best-eval protection 付き checkpoint rotation、structured JSONL/CSV logs、run summary、validation hook、run artifact audit CLI、device prefetching、optional NNX Explicit data/model mesh経路を持つ data-parallel distributed binidx training CLI。
 - `from rwkv7m import ...` で使える installable package layout。
 
 未対応:
@@ -712,8 +738,10 @@ from rwkv7m import (
 - pretrained RWKV checkpoint conversion。
 - repository 内 PyTorch/non-JAX runtime backend（意図的に対象外）。
 - 完全に調整された per-parameter TPU sharding rules。
-- 実 TPU pod 上での Orbax sharded optimizer/parameter/runtime-state checkpoint save/resume 検証。
+- 実TPU pod上でのRWKV7M本体train-stateおよびrecurrent/screening runtime-stateの
+  Orbax checkpoint save/resume検証。
 - 実 TPU pod 上で検証済みの production-scale distributed TPU trainer。
+- 7B・multi-host TPU実行、XProfによるcollective tuning、failure recovery drill。
 - stateful binidx validation を超える task-specific long-context evaluation harnesses。
 
 ## テスト
@@ -722,4 +750,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、NNX public inference/training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、full-model Linen/NNX forward・gradient parity、screening algebra/gradient parity、7B abstract memory planning、NNX Orbax lifecycleが含まれます。現時点の full suite は123 testsです。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、NNX public inference/training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、full-model Linen/NNX forward・gradient parity、screening algebra/gradient parity、7B abstract memory planning、NNX Orbax lifecycleが含まれます。現時点の full suite は126 testsです。

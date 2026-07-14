@@ -2,7 +2,9 @@
 
 [日本語 README](README.ja.md)
 
-JAX/Flax reference implementation of an RWKV-7 style recurrent language model with optional state-level screening memory.
+JAX/Flax NNX research implementation of an RWKV-7 style recurrent language
+model with optional state-level screening memory. Linen is retained as the
+numerical and upstream-conversion reference.
 
 This repository is research-oriented. The current implementation is optimized for correctness, tests, and API usability before custom kernels or checkpoint compatibility.
 
@@ -442,7 +444,7 @@ uv run rwkv7m-train-binidx-dp `
   --prefetch-size 2
 ```
 
-This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, carry-state runtime checkpoint/resume for distributed local runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks. Full tuned sharded checkpoint policy validation on real TPU pods is still pending.
+This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, carry-state runtime checkpoint/resume for distributed local runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and an optional NNX Explicit data/model mesh path. Full RWKV7M sharded train/runtime-state checkpoint validation on real TPU pods is still pending.
 
 Audit distributed run artifacts locally:
 
@@ -486,10 +488,34 @@ uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
 
 The distributed CLI is NNX-native, uses Orbax for TPU-scale checkpoints, uses
 topology-aware `jax.make_mesh()`, and synchronizes the complete updated NNX
-model/optimizer state before reporting a timing window. Explicit model-parallel
-`dot_general` output shardings and collective/HLO tuning remain Phase 3 work;
-Phase 2 records row/column parameter axes and activation constraints under the
-Auto mesh path.
+model/optimizer state before reporting a timing window. When a distinct
+`--param-axis-name` is selected, Phase 3 uses Explicit mesh axes, explicit
+row/column `dot_general` outputs, model-sharded hidden activations and RWKV
+heads, and model-sharded screening slots. Inspect the post-SPMD executable HLO
+and execute one optimizer step with:
+
+```powershell
+$env:JAX_NUM_CPU_DEVICES="2"
+uv run rwkv7m-audit-nnx-model-parallel `
+  --model-axis-size 2 `
+  --screening `
+  --write-screening
+```
+
+The forced CPU run is a deterministic local contract test. A real TPU v5e
+(`v5litepod-4`, four devices) was also verified on 2026-07-14 with a
+`data=1, model=4` mesh and a small complete RWKV7M configuration with read/write
+screening. The audit completed finite forward/backward computation and one
+optimizer update, retained `P("data", "model", None, None)` WKV state and
+`P("data", None, "model")` screening-slot placement, and reported 16 compiled
+collectives: 13 all-reduces, 3 all-to-alls, and no all-gathers.
+
+The independent NNX lifecycle probe also completed Orbax create and restore in
+separate processes on the same TPU slice, advancing the optimizer from step 1
+to step 2 after restore. This validates the small framework lifecycle probe,
+not the full RWKV7M distributed train-state or recurrent/screening runtime-state
+checkpoint path. A 7B run, multi-host execution, XProf tuning of the three
+all-to-alls, production throughput, and failure recovery remain pending.
 
 ## Public API
 
@@ -525,7 +551,8 @@ Lower-level modules:
 
 ## Current Scope
 
-- Flax Linen implementation.
+- Flax NNX runtime/training implementation, with Linen retained as the numerical
+  and upstream-conversion reference.
 - Full-sequence training path with `jax.lax.scan` inside recurrent components.
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
@@ -539,7 +566,7 @@ Lower-level modules:
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
-- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, carry-state runtime checkpoint/resume, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, carry-state runtime checkpoint/resume, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and an optional NNX Explicit data/model mesh path.
 - Installable package layout for `from rwkv7m import ...`.
 
 Not yet included:
@@ -548,8 +575,10 @@ Not yet included:
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,
-- real TPU pod validation of Orbax sharded optimizer/parameter/runtime-state checkpoint save/resume,
+- full RWKV7M train-state and recurrent/screening runtime-state Orbax
+  checkpoint save/resume validation on real TPU pods,
 - production-scale distributed TPU trainer validation on real TPU pods,
+- 7B and multi-host TPU execution, XProf collective tuning, and failure recovery drills,
 - task-specific long-context evaluation harnesses beyond stateful binidx validation.
 
 ## Tests
@@ -558,4 +587,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 123 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 126 tests.

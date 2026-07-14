@@ -31,6 +31,7 @@ rwkv7m-generate = "rwkv7m.cli.generate:main"
 rwkv7m-verify-upstream-rwkv7 = "rwkv7m.cli.verify_upstream_rwkv7:main"
 rwkv7m-plan-scale = "rwkv7m.cli.plan_scale:main"
 rwkv7m-verify-nnx-lifecycle = "rwkv7m.cli.verify_nnx_lifecycle:main"
+rwkv7m-audit-nnx-model-parallel = "rwkv7m.cli.audit_nnx_model_parallel:main"
 
 [build-system]
 requires = ["hatchling"]

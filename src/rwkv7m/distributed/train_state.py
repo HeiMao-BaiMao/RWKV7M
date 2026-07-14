@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import jax
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from .mesh import make_1d_mesh
 from .partitioning import place_parameter_tree
@@ -14,6 +15,7 @@ from .sharding import (
     replicated_sharding,
 )
 from ..train.nnx_train import NNXTrainState
+from ..model.state import LayerRWKVState, LayerScreenState, ModelScreenState
 
 
 @dataclass
@@ -28,6 +30,36 @@ class DistributedTrainObjects:
     state_sharding: object
 
 
+def _place_recurrent_states(tree, mesh, *, data_axis, model_axis):
+    """Place carried activations according to the Phase 3 state contract."""
+    hidden = NamedSharding(mesh, P(data_axis, model_axis))
+    wkv = NamedSharding(mesh, P(data_axis, model_axis, None, None))
+    slots = NamedSharding(mesh, P(data_axis, None, model_axis))
+    token_state = NamedSharding(mesh, P(data_axis, None))
+
+    if isinstance(tree, tuple):
+        return tuple(
+            LayerRWKVState(
+                time_mix_x=jax.device_put(layer.time_mix_x, hidden),
+                channel_mix_x=jax.device_put(layer.channel_mix_x, hidden),
+                wkv=jax.device_put(layer.wkv, wkv),
+            )
+            for layer in tree
+        )
+    if isinstance(tree, ModelScreenState):
+        return ModelScreenState(
+            layers=tuple(
+                LayerScreenState(
+                    slots=jax.device_put(layer.slots, slots),
+                    ages=jax.device_put(layer.ages, token_state),
+                    usage_ema=jax.device_put(layer.usage_ema, token_state),
+                )
+                for layer in tree.layers
+            )
+        )
+    raise TypeError(f"unsupported recurrent state type: {type(tree)!r}")
+
+
 def place_train_objects(
     runtime,
     train_state,
@@ -39,10 +71,19 @@ def place_train_objects(
     mesh = make_1d_mesh(axis_name) if mesh is None else mesh
     state_sharding = replicated_sharding(mesh)
     batch_sharding = data_parallel_sharding(mesh, axis_name=axis_name)
-    initial_rwkv_state = put_to_devices(runtime.initial_rwkv_state, batch_sharding)
-    initial_screen_state = put_to_devices(runtime.initial_screen_state, batch_sharding)
-    rwkv_state = put_to_devices(runtime.rwkv_state, batch_sharding)
-    screen_state = put_to_devices(runtime.screen_state, batch_sharding)
+    if param_axis_name is not None and param_axis_name != axis_name:
+        recurrent_placement = lambda tree: _place_recurrent_states(
+            tree,
+            mesh,
+            data_axis=axis_name,
+            model_axis=param_axis_name,
+        )
+    else:
+        recurrent_placement = lambda tree: put_to_devices(tree, batch_sharding)
+    initial_rwkv_state = recurrent_placement(runtime.initial_rwkv_state)
+    initial_screen_state = recurrent_placement(runtime.initial_screen_state)
+    rwkv_state = recurrent_placement(runtime.rwkv_state)
+    screen_state = recurrent_placement(runtime.screen_state)
 
     if isinstance(train_state, NNXTrainState):
         if param_axis_name is not None:
