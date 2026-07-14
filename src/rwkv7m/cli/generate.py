@@ -2,7 +2,7 @@ import argparse
 
 import jax
 
-from ..api import create_runtime, generate_text
+from ..api import create_runtime, generate_text, load_runtime_params
 from ..io import load_model_safetensors
 from ..tokenizer import RWKVTokenizer
 from .config import parse_args_with_config
@@ -29,7 +29,7 @@ def main(argv=None):
     if config is None:
         raise ValueError("checkpoint safetensors is missing rwkv7m config metadata")
     runtime = create_runtime(jax.random.PRNGKey(args.seed), config, batch_size=1)
-    runtime.variables = {"params": params}
+    load_runtime_params(runtime, params)
     tokenizer = RWKVTokenizer(args.vocab_file)
     text = generate_text(
         runtime,

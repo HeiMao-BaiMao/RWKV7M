@@ -1,6 +1,8 @@
 import flax
+import jax
 import optax
 import jax.numpy as jnp
+from flax import nnx
 from dataclasses import dataclass
 from flax.training import train_state as flax_train_state
 
@@ -34,6 +36,14 @@ def rwkv_warmup_cosine_schedule(lr_init, lr_final, warmup_steps, total_steps):
 
 
 def decay_mask_fn(params):
+    if isinstance(params, nnx.State):
+        return nnx.from_flat_state(
+            (
+                path,
+                value[...].ndim >= 2 and path[-1] in ("kernel", "embedding"),
+            )
+            for path, value in nnx.to_flat_state(params)
+        )
     # Upstream RWKV-LM decays only true matmul weights. Matching that here
     # keeps token-shift mix params, w0/a0/v0/k_k/k_a/r_k anchors, LoRA
     # matrices, norms, biases, tau/lambda scalars, and slot_embed decay-free.
@@ -46,6 +56,10 @@ def decay_mask_fn(params):
 
 
 def rwkv_w0_mask_fn(params):
+    if isinstance(params, nnx.State):
+        return nnx.from_flat_state(
+            (path, path[-1] == "w0") for path, _ in nnx.to_flat_state(params)
+        )
     """Select the decay anchor that upstream RWKV trains at 2x base LR."""
     flat = flax.traverse_util.flatten_dict(params)
     mask = {path: path[-1] == "w0" for path in flat}
@@ -71,16 +85,40 @@ def create_optimizer(config, total_steps=10000):
             end_value=config.get("lr_final", 1e-5),
         )
 
+    optimizer_state_dtype = jnp.dtype(
+        config.get("optimizer_state_dtype", "float32")
+    )
+    adamw = optax.adamw(
+        learning_rate=lr_schedule,
+        weight_decay=config.get("weight_decay", 0.001),
+        b1=config.get("adam_beta1", 0.9),
+        b2=config.get("adam_beta2", 0.999),
+        eps=config.get("adam_eps", 1e-8),
+        mu_dtype=optimizer_state_dtype,
+        mask=decay_mask_fn,
+    )
+
+    def init_adamw(params):
+        state = adamw.init(params)
+        # Optax exposes mu_dtype but initializes the second moment from the
+        # parameter dtype. Cast every floating optimizer-state leaf once so
+        # both Adam moments follow the explicit runtime policy.
+        return jax.tree.map(
+            lambda value: value.astype(optimizer_state_dtype)
+            if hasattr(value, "dtype")
+            and jnp.issubdtype(value.dtype, jnp.inexact)
+            else value,
+            state,
+        )
+
+    adamw_with_state_dtype = optax.GradientTransformationExtraArgs(
+        init_adamw,
+        adamw.update,
+    )
+
     tx = optax.chain(
         optax.clip_by_global_norm(config.get("max_grad_norm", 1.0)),
-        optax.adamw(
-            learning_rate=lr_schedule,
-            weight_decay=config.get("weight_decay", 0.001),
-            b1=config.get("adam_beta1", 0.9),
-            b2=config.get("adam_beta2", 0.999),
-            eps=config.get("adam_eps", 1e-8),
-            mask=decay_mask_fn,
-        ),
+        adamw_with_state_dtype,
         optax.masked(optax.scale(2.0), rwkv_w0_mask_fn),
     )
     return tx

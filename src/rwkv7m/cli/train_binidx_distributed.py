@@ -25,11 +25,14 @@ from ..distributed import (
     restore_distributed_train_state,
     restore_distributed_runtime_state,
     rotate_checkpoints,
+    runtime_version_manifest,
     save_data_parallel_checkpoint,
     train_global_batch_data_parallel,
     write_metric_record,
 )
 from ..io import model_config_to_dict
+from ..model import MODEL_PRESET_NAMES
+from ..model.nnx_model import NNXShardingConfig
 from .config import parse_args_with_config
 from .train_binidx import build_config
 
@@ -39,6 +42,18 @@ def parse_args(argv=None):
         description="Data-parallel rwkv7m binidx training skeleton for JAX distributed setups."
     )
     parser.add_argument("--data-file", required=True)
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument(
+        "--model-config",
+        default=None,
+        help="Shared ModelConfig JSON used unchanged by small and large models",
+    )
+    model_source.add_argument(
+        "--model-preset",
+        choices=MODEL_PRESET_NAMES,
+        default=None,
+        help="Named shared NNX model configuration",
+    )
     parser.add_argument("--ctx-len", type=int, required=True)
     parser.add_argument("--global-batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100)
@@ -47,6 +62,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--param-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--param-update-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--optimizer-state-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--gradient-accum-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--lm-head-init", choices=["orthogonal", "variance_scaled"], default="orthogonal")
+    parser.add_argument("--vocab-parallel", action="store_true")
+    parser.add_argument("--remat-blocks", action="store_true")
+    parser.add_argument("--sequence-chunk-size", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=10)
@@ -243,6 +267,7 @@ def _write_run_config(args, config, info, *, params=None, mesh=None):
             if key != "devices"
         },
         "devices": info.get("devices", []),
+        "environment": runtime_version_manifest(),
     }
     if args.param_axis_name is not None and params is not None and mesh is not None:
         payload["parameter_partition_summary"] = parameter_partition_summary(
@@ -341,20 +366,89 @@ def _runtime_state_payload(runtime_or_dist):
     }
 
 
+def _validate_model_parallel_shapes(config, mesh, axis_name):
+    axis_index = tuple(mesh.axis_names).index(axis_name)
+    axis_size = int(mesh.devices.shape[axis_index])
+    required = {
+        "d_model": config.d_model,
+        "n_heads": config.n_heads,
+    }
+    if config.use_screening and config.screening.screened_layers:
+        required["d_slot"] = config.screening.d_slot
+    if config.vocab_parallel:
+        required["vocab_size"] = config.vocab_size
+    invalid = {
+        name: value for name, value in required.items() if value % axis_size != 0
+    }
+    if invalid:
+        details = ", ".join(f"{name}={value}" for name, value in invalid.items())
+        raise ValueError(
+            f"model-parallel dimensions must be divisible by axis "
+            f"{axis_name!r} size {axis_size}: {details}"
+        )
+
+
 def run_distributed_training(args):
     info = initialize_jax_distributed()
-    if "data" not in tuple(args.mesh_axis_names):
+    mesh_axis_names = tuple(args.mesh_axis_names)
+    if "data" not in mesh_axis_names:
         raise ValueError("mesh_axis_names must include 'data'")
+    if args.param_axis_name is not None and args.param_axis_name not in mesh_axis_names:
+        raise ValueError(
+            f"param_axis_name {args.param_axis_name!r} is not present in "
+            f"mesh_axis_names={mesh_axis_names!r}"
+        )
     if args.carry_state and args.sampling_mode != "sequential":
         raise ValueError("--carry-state requires --sampling-mode sequential")
-    mesh = make_mesh(tuple(args.mesh_axis_names), axis_sizes=args.mesh_axis_sizes)
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if args.global_batch_size % args.gradient_accumulation_steps != 0:
+        raise ValueError(
+            "global_batch_size must be divisible by gradient_accumulation_steps"
+        )
+    uses_explicit_model_parallel = args.param_axis_name not in (None, "data")
+    axis_type = (
+        jax.sharding.AxisType.Explicit
+        if uses_explicit_model_parallel
+        else jax.sharding.AxisType.Auto
+    )
+    mesh = make_mesh(
+        mesh_axis_names,
+        axis_sizes=args.mesh_axis_sizes,
+        axis_types=(axis_type,) * len(mesh_axis_names),
+    )
+    data_axis_index = mesh_axis_names.index("data")
+    data_axis_size = int(mesh.devices.shape[data_axis_index])
+    microbatch_size = (
+        args.global_batch_size // args.gradient_accumulation_steps
+    )
+    if microbatch_size % data_axis_size != 0:
+        raise ValueError(
+            "global microbatch size must be divisible by the data mesh axis size"
+        )
     if args.resume:
         checkpoint_payload = load_distributed_checkpoint_metadata(args.resume)
         config = checkpoint_payload.config
         start_step = checkpoint_payload.start_step
+        if args.model_config is not None or args.model_preset is not None:
+            requested_config = build_config(args)
+            if model_config_to_dict(requested_config) != model_config_to_dict(config):
+                raise ValueError(
+                    "--model-config does not match the model config stored in --resume"
+                )
     else:
         config = build_config(args)
         start_step = 0
+    if args.ctx_len > config.max_seq_len:
+        raise ValueError(
+            f"ctx_len={args.ctx_len} exceeds model max_seq_len={config.max_seq_len}"
+        )
+    if config.vocab_parallel and not uses_explicit_model_parallel:
+        raise ValueError(
+            "vocab_parallel requires a distinct explicit --param-axis-name"
+        )
+    if uses_explicit_model_parallel:
+        _validate_model_parallel_shapes(config, mesh, args.param_axis_name)
 
     dataset = create_host_binidx_dataset(
         args.data_file,
@@ -365,6 +459,7 @@ def run_distributed_training(args):
         process_index=info["process_index"],
         process_count=info["process_count"],
         local_device_count=info["local_device_count"],
+        local_data_shard_count=int(mesh.local_mesh.shape["data"]),
         sampling_mode=args.sampling_mode,
     )
     eval_dataset = None
@@ -378,13 +473,31 @@ def run_distributed_training(args):
             process_index=info["process_index"],
             process_count=info["process_count"],
             local_device_count=info["local_device_count"],
+            local_data_shard_count=int(mesh.local_mesh.shape["data"]),
             sampling_mode=args.sampling_mode,
+        )
+    if args.param_axis_name == "data":
+        data_axis_index = tuple(mesh.axis_names).index("data")
+        if int(mesh.devices.shape[data_axis_index]) != 1:
+            raise ValueError(
+                "NNX model parallelism requires a parameter axis distinct "
+                "from the data axis"
+            )
+        # Preserve the historical one-device smoke invocation. There is no
+        # physical model sharding to perform on an axis of size one.
+        nnx_sharding = None
+    else:
+        nnx_sharding = (
+            NNXShardingConfig(mesh, model_axis=args.param_axis_name)
+            if args.param_axis_name is not None
+            else None
         )
     runtime, train_state = create_train_runtime(
         jax.random.PRNGKey(args.seed),
         config,
         batch_size=args.global_batch_size,
         total_steps=max(start_step + args.steps, 1),
+        sharding=nnx_sharding,
     )
     if args.resume:
         train_state, checkpoint_payload = restore_distributed_train_state(
@@ -392,7 +505,7 @@ def run_distributed_training(args):
             train_state,
         )
         config = checkpoint_payload.config
-        runtime.variables = {"params": train_state.params}
+        runtime.variables = {"params": train_state.nnx_params}
         if args.carry_state:
             runtime_state = restore_distributed_runtime_state(
                 args.resume,
@@ -446,7 +559,19 @@ def run_distributed_training(args):
                 global_batch,
                 phase=args.phase,
                 carry_state=args.carry_state,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
             )
+            # The loss output can become ready before every parameter and
+            # optimizer-state leaf. This reference CLI reports per-step
+            # throughput, so wait for the complete updated train state before
+            # stopping the timer. The TPU-scale NNX path will measure larger
+            # asynchronous windows instead of synchronizing every step.
+            ready_state = (
+                dist.train_state.ready_state()
+                if hasattr(dist.train_state, "ready_state")
+                else dist.train_state
+            )
+            jax.block_until_ready(ready_state)
             elapsed = time.perf_counter() - step_start
             host_metrics = metrics_to_host_dict(metrics)
             completed_step = int(dist.train_state.step)

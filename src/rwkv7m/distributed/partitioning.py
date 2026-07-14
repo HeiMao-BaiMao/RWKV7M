@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 
@@ -63,7 +64,13 @@ def parameter_sharding(path, value, mesh, *, axis_name):
 
 def parameter_partition_summary(params, mesh, *, axis_name):
     axis_size = mesh_axis_size(mesh, axis_name)
-    flat = flatten_dict(params)
+    if isinstance(params, nnx.State):
+        flat = {
+            path: value[...]
+            for path, value in nnx.to_flat_state(params)
+        }
+    else:
+        flat = flatten_dict(params)
     summary = {}
     for path, value in flat.items():
         spec = parameter_partition_spec(

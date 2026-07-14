@@ -1,20 +1,22 @@
 import jax
 import jax.numpy as jnp
-from flax.training import train_state as flax_train_state
-import optax
+from flax import nnx
 
 from ..model.screened_rwkv import (
     ModelConfig,
-    ScreenedRWKVModel,
     init_rwkv_state,
-    create_model_variables,
 )
+from ..model.nnx_model import NNXScreenedRWKVModel
 from ..model.state import init_screen_state
 from .train_state import TrainState, create_optimizer
 from .train_step import train_step
+from .nnx_train import create_nnx_train_state
 
 
 def build_train_state(key, model, variables, config, total_steps=10000):
+    del key
+    if isinstance(model, nnx.Module):
+        return create_nnx_train_state(model, config, total_steps=total_steps)
     opt_config = {
         "lr_init": getattr(config, "lr_init", 1e-3),
         "lr_final": getattr(config, "lr_final", 1e-5),
@@ -57,13 +59,12 @@ def run_toy_training(
     num_steps: int = 100,
     print_every: int = 20,
 ):
-    model = ScreenedRWKVModel(config=model_cfg)
+    key, model_key = jax.random.split(key)
+    model = NNXScreenedRWKVModel(model_cfg, rngs=nnx.Rngs(params=model_key))
     rwkv_state = init_rwkv_state(batch_size, model_cfg)
     screen_state = init_screen_state(batch_size, model_cfg.screening)
 
-    key, subkey = jax.random.split(key)
-    variables, _ = create_model_variables(subkey, model_cfg, batch_size)
-
+    variables = {"params": nnx.state(model, nnx.Param)}
     key, subkey = jax.random.split(key)
     train_state = build_train_state(
         subkey, model, variables, model_cfg, total_steps=num_steps

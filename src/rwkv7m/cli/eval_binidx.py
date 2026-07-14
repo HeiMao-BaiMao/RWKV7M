@@ -5,10 +5,10 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
-from ..api import create_runtime
+from ..api import create_runtime, load_runtime_params
 from ..data import create_binidx_dataset
-from ..io import load_model_safetensors
-from ..model import ModelConfig, ScreeningConfig
+from ..io import load_model_config, load_model_safetensors
+from ..model import MODEL_PRESET_NAMES, ModelConfig, ScreeningConfig, model_preset
 from ..model.screened_rwkv import cross_entropy_loss
 from .config import parse_args_with_config
 
@@ -24,6 +24,19 @@ def default_bank_ids(n_slots):
 
 
 def build_config(args):
+    if args.model_config is not None and args.model_preset is not None:
+        raise ValueError("--model-config and --model-preset are mutually exclusive")
+    if args.model_config is not None or args.model_preset is not None:
+        config = (
+            load_model_config(args.model_config)
+            if args.model_config is not None
+            else model_preset(args.model_preset)
+        )
+        if args.ctx_len > config.max_seq_len:
+            raise ValueError(
+                f"ctx_len={args.ctx_len} exceeds model max_seq_len={config.max_seq_len}"
+            )
+        return config
     if args.use_screening:
         screened_layers = tuple(args.screened_layers)
         if not screened_layers and args.n_layers > 1:
@@ -49,6 +62,11 @@ def build_config(args):
         vocab_size=args.vocab_size,
         max_seq_len=args.ctx_len,
         dtype=args.dtype,
+        param_dtype=args.param_dtype,
+        lm_head_init=args.lm_head_init,
+        vocab_parallel=args.vocab_parallel,
+        remat_blocks=args.remat_blocks,
+        sequence_chunk_size=args.sequence_chunk_size,
         use_screening=args.use_screening,
         screening=screening,
     )
@@ -86,7 +104,7 @@ def evaluate_binidx(args):
         batch_size=args.batch_size,
     )
     if params is not None:
-        runtime.variables = {"params": params}
+        load_runtime_params(runtime, params)
 
     @jax.jit
     def eval_step(input_ids, target_ids, mask, rwkv_state, screen_state):
@@ -159,6 +177,18 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate rwkv7m next-token loss on binidx data.")
     parser.add_argument("--data-file", required=True)
     parser.add_argument("--checkpoint", default=None, help="Checkpoint dir or model.safetensors file")
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument(
+        "--model-config",
+        default=None,
+        help="Shared ModelConfig JSON used unchanged by small and large models",
+    )
+    model_source.add_argument(
+        "--model-preset",
+        choices=MODEL_PRESET_NAMES,
+        default=None,
+        help="Named shared NNX model configuration",
+    )
     parser.add_argument("--ctx-len", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=10)
@@ -168,6 +198,11 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--param-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--lm-head-init", choices=["orthogonal", "variance_scaled"], default="orthogonal")
+    parser.add_argument("--vocab-parallel", action="store_true")
+    parser.add_argument("--remat-blocks", action="store_true")
+    parser.add_argument("--sequence-chunk-size", type=int, default=None)
     parser.add_argument("--vocab-size", type=int, default=65536)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-ffn", type=int, default=256)

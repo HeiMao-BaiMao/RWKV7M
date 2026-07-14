@@ -2,9 +2,11 @@ from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from ..model.screened_rwkv import cross_entropy_loss
 from ..train.train_step import train_step
+from ..train.nnx_train import NNXTrainState, nnx_model_loss
 from .metrics import aggregate_metrics
 from .sharding import host_batch_to_global_arrays
 
@@ -32,6 +34,7 @@ def train_global_batch_data_parallel(
     *,
     phase="read_screening_only",
     carry_state=False,
+    gradient_accumulation_steps=1,
 ):
     rwkv_state, screen_state = _state_inputs(dist, carry_state)
     train_state, rwkv_state, screen_state, metrics = train_step(
@@ -40,6 +43,7 @@ def train_global_batch_data_parallel(
         rwkv_state,
         screen_state,
         phase=phase,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
     return (
         _replace_training_state(dist, train_state, rwkv_state, screen_state, carry_state),
@@ -54,6 +58,7 @@ def train_batch_data_parallel(
     *,
     phase="read_screening_only",
     carry_state=False,
+    gradient_accumulation_steps=1,
 ):
     global_batch = host_batch_to_global_arrays(host_batch, dist.batch_sharding, layout)
     return train_global_batch_data_parallel(
@@ -61,11 +66,12 @@ def train_batch_data_parallel(
         global_batch,
         phase=phase,
         carry_state=carry_state,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
 
 
 @jax.jit(static_argnames=["phase"])
-def eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
+def _linen_eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
     logits, new_rwkv_state, new_screen_state, stats = train_state.apply_fn(
         {"params": train_state.params},
         batch["input_ids"],
@@ -83,6 +89,42 @@ def eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase=
         "rel_write_mean": stats.get("rel_write_mean", jnp.zeros(())),
         "rel_write_effective_mean": stats.get("rel_write_effective_mean", jnp.zeros(())),
     }, new_rwkv_state, new_screen_state
+
+
+@nnx.jit(static_argnames=("phase",))
+def _nnx_eval_step_data_parallel(
+    model, batch, rwkv_state, screen_state, phase="read_screening_only"
+):
+    _, (metrics, new_rwkv_state, new_screen_state) = nnx_model_loss(
+        model,
+        batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+        deterministic=True,
+        include_l2wrap=False,
+    )
+    return metrics, new_rwkv_state, new_screen_state
+
+
+def eval_step_data_parallel(
+    train_state, batch, rwkv_state, screen_state, phase="read_screening_only"
+):
+    if isinstance(train_state, NNXTrainState):
+        return _nnx_eval_step_data_parallel(
+            train_state.model,
+            batch,
+            rwkv_state,
+            screen_state,
+            phase=phase,
+        )
+    return _linen_eval_step_data_parallel(
+        train_state,
+        batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+    )
 
 
 def evaluate_global_batch_data_parallel(

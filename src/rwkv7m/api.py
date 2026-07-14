@@ -2,24 +2,30 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from .data import BinIdxBatchDataset, create_binidx_dataset
 from .infer.generate import decode_one, generate, prefill
 from .model.screened_rwkv import (
     ModelConfig,
-    ScreenedRWKVModel,
-    create_model_variables,
     init_rwkv_state,
 )
+from .model.nnx_model import (
+    NNXScreenedRWKVModel,
+    NNXShardingConfig,
+    initialize_nnx_model,
+)
+from .model.nnx_conversion import load_linen_params_into_nnx
 from .model.state import init_screen_state
 from .tokenizer import RWKVTokenizer
-from .train.train_loop import build_train_state
+from .io.config import load_model_config
 from .train.train_step import train_step
+from .train.nnx_train import initialize_nnx_train_state
 
 
 @dataclass
 class RWKV7MRuntime:
-    model: ScreenedRWKVModel
+    model: NNXScreenedRWKVModel
     variables: dict
     rwkv_state: tuple
     screen_state: object
@@ -31,11 +37,14 @@ class RWKV7MRuntime:
 
 def create_runtime(
     rng_key,
-    config: ModelConfig,
+    config,
     *,
     batch_size: int = 1,
+    sharding: NNXShardingConfig | None = None,
 ) -> RWKV7MRuntime:
-    variables, model = create_model_variables(rng_key, config, batch_size)
+    config = load_model_config(config)
+    model = initialize_nnx_model(rng_key, config, sharding=sharding)
+    variables = {"params": nnx.state(model, nnx.Param)}
     rwkv_state = init_rwkv_state(batch_size, config)
     screen_state = init_screen_state(batch_size, config.screening)
     return RWKV7MRuntime(
@@ -52,21 +61,41 @@ def create_runtime(
 
 def create_train_runtime(
     rng_key,
-    config: ModelConfig,
+    config,
     *,
     batch_size: int,
     total_steps: int = 10000,
+    sharding: NNXShardingConfig | None = None,
 ):
-    rng_key, init_key, train_key = jax.random.split(rng_key, 3)
-    runtime = create_runtime(init_key, config, batch_size=batch_size)
-    train_state = build_train_state(
-        train_key,
-        runtime.model,
-        runtime.variables,
+    config = load_model_config(config)
+    _, init_key = jax.random.split(rng_key)
+    train_state = initialize_nnx_train_state(
+        init_key,
         config,
         total_steps=total_steps,
+        sharding=sharding,
+    )
+    rwkv_state = init_rwkv_state(batch_size, config)
+    screen_state = init_screen_state(batch_size, config.screening)
+    runtime = RWKV7MRuntime(
+        model=train_state.model,
+        variables={"params": train_state.nnx_params},
+        rwkv_state=rwkv_state,
+        screen_state=screen_state,
+        config=config,
+        batch_size=batch_size,
+        initial_rwkv_state=rwkv_state,
+        initial_screen_state=screen_state,
     )
     return runtime, train_state
+
+
+def load_runtime_params(runtime: RWKV7MRuntime, params):
+    """Load a portable Linen-style parameter tree into an NNX runtime."""
+
+    load_linen_params_into_nnx(runtime.model, params)
+    runtime.variables = {"params": nnx.state(runtime.model, nnx.Param)}
+    return runtime
 
 
 def infer_prefill(runtime: RWKV7MRuntime, prompt_ids, *, phase="read_screening_only"):
@@ -162,6 +191,7 @@ def train_batch(
     *,
     phase="read_screening_only",
     carry_state: bool = False,
+    gradient_accumulation_steps: int = 1,
 ):
     if carry_state:
         rwkv_state = runtime.rwkv_state
@@ -181,11 +211,12 @@ def train_batch(
         rwkv_state,
         screen_state,
         phase=phase,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
     if carry_state:
         runtime.rwkv_state = rwkv_state
         runtime.screen_state = screen_state
-    runtime.variables = {"params": train_state.params}
+    runtime.variables = {"params": train_state.nnx_params}
     return train_state, metrics
 
 
@@ -202,6 +233,7 @@ def train_binidx(
     carry_state: bool = False,
     sampling_mode: str = "magic",
     print_every: int | None = None,
+    gradient_accumulation_steps: int = 1,
 ):
     if carry_state and sampling_mode != "sequential":
         raise ValueError("carry_state training requires sampling_mode='sequential'")
@@ -232,6 +264,7 @@ def train_binidx(
                 runtime,
                 phase=phase,
                 carry_state=carry_state,
+                gradient_accumulation_steps=gradient_accumulation_steps,
             )
             loss = float(metrics["loss"])
             losses.append(loss)
@@ -297,6 +330,7 @@ __all__ = [
     "RWKV7MRuntime",
     "create_runtime",
     "create_train_runtime",
+    "load_runtime_params",
     "infer_prefill",
     "infer_next",
     "generate_ids",

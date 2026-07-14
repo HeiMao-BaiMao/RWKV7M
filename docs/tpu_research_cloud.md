@@ -1,8 +1,15 @@
 # TPU Research Cloud Training
 
-This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, run summaries, validation hooks, best-eval checkpoint tracking, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+This document describes the TPU path for `rwkv7m`. Flax NNX now owns the
+runtime, optimizer, distributed train/eval, and checkpoint lifecycle. The Linen
+implementation is frozen as the numerical and upstream-conversion reference.
 
-Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy validation on real TPU pods, and production-scale throughput tuning.
+Phase 3 now provides an executable Explicit model-parallel path and post-SPMD
+HLO collective audit. Its small complete-model path has been functionally
+validated on a four-device TPU v5e slice, and the `0.185b` and `1b` presets have
+completed single-host v5e throughput runs. Still pending: XProf-based collective
+tuning, full RWKV7M train/runtime-state checkpoint validation on TPU pods, 7B
+and multi-host execution, and production-scale throughput tuning.
 
 ## Install
 
@@ -10,6 +17,216 @@ Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy
 uv sync --extra tpu
 uv run pytest -q tests/test_distributed_skeleton.py tests/test_distributed_train_state.py tests/test_distributed_trainer.py tests/test_train_binidx_distributed_cli.py
 ```
+
+Record the exact JAX, jaxlib, Flax, Optax, Orbax, Python, backend, and device
+versions before a TPU run. Distributed `run_config.json` now includes this
+environment manifest automatically.
+
+## Model Presets
+
+The common NNX configuration registry exposes `0.185b`, `0.3b`, `1b`, `3b`,
+and `7b` through `model_preset()` and `--model-preset`. Their exact current
+parameter counts are 184,985,222; 297,738,764; 985,479,192; 2,943,319,064; and
+6,994,788,376 respectively. Suggested initial model-axis sizes are 1, 1, 2, 4,
+and 8. Always run the estimator for the allocated topology because these axis
+sizes do not account for activations or compiler temporaries.
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-preset 3b `
+  --model-axis-size 4 `
+  --dtype-profile config
+```
+
+The equivalent tracked JSON files live under `configs/`; the existing
+`rwkv7m-7b-tpu.json.example` is the canonical 7B JSON preset.
+
+## 7B Preflight
+
+The tracked candidate is in `configs/rwkv7m-7b-tpu.json.example`. Count its
+current abstract parameter tree and estimate parameter-related memory with:
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-config configs/rwkv7m-7b-tpu.json.example `
+  --model-axis-size 8 `
+  --dtype-profile config
+```
+
+The current implementation has 6,994,788,376 parameters for this config:
+
+- RWKV core and common model parameters: 6,871,986,176.
+- four screening layers: 122,802,200.
+
+The count comes from `jax.eval_shape` over the current model initializer rather
+than a separately maintained formula. The memory estimate includes parameter
+storage, two Adam moments, FP32 accumulated gradients, and an update workspace.
+It excludes activations, RWKV/screening state, compiler temporaries, and
+collective buffers.
+
+The same model artifact is accepted by the public Python runtime, the scale
+planner, and both training CLIs. A complete distributed run example is tracked
+in `configs/rwkv7m-7b-tpu-train.json.example`:
+
+```powershell
+uv run rwkv7m-train-binidx-dp `
+  --config configs/rwkv7m-7b-tpu-train.json.example
+```
+
+The example uses an eight-way model axis, one sequence per microstep, eight
+microsteps per optimizer update, vocabulary-parallel loss, block rematerialization,
+and exact 256-token chunks. Replace its dataset paths and adapt its mesh to the
+allocated TPU topology. The shared code path is tested on small shapes, but this
+specific 7B launch remains an unexecuted preflight configuration.
+
+## NNX Lifecycle Gate
+
+Validate the small independent framework probe when changing JAX/Flax/Orbax:
+
+```powershell
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
+```
+
+The two commands run in different Python processes. Together they validate
+topology-aware sharded initialization, forward/backward, one Adam update,
+preservation of explicit output shardings, Orbax save, sharded restore, and a
+second update. On a real TPU slice, inspect the reported `PartitionSpec` values
+and device topology in addition to successful completion.
+
+The repository also runs the same lifecycle against the complete NNX RWKV7M
+model: Linen-to-NNX parameter conversion, forward/gradient parity, sharded
+model and Adam initialization, update, Orbax save/restore, and a post-restore
+update. Use `tests/test_nnx_model.py` as the Phase 2 acceptance test.
+
+Run the Phase 3 full-model contract and HLO audit with at least two devices:
+
+```powershell
+$env:JAX_NUM_CPU_DEVICES="2"
+uv run rwkv7m-audit-nnx-model-parallel `
+  --model-axis-size 2 `
+  --screening `
+  --write-screening `
+  --vocab-parallel `
+  --remat-blocks `
+  --sequence-chunk-size 2
+```
+
+This compiles the complete forward path, counts collectives in the compiled
+post-SPMD HLO, executes RWKV and screening state updates, and completes one NNX
+optimizer step. On TPU, omit the forced CPU environment variable and select a
+model-axis size that divides `d_model`, `n_heads`, and `d_slot`.
+
+## Real TPU Verification Record
+
+The Phase 3 functional gate was run on 2026-07-14 on a single-host TPU v5e
+`v5litepod-4` slice with four devices and a `data=1, model=4` mesh. The validated
+environment was Python 3.13.14, JAX/jaxlib 0.10.0, Flax 0.12.7, Optax 0.2.8,
+Orbax-checkpoint 0.11.39, and libtpu 0.0.40.
+
+```bash
+uv run --python 3.13 rwkv7m-audit-nnx-model-parallel \
+  --model-axis-size 4 \
+  --d-model 32 \
+  --n-heads 4 \
+  --head-size 8 \
+  --screening \
+  --write-screening
+```
+
+The small complete-model smoke configuration completed finite forward/backward
+computation and optimizer step 1. The audit confirmed the row/column kernel
+contracts, WKV state `P("data", "model", None, None)`, screening slots
+`P("data", None, "model")`, and 16 post-SPMD collectives: 13 all-reduces,
+3 all-to-alls, and no all-gathers.
+
+The independent small NNX lifecycle probe was then run as separate `create` and
+`restore` processes on the same slice. It restored the Orbax checkpoint and
+completed optimizer step 2 with finite loss. This result validates the isolated
+NNX/Optax/Orbax lifecycle only. It does not validate the full RWKV7M distributed
+train-state checkpoint, carried recurrent/screening runtime-state checkpoint,
+a 7B model, or multi-host TPU execution.
+
+## Single-Host TPU v5e Performance Record
+
+A performance pass was run later on 2026-07-14 at commit
+`9faf9aa8e6c7db51a5e6fd4d39d586c835c71146`. It used a temporary single-host
+`v5litepod-4` in `us-west4-a`, with four TPU v5e devices. The environment was
+Python 3.13.14, JAX/jaxlib 0.10.0, Flax 0.12.7, Optax 0.2.8,
+Orbax-checkpoint 0.11.39, and libtpu 0.0.40. Transparent huge pages were enabled
+before measurement to reduce TPU runtime startup and shutdown overhead.
+
+The input was a synthetic RWKV-compatible binidx file containing 4,194,304
+tokens. It removes storage and network variability but does not provide a model
+quality result. Preset runs kept the tracked dtype, rematerialization, sequence
+chunking, vocabulary-parallel, and screening settings unchanged. The
+no-screening comparison used the same L12-D768-FFN2688 core dimensions as the
+`0.185b` preset.
+
+The distributed CLI starts each step timer after yielding the prefetched global
+batch and stops it only after blocking on the complete updated model and
+optimizer state. The first step was excluded because it includes XLA
+compilation. `Measured steps` below therefore counts steps after step 1. The
+mean includes every post-compilation stall; the median shows the normal steady
+step more clearly.
+
+The main 30-step measurement used:
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/home/rumia/jax_cache \
+  uv run rwkv7m-train-binidx-dp \
+  --data-file data/bench/synthetic \
+  --model-preset 0.185b \
+  --ctx-len 512 \
+  --global-batch-size 4 \
+  --steps 30 \
+  --phase read_write \
+  --mesh-axis-names data \
+  --mesh-axis-sizes 4 \
+  --prefetch-size 2
+```
+
+| Model and phase | Context | Global batch | Mesh | Measured steps | Median token/s | Mean token/s |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 0.185B core dimensions, no screening | 512 | 4 | `data=4` | 11 | 18,680 | 18,611 |
+| `0.185b`, read-only screening | 512 | 4 | `data=4` | 11 | 13,021 | 12,315 |
+| `0.185b`, read/write screening | 512 | 4 | `data=4` | 29 | 11,931 | 11,510 |
+| `0.185b`, read/write screening | 512 | 4 | `data=1, model=4` | 11 | 8,812 | 8,811 |
+| `0.185b`, read/write screening | 512 | 1 | `data=1, model=4` | 7 | 4,909 | 4,911 |
+| `1b`, read/write screening | 256 | 1 | `data=1, model=4` | 5 | 879 | 786 |
+| `1b`, read/write screening | 256 | 4 | `data=1, model=4` | 5 | 2,397 | 2,249 |
+
+Main findings:
+
+- The 30-step `0.185b` data-parallel run had 29 post-compilation observations.
+  Twenty-seven formed a narrow 11,858-11,963 token/s band, while two isolated
+  stalls reached 6,694 and 5,170 token/s. The mean of the non-stall observations
+  was 11,923 token/s.
+- At global batch 4, replicating the `0.185b` model over `data=4` was 1.35 times
+  faster by median than four-way model sharding. The model fits on each device,
+  so model-sharding communication was not throughput-justified in this test.
+- Relative to the no-screening median, read-only screening reduced throughput
+  by 30.3%. Enabling writes reduced the read-only result by a further 8.4%; the
+  complete read/write path was 36.1% below the no-screening core.
+- Increasing the model-sharded `1b` run from global batch 1 to 4 improved median
+  throughput by 2.73 times. Both configurations fit in v5e HBM and completed
+  finite forward, backward, and optimizer updates.
+- The current small-model audit with vocabulary parallelism, rematerialization,
+  and sequence chunking enabled reported 15 forward collectives: 12 all-reduces,
+  3 all-to-alls, and no all-gathers. This is a different compile configuration
+  from the earlier 16-collective functional record above.
+- No OOM, TPU runtime restart, or hardware health error was observed. Cloud
+  Monitoring agent errors occurred near the test window, but no causal link to
+  the isolated slow steps was established.
+
+These results establish useful single-host v5e execution for the current
+`0.185b` and `1b` paths. They do not establish multi-host scaling, 7B fit or
+throughput, controlled run-to-run variance, power or cost efficiency, or
+XProf-guided collective efficiency.
+
+The temporary node `rwkv7m-bench-260714-9faf9aa` was deleted after the run. The
+delete operation completed successfully, and the target name was absent from
+all four zones in which allocation had been attempted.
 
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
 
@@ -83,15 +300,46 @@ uv run rwkv7m-train-binidx-dp `
   --param-axis-name model
 ```
 
-The default remains replicated parameters over a 1D `data` mesh. `--param-axis-name` enables rule-based placement for model params and shape-based placement for optimizer leaves over that mesh axis; full tuned per-parameter sharding rules are still future work.
+The default remains replicated parameters over a 1D `data` mesh.
+`--param-axis-name model` constructs the NNX model and Adam state directly under
+the target mesh using declared row/column logical axes; it does not first build
+a full unsharded model. It also selects Explicit mesh axes, validates model-axis
+divisibility, and carries RWKV heads and screening slots in model-sharded state.
 
 ## Current Implementation Boundary
 
 Implemented:
 
 - `jax.distributed.initialize()` environment-based setup.
-- 1D and multi-axis JAX mesh construction.
-- rule-based parameter placement for embeddings, dense kernels, LM head weights, and fallback array leaves.
+- topology-aware 1D and multi-axis JAX mesh construction with `jax.make_mesh()`.
+- complete NNX RWKV core, screening, model, optimizer, runtime, distributed
+  train/eval, and checkpoint lifecycle.
+- full-model Linen-to-NNX tensor-path conversion and forward/gradient parity.
+- NNX sharded init/update/Orbax/restore lifecycle probe and full-model test.
+- abstract parameter counting, dtype policy, and parameter-related HBM estimator.
+- exact package/runtime manifest in distributed run configuration.
+- declared row/column NNX parameter axes for embeddings, RWKV projections,
+  screening projections, norms, states, and LM head.
+- explicit output shardings for embedding gather, row/column linear operations,
+  RWKV head reshapes, and screening delta projection.
+- a shared `ModelConfig` artifact for public APIs, small runs, the 7B planner,
+  and distributed training.
+- BF16 parameter storage/compute with explicit FP32 update, Adam-state, and
+  gradient-accumulation policies.
+- vocabulary-parallel logits, distributed cross entropy and L2Wrap, exact
+  state-carrying sequence chunks, block rematerialization, and microbatch
+  gradient accumulation.
+- activation placement `P("data", None, "model")`, RWKV state placement
+  `P("data", "model", None, None)`, and screening slot placement
+  `P("data", None, "model")` on the Phase 3 path.
+- compiled post-SPMD HLO collective audit and a forced two-CPU full-model
+  forward/backward/optimizer regression test.
+- real four-device TPU v5e functional validation of the small complete-model
+  Phase 3 forward/backward/optimizer path and its compiled collective audit.
+- real single-host TPU v5e throughput measurements for the `0.185b` and `1b`
+  presets, including data/model mesh and screening-phase comparisons.
+- real TPU validation of the independent small NNX Orbax lifecycle probe across
+  separate create/restore processes.
 - process-aware host binidx sampling.
 - data-parallel batch placement with `jax.make_array_from_process_local_data`.
 - train/eval step boundaries for local distributed tests.
@@ -107,17 +355,25 @@ Implemented:
 
 Pending:
 
-- tuned sharding specs per parameter group.
-- real TPU pod validation of sharded runtime-state checkpoint/resume for carried recurrent/screening state.
-- real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
+- XProf profiling and further throughput tuning on multi-device TPU, including the
+  three observed all-to-all collectives.
+- real TPU pod validation of full RWKV7M sharded runtime-state checkpoint/resume
+  for carried recurrent/screening state.
+- real TPU pod validation of full RWKV7M Orbax checkpoint save/resume under
+  sharded train states.
+- 7B and multi-host TPU execution.
 - TPU pod throughput tuning and failure recovery drills.
 - task-specific long-context evaluation harnesses beyond stateful binidx validation.
 
 ## Resume
 
-Two checkpoint backends are available:
+Two checkpoint backends are available. The local-compatible msgpack backend is
+the CLI default; select Orbax explicitly for TPU-scale runs:
 
-- `--checkpoint-backend flax`: process 0 materializes and writes `train_state.msgpack` plus `model.safetensors`; this remains the default and is useful for small/local runs and portable artifact export. With `--carry-state`, it also writes `runtime_state.msgpack`.
+- `--checkpoint-backend flax`: process 0 writes the NNX model/optimizer pure
+  state as `train_state.msgpack` plus `model.safetensors`; use it for small/local
+  runs and portable artifact export. With `--carry-state`, it also writes
+  `runtime_state.msgpack`.
 - `--checkpoint-backend orbax`: all processes write an Orbax train-state checkpoint under `orbax_train_state`, while process 0 writes `checkpoint.json`; use this for TPU-scale runs where materializing the full train state on process 0 is not viable. With `--carry-state`, it also writes `orbax_runtime_state`.
 
 Resume works for both backends:
@@ -145,7 +401,7 @@ When `--output-dir` is set, the distributed CLI writes:
 - `metrics.jsonl`
 - `metrics.csv`
 
-`run_config.json` stores CLI args, model config, process count, device count, and device names. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps.
+`run_config.json` stores CLI args, model config, process count, device count, device names, and exact runtime/package versions. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. The NNX distributed CLI synchronizes the complete updated model/optimizer state at the end of the timing window.
 
 Use `--log-jsonl`, `--log-csv`, and `--summary-json` to override output paths. `--summary-every` controls periodic summary writes. `--best-metric` and `--best-mode` choose the validation metric to track, and `--save-best-checkpoint` saves a checkpoint when that metric improves. Best checkpoints are protected from checkpoint rotation.
 
@@ -176,7 +432,11 @@ Current checkpoint backends persist distributed carry-state runtime state and re
 
 ## Export Contract
 
-Each checkpoint directory includes `model.safetensors`. This is the canonical artifact for external runtimes:
+Flax-backend checkpoint directories include `model.safetensors`. Orbax training
+checkpoints contain sharded train state and metadata but do not implicitly
+materialize portable weights. A final/export operation must write complete
+tensors one at a time or in small groups without gathering the whole model at
+once. `model.safetensors` remains the canonical external-runtime artifact:
 
 - `rwkv7m_config_json` stores the full model config.
 - top-level metadata stores architecture, dtype, dimensions, screening summary, and tokenizer vocabulary identity.

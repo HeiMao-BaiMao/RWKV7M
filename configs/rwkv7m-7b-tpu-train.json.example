@@ -1,0 +1,23 @@
+{
+  "data_file": "data/corpus",
+  "model_config": "configs/rwkv7m-7b-tpu.json.example",
+  "ctx_len": 4096,
+  "global_batch_size": 8,
+  "gradient_accumulation_steps": 8,
+  "steps": 1000,
+  "phase": "read_write",
+  "mesh_axis_names": ["data", "model"],
+  "mesh_axis_sizes": [1, 8],
+  "param_axis_name": "model",
+  "checkpoint_backend": "orbax",
+  "output_dir": "out/rwkv7m-7b-tpu",
+  "save_every": 100,
+  "keep_last_checkpoints": 3,
+  "eval_every": 100,
+  "eval_steps": 10,
+  "eval_data_file": "data/validation",
+  "summary_every": 10,
+  "save_best_checkpoint": true,
+  "prefetch_size": 2,
+  "print_every": 10
+}

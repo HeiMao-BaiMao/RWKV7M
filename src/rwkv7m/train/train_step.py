@@ -24,12 +24,20 @@ def l2wrap_loss(logits, factor=_L2WRAP_FACTOR):
     Equivalent to the upstream custom-gradient formulation, whose backward
     adds max_logit * factor / (B*T) at each argmax position.
     """
+    total, count = l2wrap_components(logits, factor=factor)
+    return total / count
+
+
+def l2wrap_components(logits, factor=_L2WRAP_FACTOR):
     max_logits = jnp.max(logits.astype(jnp.float32), axis=-1)
-    return 0.5 * factor * jnp.mean(jnp.square(max_logits))
+    return (
+        0.5 * factor * jnp.sum(jnp.square(max_logits)),
+        jnp.asarray(max_logits.size, dtype=jnp.float32),
+    )
 
 
 @jax.jit(static_argnames=["phase"], donate_argnums=(0,))
-def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
+def _linen_train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
     def loss_fn(params):
         logits, new_rwkv_state, new_screen_state, stats = train_state.apply_fn(
             {"params": params},
@@ -74,6 +82,38 @@ def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screeni
 
     metrics["total_loss"] = loss
     return train_state, new_rwkv_state, new_screen_state, metrics
+
+
+def train_step(
+    train_state,
+    batch,
+    rwkv_state,
+    screen_state,
+    phase="read_screening_only",
+    gradient_accumulation_steps=1,
+):
+    """Dispatch to the NNX training path or frozen Linen reference path."""
+
+    from .nnx_train import NNXTrainState, nnx_train_step
+
+    if isinstance(train_state, NNXTrainState):
+        return nnx_train_step(
+            train_state,
+            batch,
+            rwkv_state,
+            screen_state,
+            phase=phase,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+    if gradient_accumulation_steps != 1:
+        raise ValueError("gradient accumulation is supported by the NNX path only")
+    return _linen_train_step(
+        train_state,
+        batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+    )
 
 
 def compute_aux_losses(stats, phase="read_screening_only"):

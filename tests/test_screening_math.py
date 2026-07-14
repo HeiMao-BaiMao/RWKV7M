@@ -9,6 +9,7 @@ from rwkv7m.model.screening import (
     relevance_with_warmup,
     tanh_norm,
     update_rate_from_half_life,
+    compute_slot_delta,
 )
 
 
@@ -93,3 +94,57 @@ def test_update_rate_matches_requested_half_life():
         rate = update_rate_from_half_life(half_life)
         retained = jnp.power(1.0 - rate, half_life)
         assert jnp.allclose(retained, 0.5, rtol=1e-4, atol=1e-5)
+
+
+def _concatenated_slot_delta(x, h, slot_embed, kernel, bias):
+    batch_size = x.shape[0]
+    n_slots = slot_embed.shape[0]
+    x_rep = jnp.broadcast_to(x[:, None, :], (batch_size, n_slots, x.shape[-1]))
+    h_rep = jnp.broadcast_to(h[:, None, :], (batch_size, n_slots, h.shape[-1]))
+    slot_rep = jnp.broadcast_to(
+        slot_embed[None, :, :],
+        (batch_size, n_slots, slot_embed.shape[-1]),
+    )
+    joined = jnp.concatenate([x_rep, h_rep, slot_rep], axis=-1)
+    return jnp.tanh(jnp.einsum("bmi,io->bmo", joined, kernel) + bias)
+
+
+def _slot_delta_inputs(dtype=jnp.float32):
+    keys = jax.random.split(jax.random.PRNGKey(23), 5)
+    batch_size, d_model, n_slots, d_slot = 2, 8, 3, 4
+    return (
+        jax.random.normal(keys[0], (batch_size, d_model), dtype=dtype),
+        jax.random.normal(keys[1], (batch_size, d_model), dtype=dtype),
+        jax.random.normal(keys[2], (n_slots, d_slot), dtype=dtype),
+        jax.random.normal(keys[3], (2 * d_model + d_slot, d_slot), dtype=dtype),
+        jax.random.normal(keys[4], (d_slot,), dtype=dtype),
+    )
+
+
+def test_split_slot_delta_matches_concatenated_forward_float32():
+    inputs = _slot_delta_inputs()
+    expected = _concatenated_slot_delta(*inputs)
+    actual = compute_slot_delta(*inputs)
+    assert jnp.allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_split_slot_delta_matches_concatenated_gradients_float32():
+    inputs = _slot_delta_inputs()
+
+    def reference_loss(*args):
+        return jnp.sum(jnp.square(_concatenated_slot_delta(*args)))
+
+    def split_loss(*args):
+        return jnp.sum(jnp.square(compute_slot_delta(*args)))
+
+    expected = jax.grad(reference_loss, argnums=(0, 1, 2, 3, 4))(*inputs)
+    actual = jax.grad(split_loss, argnums=(0, 1, 2, 3, 4))(*inputs)
+    for actual_grad, expected_grad in zip(actual, expected):
+        assert jnp.allclose(actual_grad, expected_grad, rtol=3e-5, atol=3e-6)
+
+
+def test_split_slot_delta_matches_concatenated_forward_bfloat16():
+    inputs = _slot_delta_inputs(jnp.bfloat16)
+    expected = _concatenated_slot_delta(*inputs).astype(jnp.float32)
+    actual = compute_slot_delta(*inputs).astype(jnp.float32)
+    assert jnp.allclose(actual, expected, rtol=1e-2, atol=1e-2)

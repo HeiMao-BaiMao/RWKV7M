@@ -6,17 +6,34 @@ import jax
 from ..api import create_train_runtime, train_batch
 from ..data import create_binidx_dataset
 from ..io import (
+    load_model_config,
     load_train_checkpoint,
     load_train_checkpoint_metadata,
     load_train_runtime_state,
+    model_config_to_dict,
     save_train_checkpoint,
 )
-from ..model import ModelConfig, ScreeningConfig
+from ..model import MODEL_PRESET_NAMES, ModelConfig, ScreeningConfig, model_preset
 from .config import parse_args_with_config
 from .eval_binidx import evaluate_binidx, parse_args as parse_eval_args
 
 
 def build_config(args):
+    model_config_path = getattr(args, "model_config", None)
+    preset_name = getattr(args, "model_preset", None)
+    if model_config_path is not None and preset_name is not None:
+        raise ValueError("--model-config and --model-preset are mutually exclusive")
+    if model_config_path is not None or preset_name is not None:
+        config = (
+            load_model_config(model_config_path)
+            if model_config_path is not None
+            else model_preset(preset_name)
+        )
+        if args.ctx_len > config.max_seq_len:
+            raise ValueError(
+                f"ctx_len={args.ctx_len} exceeds model max_seq_len={config.max_seq_len}"
+            )
+        return config
     if args.use_screening:
         screened_layers = tuple(args.screened_layers)
         if not screened_layers and args.n_layers > 1:
@@ -48,6 +65,14 @@ def build_config(args):
         vocab_size=args.vocab_size,
         max_seq_len=args.ctx_len,
         dtype=args.dtype,
+        param_dtype=args.param_dtype,
+        param_update_dtype=args.param_update_dtype,
+        optimizer_state_dtype=args.optimizer_state_dtype,
+        gradient_accum_dtype=args.gradient_accum_dtype,
+        lm_head_init=args.lm_head_init,
+        vocab_parallel=args.vocab_parallel,
+        remat_blocks=args.remat_blocks,
+        sequence_chunk_size=args.sequence_chunk_size,
         use_screening=args.use_screening,
         screening=screening,
         lr_init=args.lr_init,
@@ -78,6 +103,18 @@ def default_bank_ids(n_slots):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train rwkv7m on RWKV-LM-V7 .bin/.idx data.")
     parser.add_argument("--data-file", required=True, help="Dataset prefix path without .bin/.idx")
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument(
+        "--model-config",
+        default=None,
+        help="Shared ModelConfig JSON used unchanged by small and large models",
+    )
+    model_source.add_argument(
+        "--model-preset",
+        choices=MODEL_PRESET_NAMES,
+        default=None,
+        help="Named shared NNX model configuration",
+    )
     parser.add_argument("--ctx-len", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100)
@@ -86,6 +123,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--param-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--param-update-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--optimizer-state-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--gradient-accum-dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--lm-head-init", choices=["orthogonal", "variance_scaled"], default="orthogonal")
+    parser.add_argument("--vocab-parallel", action="store_true")
+    parser.add_argument("--remat-blocks", action="store_true")
+    parser.add_argument("--sequence-chunk-size", type=int, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=10)
@@ -203,12 +249,33 @@ def _run_eval(args, checkpoint_dir, step):
 def run_training(args):
     if args.carry_state and args.sampling_mode != "sequential":
         raise ValueError("--carry-state requires --sampling-mode sequential")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    if args.batch_size % args.gradient_accumulation_steps != 0:
+        raise ValueError(
+            "batch_size must be divisible by gradient_accumulation_steps"
+        )
     if args.resume:
         cfg, payload = load_train_checkpoint_metadata(args.resume)
         start_step = int(payload.get("step", 0))
+        if args.model_config is not None or args.model_preset is not None:
+            requested_config = build_config(args)
+            if model_config_to_dict(requested_config) != model_config_to_dict(cfg):
+                raise ValueError(
+                    "--model-config does not match the model config stored in --resume"
+                )
     else:
         cfg = build_config(args)
         start_step = 0
+    if args.ctx_len > cfg.max_seq_len:
+        raise ValueError(
+            f"ctx_len={args.ctx_len} exceeds model max_seq_len={cfg.max_seq_len}"
+        )
+    if cfg.vocab_parallel:
+        raise ValueError(
+            "vocab_parallel model configs require rwkv7m-train-binidx-dp "
+            "with a distinct model mesh axis"
+        )
 
     dataset = create_binidx_dataset(
         args.data_file,
@@ -227,7 +294,7 @@ def run_training(args):
     )
     if args.resume:
         train_state, cfg, _ = load_train_checkpoint(args.resume, train_state)
-        runtime.variables = {"params": train_state.params}
+        runtime.variables = {"params": train_state.nnx_params}
         if args.carry_state:
             runtime_state = load_train_runtime_state(
                 args.resume,
@@ -259,6 +326,7 @@ def run_training(args):
                 runtime,
                 phase=args.phase,
                 carry_state=args.carry_state,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
             )
             completed_step = int(train_state.step)
             if args.print_every and (

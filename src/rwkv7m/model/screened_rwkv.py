@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from dataclasses import dataclass, field
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from .screening import ScreeningConfig, StateLevelScreening, normalize_phase
 from .state import (
@@ -25,6 +26,22 @@ class ModelConfig:
     vocab_size: int = 50257
     max_seq_len: int = 2048
     dtype: str = "bfloat16"
+    # Storage/update policy shared by small and large NNX models. Parameters
+    # default to FP32 for reference parity; large configurations can select
+    # BF16 storage while keeping gradients and Adam moments in FP32.
+    param_dtype: str = "float32"
+    param_update_dtype: str = "float32"
+    optimizer_state_dtype: str = "float32"
+    gradient_accum_dtype: str = "float32"
+    # The global orthogonal LM-head initializer is retained for reference
+    # parity on small models. Large sharded models should use
+    # ``variance_scaled`` to avoid a global QR decomposition during init.
+    lm_head_init: str = "orthogonal"
+    # Large-model execution controls. These do not change the architecture;
+    # they select memory-aware implementations of the same NNX graph.
+    vocab_parallel: bool = False
+    remat_blocks: bool = False
+    sequence_chunk_size: int | None = None
 
     # Screening config
     use_screening: bool = True
@@ -44,6 +61,25 @@ class ModelConfig:
     def __post_init__(self):
         if self.d_model != self.n_heads * self.head_size:
             raise ValueError("d_model must equal n_heads * head_size")
+        supported_dtypes = {"float32", "bfloat16"}
+        for name in (
+            "dtype",
+            "param_dtype",
+            "param_update_dtype",
+            "optimizer_state_dtype",
+            "gradient_accum_dtype",
+        ):
+            value = getattr(self, name)
+            if value not in supported_dtypes:
+                raise ValueError(
+                    f"{name} must be one of {sorted(supported_dtypes)}, got {value!r}"
+                )
+        if self.sequence_chunk_size is not None and self.sequence_chunk_size <= 0:
+            raise ValueError("sequence_chunk_size must be positive when set")
+        if self.lm_head_init not in ("orthogonal", "variance_scaled"):
+            raise ValueError(
+                "lm_head_init must be 'orthogonal' or 'variance_scaled'"
+            )
         self.screening.screened_layers = tuple(self.screening.screened_layers)
         self.screening.bank_ids = tuple(self.screening.bank_ids)
         if not self.use_screening or not self.screening.screened_layers:
@@ -140,10 +176,18 @@ class ScreenedRWKVModel(nn.Module):
             head_gain = 0.5 * math.sqrt(cfg.vocab_size / cfg.d_model)
         else:
             head_gain = 0.5
+        if cfg.lm_head_init == "orthogonal":
+            head_init = nn.initializers.orthogonal(scale=head_gain)
+        else:
+            head_init = nn.initializers.variance_scaling(
+                scale=head_gain * head_gain,
+                mode="fan_in",
+                distribution="truncated_normal",
+            )
         self.lm_head = nn.Dense(
             cfg.vocab_size,
             use_bias=False,
-            kernel_init=nn.initializers.orthogonal(scale=head_gain),
+            kernel_init=head_init,
             name="lm_head",
         )
 
@@ -221,13 +265,49 @@ def init_rwkv_state(batch_size, config: ModelConfig):
     return init_model_rwkv_state(batch_size, config)
 
 
-def cross_entropy_loss(logits, targets, mask=None):
+def cross_entropy_loss(logits, targets, mask=None, *, target_sharding=None):
+    total, count = cross_entropy_components(
+        logits,
+        targets,
+        mask,
+        target_sharding=target_sharding,
+    )
+    return total / jnp.maximum(count, 1.0)
+
+
+def cross_entropy_components(logits, targets, mask=None, *, target_sharding=None):
+    """Return a globally reducible CE numerator and denominator.
+
+    JAX global-array semantics keep this valid when the vocabulary dimension
+    is sharded: logsumexp and target selection compile to the required
+    collectives without materializing full logits on each device.
+    """
+
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    nll = -jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1)
+    logits_sharding = getattr(logits, "sharding", None)
+    logits_spec = getattr(logits_sharding, "spec", None)
+    if target_sharding is None and logits_spec is not None and logits_spec[-1] is not None:
+        target_sharding = NamedSharding(
+            logits_sharding.mesh,
+            P(*tuple(logits_spec[:-1])),
+        )
+    if target_sharding is not None:
+        batch_index = jnp.arange(logits.shape[0])[:, None]
+        token_index = jnp.arange(logits.shape[1])[None, :]
+        target_log_probs = log_probs.at[
+            batch_index,
+            token_index,
+            targets,
+        ].get(out_sharding=target_sharding)
+        nll = -target_log_probs
+    else:
+        nll = -jnp.take_along_axis(
+            log_probs, targets[..., None], axis=-1
+        ).squeeze(-1)
     if mask is not None:
         nll = nll * mask
-        return jnp.sum(nll) / jnp.maximum(jnp.sum(mask), 1.0)
-    return jnp.mean(nll)
+        return jnp.sum(nll), jnp.sum(mask)
+    return jnp.sum(nll), jnp.asarray(nll.size, dtype=jnp.float32)
 
 
 def create_model_variables(rng, config: ModelConfig, batch_size: int):
