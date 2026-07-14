@@ -230,6 +230,19 @@ the Triton Pallas lowering explicitly; recognized Hopper/Blackwell devices use
 Mosaic GPU. FFI is an unbundled, explicitly registered escape hatch and is
 never selected automatically.
 
+State-level screening has a separate projected recurrence boundary. Dense
+query, gate, delta, key/value-target, and output projections execute once over
+the sequence through normal XLA GEMM paths; the remaining time-dependent
+normalization, relevance, aggregation, and state update dispatches to separate
+TPU or GPU Pallas forward kernels. `RWKV7M_SCREENING_BACKEND` can independently
+select `reference`, `pallas_tpu`, `pallas_gpu_mosaic`, or
+`pallas_gpu_triton`. Training uses backend-specific reverse-time Pallas kernels
+with an FP32 carry tape. Model sharding gathers the slot feature once at the
+recurrence boundary, averages replicated outputs for a single logical
+transpose contribution, and slices final slots back to their owners. These new
+screening paths are implemented but have not yet been correctness- or
+performance-validated.
+
 Run the synchronized accelerator/reference WKV benchmark with:
 
 ```bash
@@ -237,6 +250,16 @@ uv run python scripts/benchmark_wkv_accelerator.py \
   --time 128 --batch 1 --heads 12 --head-size 64 \
   --warmup 5 --iterations 100 --output out/wkv-benchmark.json
 ```
+
+For a local-versus-official ranking, do not compare this project's prefetched
+train-loop rate directly with the upstream end-to-end runner. The strict
+compute-only workflow materializes one shared NPZ batch with
+`scripts/prepare_compute_benchmark_batch.py`, then runs
+`scripts/benchmark_local_train_compute.py` and
+`scripts/benchmark_upstream_train_compute.py` with identical warmup, iteration,
+and GC settings. WKV-only official CUDA measurements use
+`scripts/benchmark_upstream_wkv_compute.py`. The exact boundary and invalidation
+rules are documented in the L40S performance report.
 
 For controlled long-running throughput experiments, the distributed trainer
 also accepts `--disable-python-gc`. This opt-in flag disables only CPython's
@@ -690,6 +713,8 @@ Not yet included:
 
 - production accelerator profiling and shape-specific Pallas autotuning beyond
   the validated L40S shapes,
+- real-accelerator screening parity/performance validation and a non-duplicated
+  model-axis screening recurrence,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,

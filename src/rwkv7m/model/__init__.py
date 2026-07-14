@@ -1,5 +1,11 @@
 from .state import LayerRWKVState, LayerScreenState, ModelScreenState, init_screen_state, init_rwkv_state
 from .screening import ScreeningConfig, StateLevelScreening, normalize_phase
+from .screening_recurrence import (
+    ScreeningRecurrenceConfig,
+    screening_recurrence,
+    screening_recurrence_reference,
+    screening_recurrence_sharded,
+)
 from .screened_rwkv import ScreenedRWKVLayer, ScreenedRWKVModel, ModelConfig
 from .rwkv_core import RWKV7Block, RWKV7TimeMix, RWKV7ChannelMix, RWKV7Config
 from .wkv import wkv7, wkv7_reference, wkv7_sharded
@@ -33,6 +39,7 @@ __all__ = [
     "init_screen_state",
     "init_rwkv_state",
     "ScreeningConfig",
+    "ScreeningRecurrenceConfig",
     "StateLevelScreening",
     "normalize_phase",
     "ScreenedRWKVLayer",
@@ -45,6 +52,9 @@ __all__ = [
     "wkv7",
     "wkv7_reference",
     "wkv7_sharded",
+    "screening_recurrence",
+    "screening_recurrence_reference",
+    "screening_recurrence_sharded",
     "NNXShardingConfig",
     "NNXRWKV7Block",
     "NNXRWKV7ChannelMix",

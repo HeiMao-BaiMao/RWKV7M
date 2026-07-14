@@ -24,11 +24,22 @@ from .screening import (
     bounded_tau,
     compute_slot_delta,
     normalize_phase,
-    tanh_norm,
     theta_from_tau,
-    trim_square,
     unit_norm,
     update_rate_from_half_life,
+)
+from .screening_recurrence import (
+    ACTIVE_SLOTS,
+    READ_MAX,
+    READ_MEAN,
+    U_NORM,
+    USAGE_MEAN,
+    WRITE_EFFECTIVE_MEAN,
+    WRITE_MEAN,
+    Z_NORM,
+    ScreeningRecurrenceConfig,
+    screening_recurrence,
+    screening_recurrence_sharded,
 )
 from .state import LayerRWKVState, LayerScreenState, ModelScreenState
 from .wkv import wkv7, wkv7_sharded
@@ -297,11 +308,20 @@ def _compute_slot_delta(
         leading_data_axis=False,
         dtype=dtype,
     )
-    return jnp.tanh(
-        x_term[:, None, :]
-        + h_term[:, None, :]
-        + slot_term[None, :, :]
+    slot_leading_shape = (1,) * (x_term.ndim - 1)
+    result = jnp.tanh(
+        x_term[..., None, :]
+        + h_term[..., None, :]
+        + jnp.reshape(slot_term, (*slot_leading_shape, *slot_term.shape))
         + bias
+    )
+    result_axes: list[str | None] = [sharding.data_axis]
+    result_axes.extend([None] * (result.ndim - 2))
+    result_axes.append(sharding.model_axis)
+    return _apply_activation_sharding(
+        result,
+        sharding.named(*result_axes),
+        sharding,
     )
 
 
@@ -1033,9 +1053,8 @@ class NNXStateLevelScreening(nnx.Module):
         del deterministic
         cfg = self.config
         phase = normalize_phase(phase)
-        _, T, _ = x_seq.shape
         slots = _constrain_slots(state.slots.astype(jnp.float32), self.sharding)
-        ages = state.ages
+        ages = state.ages.astype(jnp.float32)
         usage_ema = state.usage_ema.astype(jnp.float32)
         x_ln_seq = _apply_norm_in_float32(
             self.screen_ln,
@@ -1045,9 +1064,29 @@ class NNXStateLevelScreening(nnx.Module):
         q_r_seq = unit_norm(
             self.q_proj_r(x_ln_seq).astype(jnp.float32), eps=cfg.eps
         )
-        tau_r = bounded_tau(_value(self.tau_r_raw))
-        lambda_screen = jax.nn.softplus(_value(self.lambda_raw))
-        mu = self._compute_mu()
+        gate_seq = jax.nn.sigmoid(
+            self.gate_proj(x_ln_seq).astype(jnp.float32)
+        )
+        delta_s_seq = _compute_slot_delta(
+            x_ln_seq,
+            h_base_seq.astype(jnp.float32),
+            _value(self.slot_embed),
+            _value(self.delta_proj.kernel),
+            _value(self.delta_proj.bias),
+            self.sharding,
+            dtype=self.compute_dtype,
+        )
+
+        initial_read_keys = self.k_proj_r(slots)
+        initial_values = self.v_proj(slots)
+        delta_read_keys = self.k_proj_r(delta_s_seq)
+        delta_values = self.v_proj(delta_s_seq)
+
+        tau_r = bounded_tau(_value(self.tau_r_raw)).astype(jnp.float32)
+        lambda_screen = jax.nn.softplus(_value(self.lambda_raw)).astype(
+            jnp.float32
+        )
+        mu = self._compute_mu().astype(jnp.float32)
         write_enabled = phase == "read_write" and cfg.use_write_screening
         if write_enabled:
             q_w_in = jnp.concatenate(
@@ -1056,107 +1095,121 @@ class NNXStateLevelScreening(nnx.Module):
             q_w_seq = unit_norm(
                 self.q_proj_w(q_w_in).astype(jnp.float32), eps=cfg.eps
             )
-            tau_w = bounded_tau(_value(self.tau_w_raw))
+            tau_w = bounded_tau(_value(self.tau_w_raw)).astype(jnp.float32)
+            slot_embed = _value(self.slot_embed)
+            initial_write_keys = self.k_proj_w(
+                slots + slot_embed[None, :, :]
+            )
+            delta_write_keys = self.k_proj_w(
+                delta_s_seq + slot_embed[None, None, :, :]
+            )
         else:
-            q_w_seq = None
-            tau_w = jnp.zeros(())
+            q_w_seq = jnp.zeros_like(q_r_seq)
+            tau_w = jnp.zeros((), dtype=jnp.float32)
+            initial_write_keys = jnp.zeros_like(initial_read_keys)
+            delta_write_keys = jnp.zeros_like(delta_read_keys)
 
-        def step(carry, t):
-            slots_t, ages_t, usage_t = carry
-            k_r = unit_norm(
-                self.k_proj_r(slots_t).astype(jnp.float32), eps=cfg.eps
-            )
-            values = self.v_proj(slots_t).astype(jnp.float32)
-            if cfg.use_value_unit_norm:
-                values = unit_norm(values, eps=cfg.eps)
-            sim_r = jnp.einsum("bk,bmk->bm", q_r_seq[:, t, :], k_r)
-            if cfg.use_leaky_warmup:
-                hard = trim_square(sim_r, tau_r)
-                soft = jax.nn.sigmoid(cfg.leaky_gamma * (sim_r - tau_r))
-                rel_r = (1.0 - cfg.leaky_alpha) * hard + cfg.leaky_alpha * soft
-            else:
-                rel_r = trim_square(sim_r, tau_r, eps=cfg.eps)
-            if cfg.use_age_mask:
-                age_scores = (cfg.age_ref - ages_t) / (cfg.age_sigma + cfg.eps)
-                rel_r *= jax.nn.sigmoid(age_scores)
-            z = jnp.einsum("bm,bmv->bv", rel_r, values)
-            u = tanh_norm(z, cap=cfg.tanh_norm_cap, eps=cfg.eps)
-            gate = jax.nn.sigmoid(
-                self.gate_proj(x_ln_seq[:, t, :]).astype(jnp.float32)
-            )
-            read_out = self.out_proj(u)
-            h_t = (
-                h_base_seq[:, t, :]
-                + lambda_screen * gate * read_out.astype(h_base_seq.dtype)
-            ).astype(h_base_seq.dtype)
-            delta_s_t = _compute_slot_delta(
-                x_ln_seq[:, t, :],
-                h_base_seq[:, t, :].astype(jnp.float32),
-                _value(self.slot_embed),
-                _value(self.delta_proj.kernel),
-                _value(self.delta_proj.bias),
-                self.sharding,
-                dtype=self.compute_dtype,
-            ).astype(jnp.float32)
-            if not write_enabled:
-                strength = mu[None, :, None]
-                new_slots = slots_t + strength * (delta_s_t - slots_t)
-                new_ages = ages_t
-                rel_w = jnp.zeros_like(rel_r)
-            else:
-                slots_for_key = slots_t + _value(self.slot_embed)[None, :, :]
-                k_w = unit_norm(
-                    self.k_proj_w(slots_for_key).astype(jnp.float32),
-                    eps=cfg.eps,
-                )
-                sim_w = jnp.einsum("bk,bmk->bm", q_w_seq[:, t, :], k_w)
-                rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
-                strength = mu[None, :, None] * jnp.maximum(
-                    rel_w, cfg.write_rel_floor
-                )[:, :, None]
-                new_slots = slots_t + strength * (delta_s_t - slots_t)
-                new_ages = jnp.where(rel_w > 1e-3, 0.0, ages_t + 1.0)
-            new_slots = _constrain_slots(new_slots, self.sharding)
-            update_delta = new_slots - slots_t
-            activity = jnp.maximum(rel_r, rel_w if write_enabled else rel_r)
-            new_usage = cfg.usage_ema_decay * usage_t + (
-                1.0 - cfg.usage_ema_decay
-            ) * activity
-            stats_t = {
-                "rel_read_mean": jnp.mean(rel_r),
-                "rel_read_max": jnp.max(rel_r),
-                "active_slots_mean": jnp.mean(jnp.sum(rel_r > 1e-3, axis=-1)),
-                "z_norm_mean": jnp.mean(jnp.linalg.norm(z, axis=-1)),
-                "u_norm_mean": jnp.mean(jnp.linalg.norm(u, axis=-1)),
-                "tau_r": tau_r,
-                "lambda_screen": lambda_screen,
-                "rel_write_mean": jnp.mean(rel_w),
-                "rel_write_effective_mean": (
-                    jnp.mean(jnp.maximum(rel_w, cfg.write_rel_floor))
-                    if write_enabled
-                    else jnp.mean(rel_w)
-                ),
-                "slot_update_norm_mean": jnp.mean(
-                    jnp.linalg.norm(update_delta, axis=-1)
-                ),
-                "slot_usage_ema_mean": jnp.mean(new_usage),
-                "tau_w": tau_w,
-            }
-            return (new_slots, new_ages, new_usage), (h_t, stats_t)
-
-        (final_slots, final_ages, final_usage), (h_seq, stats_seq) = jax.lax.scan(
-            step, (slots, ages, usage_ema), jnp.arange(T)
+        recurrence_config = ScreeningRecurrenceConfig(
+            write_enabled=write_enabled,
+            use_value_unit_norm=cfg.use_value_unit_norm,
+            use_leaky_warmup=cfg.use_leaky_warmup,
+            leaky_alpha=cfg.leaky_alpha,
+            leaky_gamma=cfg.leaky_gamma,
+            use_age_mask=cfg.use_age_mask,
+            age_ref=cfg.age_ref,
+            age_sigma=cfg.age_sigma,
+            write_rel_floor=cfg.write_rel_floor,
+            usage_ema_decay=cfg.usage_ema_decay,
+            tanh_norm_cap=cfg.tanh_norm_cap,
+            eps=cfg.eps,
         )
+        recurrence_inputs = tuple(
+            jnp.swapaxes(value, 0, 1)
+            for value in (
+                q_r_seq,
+                q_w_seq,
+                delta_s_seq,
+                delta_read_keys,
+                delta_values,
+                delta_write_keys,
+            )
+        )
+        state_inputs = (
+            slots,
+            initial_read_keys,
+            initial_values,
+            initial_write_keys,
+            ages,
+            usage_ema,
+            mu,
+            tau_r,
+            tau_w,
+        )
+        if self.sharding is None:
+            recurrence_outputs = screening_recurrence(
+                *recurrence_inputs,
+                *state_inputs,
+                recurrence_config,
+            )
+        else:
+            recurrence_outputs = screening_recurrence_sharded(
+                *recurrence_inputs,
+                *state_inputs,
+                recurrence_config,
+                mesh=self.sharding.mesh,
+                data_axis=self.sharding.data_axis,
+                model_axis=self.sharding.model_axis,
+            )
+        (
+            u_time,
+            final_slots,
+            final_ages,
+            final_usage,
+            step_statistics,
+            update_squared,
+        ) = recurrence_outputs
+
+        u_seq = jnp.swapaxes(u_time, 0, 1)
+        read_out_seq = self.out_proj(u_seq)
+        h_seq = (
+            h_base_seq
+            + lambda_screen
+            * gate_seq
+            * read_out_seq.astype(h_base_seq.dtype)
+        ).astype(h_base_seq.dtype)
+
+        stats = {
+            "rel_read_mean": jnp.mean(step_statistics[..., READ_MEAN]),
+            "rel_read_max": jnp.mean(
+                jnp.max(step_statistics[..., READ_MAX], axis=1)
+            ),
+            "active_slots_mean": jnp.mean(
+                step_statistics[..., ACTIVE_SLOTS]
+            ),
+            "z_norm_mean": jnp.mean(step_statistics[..., Z_NORM]),
+            "u_norm_mean": jnp.mean(step_statistics[..., U_NORM]),
+            "tau_r": tau_r,
+            "lambda_screen": lambda_screen,
+            "rel_write_mean": jnp.mean(
+                step_statistics[..., WRITE_MEAN]
+            ),
+            "rel_write_effective_mean": jnp.mean(
+                step_statistics[..., WRITE_EFFECTIVE_MEAN]
+            ),
+            "slot_update_norm_mean": jnp.mean(jnp.sqrt(update_squared)),
+            "slot_usage_ema_mean": jnp.mean(
+                step_statistics[..., USAGE_MEAN]
+            ),
+            "tau_w": tau_w,
+        }
         new_state = LayerScreenState(
-            slots=final_slots.astype(state.slots.dtype),
+            slots=_constrain_slots(final_slots, self.sharding).astype(
+                state.slots.dtype
+            ),
             ages=final_ages,
             usage_ema=final_usage.astype(state.usage_ema.dtype),
         )
-        return (
-            jnp.swapaxes(h_seq, 0, 1),
-            new_state,
-            {key: jnp.mean(value) for key, value in stats_seq.items()},
-        )
+        return h_seq, new_state, stats
 
 
 class NNXScreenedRWKVLayer(nnx.Module):

@@ -1,5 +1,9 @@
 # NVIDIA L40S Pallas performance validation
 
+> The screening throughput measurements in this report predate the projected
+> Pallas screening recurrence. They remain the baseline for the next hardware
+> gate; no post-change screening result has been measured yet.
+
 ## Summary
 
 On 2026-07-14, the production Triton-Pallas WKV path was validated on a
@@ -13,10 +17,10 @@ or 4.17x.
 After removing recurrent and head chunking, disabling rematerialization, and
 controlling CPython cyclic garbage collection, the screening-free local core
 sustained 9,413 token/s. The directly executed upstream RWKV-LM-V7 fused CUDA
-runner sustained 8,516 token/s in its corresponding run. This 1.11x result is
-useful evidence that Pallas is no longer the limiting issue for the tested
-shape; it is not a claim that the two training stacks are instruction-for-
-instruction identical.
+runner sustained 8,516 token/s in its corresponding run. These runs only show
+that two different complete training stacks reached similar throughput on the
+same L40S. Their 1.105 ratio is a reference comparison, not evidence that the
+Pallas WKV kernel or the JAX stack is 1.105x faster.
 
 The most important remaining result is negative: state-level screening now
 dominates this small model's GPU cost. Against the canonical FFN-2688
@@ -118,12 +122,86 @@ width FFN matrices directly, so its actual FFN is 3072 rather than the
 previously reported 2688. The comparison helper now records `actual_dim_ffn`
 and `actual_parameter_count` instead of relying on the requested wrapper value.
 
-The local-to-official sustained-throughput ratio is 1.105x. This is a
-controlled engineering comparison of the same context, batch, layer count,
-model width, head shape, vocabulary, and actual FFN width. It still includes
-different model wrappers, loss/optimizer implementations, parameterization,
-and timing harnesses, so a small lead should not be interpreted as a universal
-backend ranking.
+The local-to-official sustained-throughput ratio is 1.105x. It is a reference
+comparison only. The local window begins after a prefetched batch is available
+and ends after synchronization of the complete updated state. The official
+window also includes dataset sampling, CPU-to-GPU transfer, and the scalar
+loss read; GC policy, measured step count, optimizer, and Python environment
+also differ. The supported conclusion is therefore limited to: *different
+complete learning stacks attained similar train throughput on the same L40S.*
+It does not establish that Pallas WKV is faster than the official CUDA kernel,
+or that JAX is faster than PyTorch.
+
+## Strict compute-only comparison method
+
+New measurements must use the tracked schema-v2 compute-only harnesses. First,
+materialize one batch once and pass the identical NPZ to both full-step
+runners:
+
+```bash
+uv run python scripts/prepare_compute_benchmark_batch.py \
+  --data-file /data/train --ctx-len 512 --batch-size 1 \
+  --magic-prime 999983 --output out/fixed-batch-b1-t512.npz
+
+uv run python scripts/benchmark_local_train_compute.py \
+  --fixed-batch out/fixed-batch-b1-t512.npz \
+  --model-preset 0.185b --variant baseline \
+  --ctx-len 512 --batch-size 1 --no-remat-blocks \
+  --no-sequence-chunking --no-head-chunking \
+  --benchmark-warmup 5 --benchmark-iterations 50 \
+  --disable-python-gc --output out/local-train-compute.json
+
+python scripts/benchmark_upstream_train_compute.py \
+  --upstream-repo /opt/RWKV-LM/RWKV-v7/train_temp \
+  --fixed-batch out/fixed-batch-b1-t512.npz \
+  --n-layer 12 --n-embd 768 --dim-att 768 --dim-ffn 3072 \
+  --vocab-size 65536 --benchmark-warmup 5 \
+  --benchmark-iterations 50 --disable-python-gc \
+  --output out/upstream-train-compute.json
+```
+
+Both outputs record the fixed-batch SHA-256, device/runtime identity, warmup,
+iteration count, and GC policy. Sampling, host-to-device transfer, compilation,
+checkpointing, logging, and host metrics are outside the timing windows.
+Forward, backward, and optimizer are measured as independent synchronized
+windows. A separate full-step window has no intermediate phase barriers and is
+the throughput comparison value. The local backward window reuses one prepared
+VJP residual; the official backward window prepares its autograd graph before
+the timer. Optimizer windows likewise consume precomputed fixed gradients.
+The records include optimizer identity and hyperparameters; Optax and FusedAdam
+remain different implementations, so the phase split is required when
+attributing a full-step difference.
+
+Before quoting a ratio, run `scripts/compare_compute_benchmarks.py` on the two
+JSON files. It refuses records with different schema, benchmark kind, device,
+shape, input fingerprint, warmup, iteration count, or GC policy and maps the
+framework-specific phase names explicitly.
+
+WKV-only comparison uses the same PCG64-generated tensors, zero initial state,
+seed, shape, warmup, iteration count, GC policy, and FP32-squared objective:
+
+```bash
+uv run python scripts/benchmark_wkv_accelerator.py \
+  --time 128 --batch 1 --heads 12 --head-size 64 \
+  --initial-state zero \
+  --warmup 5 --iterations 100 --disable-python-gc \
+  --output out/local-wkv-compute.json
+
+python scripts/benchmark_upstream_wkv_compute.py \
+  --upstream-repo /opt/RWKV-LM/RWKV-v7/train_temp \
+  --time 128 --batch 1 --heads 12 --head-size 64 \
+  --warmup 5 --iterations 100 --disable-python-gc \
+  --output out/upstream-wkv-compute.json
+```
+
+The two WKV JSON records expose a pre-BF16 input fingerprint. A comparison is
+invalid if that fingerprint, shape, method fields, or device identity differ.
+Use local `pallas_training_forward`, rather than the tape-free
+`pallas_forward`, against the autograd-enabled official forward. Backward and
+combined windows expose gradients only for the six vector inputs on both
+sides; the local zero initial state is fixed rather than a timed gradient
+argument.
+No result from these new harnesses has been measured yet.
 
 The direct Pallas-versus-reference model comparison used identical local
 configuration and data. With the tracked `0.185b` rematerialization and
@@ -236,7 +314,9 @@ therefore remains unverified.
 The evidence supports the following current decisions:
 
 - keep Triton Pallas as the default Ada path; it passed real lowering and is
-  already competitive with the directly executed fused upstream runner;
+  compatible with a local complete stack that reached similar throughput to
+  the directly executed fused upstream runner; strict compute-only ranking is
+  still unmeasured;
 - keep FFI as an explicit registration boundary, not an automatic path;
 - tune or fuse state-level screening before spending effort on another WKV
   implementation for this shape;

@@ -86,6 +86,45 @@ existing presets. Each head chunk still creates its full BF16 vocabulary logits
 and casts them to FP32 for cross entropy. Vocabulary tiling and online
 log-sum-exp are therefore still pending.
 
+## Screening recurrence boundary
+
+State-level screening now separates sequence-wide dense projections from its
+time-dependent recurrence. Layer normalization, read/write queries, gate,
+slot-delta projection, projected slot targets, and the final output projection
+run as batched XLA operations outside the scan. The recurrent API receives
+time-major projected targets and maintains FP32 slot, read-key, value,
+write-key, age, and usage state.
+
+```text
+XLA: norm + q/gate/delta projections
+  -> XLA: project initial slots and all delta targets
+  -> Pallas: normalize, score, aggregate, and update projected state over T
+  -> XLA: one sequence-wide output projection and gated residual
+```
+
+This removes token-sized GEMMs and model-axis collectives from the persistent
+loop. `RWKV7M_SCREENING_BACKEND` independently accepts `reference`,
+`pallas_tpu`, `pallas_gpu_mosaic`, and `pallas_gpu_triton`; automatic selection
+uses the same accelerator policy as WKV. GPU and TPU own separate kernel
+bodies. CPU uses the projected `lax.scan` reference.
+
+Accelerator training uses a Pallas forward that stores the FP32 per-token carry
+and a dedicated reverse-time Pallas kernel. The reverse kernel performs the
+sequential transpose in one persistent loop and applies the local transition
+VJP at each step; it does not transpose the whole Pallas forward or recompute a
+portable scan. CPU and explicit fallback execution retain the projected
+reference pullback.
+
+For model sharding, the slot feature shard is gathered once before the
+recurrence. Each model device runs the persistent recurrence, replicated
+outputs are averaged to encode one logical transpose contribution, and final
+slots are sliced back to their owning shard. This makes the collective and VJP
+contract explicit without inserting a collective inside the time loop. It
+duplicates screening recurrence compute across the model axis, so a later
+hardware profile may justify a more specialized distributed kernel. These new
+forward/backward and sharded paths have not yet passed parity or hardware
+performance gates.
+
 ## Performance gate
 
 Correctness is required before throughput comparison:
@@ -137,6 +176,12 @@ not accepted as proof of the limiting resource.
 9. **Partial:** an L40S/Ada measured dispatch record now covers four WKV shapes
    and tracked 0.185B train-step configurations. Hopper/Blackwell and broader
    production-shape records remain pending.
+10. **Implemented, unvalidated:** screening dense projections are hoisted out
+    of the time loop; the projected reference, independent backend dispatch,
+    separate TPU/GPU persistent forward and reverse-time Pallas kernels, FP32
+    training carry tape, and explicit data/model sharding transpose are
+    integrated. Parity tests and real-hardware screening performance gates
+    remain pending by request.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:
@@ -162,8 +207,11 @@ forward and 15.09x faster in forward plus backward than the local `lax.scan`
 reference. In an identical memory-safe 0.185B training configuration, Pallas
 increased median complete-step throughput by 4.17x. A matched FFN-3072,
 screening-free local run sustained 9,413 token/s versus 8,516 token/s for the
-directly executed upstream fused RWKV-LM-V7 runner, subject to the different
-wrapper/loss/optimizer limitations recorded in the report.
+directly executed upstream fused RWKV-LM-V7 runner. This is a reference
+comparison between different timing boundaries, not a Pallas-versus-CUDA or
+JAX-versus-PyTorch ranking. Schema-v2 fixed-batch compute-only harnesses now
+record WKV forward/backward and full-model forward/backward/optimizer/full-step
+windows separately; no new strict result has been measured yet.
 
 This changes the tuning priority for the tested small shape. The canonical
 FFN-2688 read-only screening path reduced time-weighted throughput by 58.7%
