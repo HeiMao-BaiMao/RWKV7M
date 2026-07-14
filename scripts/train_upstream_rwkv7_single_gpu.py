@@ -143,6 +143,17 @@ def git_provenance(repo: Path) -> tuple[str, bool, str]:
     return commit, bool(diff), hashlib.sha256(diff).hexdigest()
 
 
+def resolve_load_model(path: str | None) -> str | None:
+    """Resolve a checkpoint before the runner changes into the upstream repo."""
+
+    if path is None:
+        return None
+    checkpoint = Path(path).resolve()
+    if not checkpoint.is_file():
+        raise SystemExit(f"checkpoint not found: {checkpoint}")
+    return str(checkpoint)
+
+
 def write_json(path: Path, payload):
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -200,6 +211,7 @@ def make_optimizer(model, args):
 def main(argv=None):
     args = parse_args(argv)
     upstream, data_file = validate_args(args)
+    args.load_model = resolve_load_model(args.load_model)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -268,6 +280,10 @@ def main(argv=None):
         dataset.real_epoch = 0
 
         model = RWKV(model_args)
+        actual_parameter_count = sum(
+            parameter.numel() for parameter in model.parameters()
+        )
+        actual_dim_ffn = int(model.blocks[0].ffn.key.out_features)
         initial_checkpoint = load_official_state(torch, model, args, output_dir)
         model = model.to(device="cuda", dtype=torch.bfloat16).train()
         optimizer, optimizer_groups = make_optimizer(model, args)
@@ -284,6 +300,8 @@ def main(argv=None):
             "initial_checkpoint": initial_checkpoint,
             "launcher": "direct_single_gpu",
             "gradient_accumulation_steps": args.global_batch_size // args.micro_batch_size,
+            "actual_parameter_count": actual_parameter_count,
+            "actual_dim_ffn": actual_dim_ffn,
             "samples_per_epoch": SAMPLES_PER_EPOCH,
             "sampler": "official MyDataset cubic permutation, global sample order",
             "loss": "official fused l2wrap_cross_entropy",

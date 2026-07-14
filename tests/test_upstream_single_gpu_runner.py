@@ -43,3 +43,15 @@ def test_epoch_and_index_preserves_official_40320_sample_boundary():
     assert MODULE.epoch_and_index(0) == (0, 0)
     assert MODULE.epoch_and_index(40_319) == (0, 40_319)
     assert MODULE.epoch_and_index(40_320) == (1, 0)
+
+
+def test_load_model_is_resolved_before_upstream_chdir(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "rwkv-init.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.chdir(tmp_path)
+
+    assert MODULE.resolve_load_model("rwkv-init.pth") == str(
+        checkpoint.resolve()
+    )
+    with pytest.raises(SystemExit, match="checkpoint not found"):
+        MODULE.resolve_load_model("missing.pth")
