@@ -125,6 +125,8 @@ def test_invalid_config_validation():
         ScreeningConfig(usage_ema_decay=1.0)
     with pytest.raises(ValueError, match="d_model must equal"):
         ModelConfig(d_model=33, n_heads=2, head_size=16, use_screening=False)
+    with pytest.raises(ValueError, match="head_chunk_size"):
+        ModelConfig(head_chunk_size=0, use_screening=False)
     with pytest.raises(ValueError, match="screening.d_model"):
         ModelConfig(
             d_model=32,

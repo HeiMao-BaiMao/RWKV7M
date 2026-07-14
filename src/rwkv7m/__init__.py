@@ -13,6 +13,14 @@ from .api import (
     train_binidx,
 )
 from .data import BinIdxBatchDataset, BinIdxConfig, create_binidx_dataset
+from .kernels import (
+    WKVBackend,
+    WKVFFIBackend,
+    available_wkv_backends,
+    register_wkv_ffi_backend,
+    resolve_wkv_backend,
+    unregister_wkv_ffi_backend,
+)
 from .model import (
     LayerRWKVState,
     LayerScreenState,
@@ -36,6 +44,9 @@ from .model import (
     normalize_phase,
     canonical_model_preset_name,
     model_preset,
+    wkv7,
+    wkv7_reference,
+    wkv7_sharded,
 )
 from .model.screened_rwkv import cross_entropy_loss, create_model_variables
 from .io import (
@@ -67,6 +78,12 @@ __all__ = [
     "BinIdxBatchDataset",
     "BinIdxConfig",
     "create_binidx_dataset",
+    "WKVBackend",
+    "WKVFFIBackend",
+    "available_wkv_backends",
+    "register_wkv_ffi_backend",
+    "resolve_wkv_backend",
+    "unregister_wkv_ffi_backend",
     "LayerRWKVState",
     "LayerScreenState",
     "MODEL_PRESET_NAMES",
@@ -89,6 +106,9 @@ __all__ = [
     "RWKV7TimeMix",
     "RWKV7ChannelMix",
     "RWKV7Config",
+    "wkv7",
+    "wkv7_reference",
+    "wkv7_sharded",
     "create_model_variables",
     "cross_entropy_loss",
     "model_config_from_dict",

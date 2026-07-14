@@ -37,6 +37,8 @@ def test_full_nnx_model_parallel_path_on_two_cpu_devices():
             "--remat-blocks",
             "--sequence-chunk-size",
             "2",
+            "--head-chunk-size",
+            "4",
         ],
         cwd=Path(__file__).resolve().parents[1],
         env=env,

@@ -68,8 +68,24 @@ def parse_args(argv=None):
     parser.add_argument("--gradient-accum-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--lm-head-init", choices=["orthogonal", "variance_scaled"], default="orthogonal")
     parser.add_argument("--vocab-parallel", action="store_true")
-    parser.add_argument("--remat-blocks", action="store_true")
-    parser.add_argument("--sequence-chunk-size", type=int, default=None)
+    remat_group = parser.add_mutually_exclusive_group()
+    remat_group.add_argument(
+        "--remat-blocks",
+        dest="remat_blocks",
+        action="store_true",
+    )
+    remat_group.add_argument(
+        "--no-remat-blocks",
+        dest="remat_blocks",
+        action="store_false",
+    )
+    parser.set_defaults(remat_blocks=None)
+    chunk_group = parser.add_mutually_exclusive_group()
+    chunk_group.add_argument("--sequence-chunk-size", type=int, default=None)
+    chunk_group.add_argument("--no-sequence-chunking", action="store_true")
+    head_chunk_group = parser.add_mutually_exclusive_group()
+    head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
+    head_chunk_group.add_argument("--no-head-chunking", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)

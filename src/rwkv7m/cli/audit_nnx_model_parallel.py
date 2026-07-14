@@ -46,6 +46,7 @@ def parse_args(argv=None):
     parser.add_argument("--vocab-parallel", action="store_true")
     parser.add_argument("--remat-blocks", action="store_true")
     parser.add_argument("--sequence-chunk-size", type=int, default=None)
+    parser.add_argument("--head-chunk-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args(argv)
 
@@ -116,6 +117,7 @@ def run_audit(args):
         config.vocab_parallel = args.vocab_parallel
         config.remat_blocks = args.remat_blocks
         config.sequence_chunk_size = args.sequence_chunk_size
+        config.head_chunk_size = args.head_chunk_size
     if args.ctx_len > config.max_seq_len:
         raise ValueError("ctx-len exceeds model max_seq_len")
     if (

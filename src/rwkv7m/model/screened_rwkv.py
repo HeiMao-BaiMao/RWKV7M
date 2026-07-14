@@ -4,8 +4,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from dataclasses import dataclass, field
-from jax.sharding import NamedSharding, PartitionSpec as P
 
+from .losses import cross_entropy_components, cross_entropy_loss
 from .screening import ScreeningConfig, StateLevelScreening, normalize_phase
 from .state import (
     ModelScreenState,
@@ -42,6 +42,9 @@ class ModelConfig:
     vocab_parallel: bool = False
     remat_blocks: bool = False
     sequence_chunk_size: int | None = None
+    # None inherits sequence_chunk_size in the training path. This preserves
+    # existing preset memory behavior while allowing independent head tuning.
+    head_chunk_size: int | None = None
 
     # Screening config
     use_screening: bool = True
@@ -76,6 +79,8 @@ class ModelConfig:
                 )
         if self.sequence_chunk_size is not None and self.sequence_chunk_size <= 0:
             raise ValueError("sequence_chunk_size must be positive when set")
+        if self.head_chunk_size is not None and self.head_chunk_size <= 0:
+            raise ValueError("head_chunk_size must be positive when set")
         if self.lm_head_init not in ("orthogonal", "variance_scaled"):
             raise ValueError(
                 "lm_head_init must be 'orthogonal' or 'variance_scaled'"
@@ -263,51 +268,6 @@ class ScreenedRWKVModel(nn.Module):
 
 def init_rwkv_state(batch_size, config: ModelConfig):
     return init_model_rwkv_state(batch_size, config)
-
-
-def cross_entropy_loss(logits, targets, mask=None, *, target_sharding=None):
-    total, count = cross_entropy_components(
-        logits,
-        targets,
-        mask,
-        target_sharding=target_sharding,
-    )
-    return total / jnp.maximum(count, 1.0)
-
-
-def cross_entropy_components(logits, targets, mask=None, *, target_sharding=None):
-    """Return a globally reducible CE numerator and denominator.
-
-    JAX global-array semantics keep this valid when the vocabulary dimension
-    is sharded: logsumexp and target selection compile to the required
-    collectives without materializing full logits on each device.
-    """
-
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    logits_sharding = getattr(logits, "sharding", None)
-    logits_spec = getattr(logits_sharding, "spec", None)
-    if target_sharding is None and logits_spec is not None and logits_spec[-1] is not None:
-        target_sharding = NamedSharding(
-            logits_sharding.mesh,
-            P(*tuple(logits_spec[:-1])),
-        )
-    if target_sharding is not None:
-        batch_index = jnp.arange(logits.shape[0])[:, None]
-        token_index = jnp.arange(logits.shape[1])[None, :]
-        target_log_probs = log_probs.at[
-            batch_index,
-            token_index,
-            targets,
-        ].get(out_sharding=target_sharding)
-        nll = -target_log_probs
-    else:
-        nll = -jnp.take_along_axis(
-            log_probs, targets[..., None], axis=-1
-        ).squeeze(-1)
-    if mask is not None:
-        nll = nll * mask
-        return jnp.sum(nll), jnp.sum(mask)
-    return jnp.sum(nll), jnp.asarray(nll.size, dtype=jnp.float32)
 
 
 def create_model_variables(rng, config: ModelConfig, batch_size: int):

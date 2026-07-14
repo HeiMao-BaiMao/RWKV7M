@@ -14,6 +14,7 @@ from rwkv7m import (
 
 def test_model_config_roundtrip():
     config = tiny_config(vocab_size=32, d_model=32, n_layers=2, n_heads=2, head_size=16)
+    config.head_chunk_size = 64
     restored = model_config_from_dict(model_config_to_dict(config))
     assert restored == config
 

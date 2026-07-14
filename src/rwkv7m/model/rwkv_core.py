@@ -61,6 +61,16 @@ def wkv_step(state, r_t, w_t, k_t, v_t, neg_kk_t, kka_t):
         new_state: [B, H, N, N]
         y_t: [B, H, N]
     """
+    # Vector storage may be BF16, but the recurrent state, decay, dot products,
+    # and rank-one updates are part of the explicit FP32 WKV boundary.
+    state = state.astype(jnp.float32)
+    r_t = r_t.astype(jnp.float32)
+    w_t = w_t.astype(jnp.float32)
+    k_t = k_t.astype(jnp.float32)
+    v_t = v_t.astype(jnp.float32)
+    neg_kk_t = neg_kk_t.astype(jnp.float32)
+    kka_t = kka_t.astype(jnp.float32)
+
     w_decay = jnp.exp(-jnp.exp(w_t))  # [B, H, N]
     w_decay = w_decay[..., None, :]   # [B, H, 1, N]
 

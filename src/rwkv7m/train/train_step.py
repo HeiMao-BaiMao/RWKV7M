@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
+from ..model.losses import l2wrap_components, l2wrap_loss
 from ..model.screened_rwkv import cross_entropy_loss
 from ..model.state import init_screen_state, ModelScreenState
 
@@ -13,27 +14,6 @@ class TrainMetrics:
     rel_read_mean: jnp.ndarray
     active_slots_mean: jnp.ndarray
     u_norm_mean: jnp.ndarray
-
-
-_L2WRAP_FACTOR = 1e-4
-
-
-def l2wrap_loss(logits, factor=_L2WRAP_FACTOR):
-    """RWKV-LM L2Wrap: pull down the max logit per position.
-
-    Equivalent to the upstream custom-gradient formulation, whose backward
-    adds max_logit * factor / (B*T) at each argmax position.
-    """
-    total, count = l2wrap_components(logits, factor=factor)
-    return total / count
-
-
-def l2wrap_components(logits, factor=_L2WRAP_FACTOR):
-    max_logits = jnp.max(logits.astype(jnp.float32), axis=-1)
-    return (
-        0.5 * factor * jnp.sum(jnp.square(max_logits)),
-        jnp.asarray(max_logits.size, dtype=jnp.float32),
-    )
 
 
 @jax.jit(static_argnames=["phase"], donate_argnums=(0,))

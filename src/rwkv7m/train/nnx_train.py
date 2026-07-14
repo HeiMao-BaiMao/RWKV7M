@@ -13,10 +13,8 @@ from ..model.nnx_model import (
     NNXShardingConfig,
     initialize_nnx_model,
 )
-from ..model.screened_rwkv import cross_entropy_components
 from ..model.nnx_conversion import nnx_params_to_linen
 from .train_state import create_optimizer
-from .train_step import l2wrap_components
 
 
 def _optimizer_config(config):
@@ -138,6 +136,32 @@ def _cast_gradient_tree(grads, dtype):
     )
 
 
+def _split_sequence_chunks(value, chunk_count, chunk_size):
+    batch_size = int(value.shape[0])
+    return jnp.swapaxes(
+        value.reshape(
+            (batch_size, chunk_count, chunk_size, *value.shape[2:])
+        ),
+        0,
+        1,
+    )
+
+
+def _merge_hidden_chunks(model, chunked_hidden):
+    """Restore [chunks, batch, tokens, hidden] to the activation contract."""
+    chunk_count, batch_size, chunk_size, hidden_size = chunked_hidden.shape
+    transposed = jnp.swapaxes(chunked_hidden, 0, 1)
+    shape = (batch_size, chunk_count * chunk_size, hidden_size)
+    sharding = model.sharding
+    if sharding is not None and sharding.uses_explicit_axes:
+        return jax.lax.reshape(
+            transposed,
+            shape,
+            out_sharding=sharding.activation(3, model_sharded=True),
+        )
+    return jnp.reshape(transposed, shape)
+
+
 def nnx_model_loss(
     active_model,
     batch,
@@ -150,11 +174,19 @@ def nnx_model_loss(
     ce_loss_scale=1.0,
     l2_loss_scale=1.0,
 ):
-    """Exact top-level sequence chunking without truncated BPTT."""
+    """Run recurrent and LM-head chunks independently without truncated BPTT."""
 
     token_count = int(batch["input_ids"].shape[1])
-    chunk_size = active_model.config.sequence_chunk_size or token_count
-    chunk_size = min(int(chunk_size), token_count)
+    recurrent_chunk_size = (
+        active_model.config.sequence_chunk_size or token_count
+    )
+    recurrent_chunk_size = min(int(recurrent_chunk_size), token_count)
+    head_chunk_size = (
+        active_model.config.head_chunk_size
+        or active_model.config.sequence_chunk_size
+        or token_count
+    )
+    head_chunk_size = min(int(head_chunk_size), token_count)
     ce_total = jnp.zeros((), dtype=jnp.float32)
     ce_count = jnp.zeros((), dtype=jnp.float32)
     l2_total = jnp.zeros((), dtype=jnp.float32)
@@ -169,85 +201,65 @@ def nnx_model_loss(
             model_sharded=False,
         )
 
-    def apply_chunk(model, carry, chunk_batch):
+    def apply_recurrent_chunk(model, carry, chunk_input_ids):
         chunk_rwkv, chunk_screen = carry
-        logits, new_rwkv, new_screen, stats = model(
-            chunk_batch["input_ids"],
+        hidden, new_rwkv, new_screen, stats = model.compute_recurrent_hidden(
+            chunk_input_ids,
             chunk_rwkv,
             chunk_screen,
             phase=phase,
             deterministic=deterministic,
         )
-        chunk_ce, chunk_ce_count = cross_entropy_components(
-            logits,
-            chunk_batch["target_ids"],
-            chunk_batch.get("mask"),
-            target_sharding=target_sharding,
-        )
-        chunk_l2, chunk_l2_count = l2wrap_components(logits)
-        outputs = {
-            "ce_total": chunk_ce,
-            "ce_count": chunk_ce_count,
-            "l2_total": chunk_l2,
-            "l2_count": chunk_l2_count,
-            "stats": stats,
-        }
-        return (new_rwkv, new_screen), outputs
+        return (new_rwkv, new_screen), {"hidden": hidden, "stats": stats}
 
-    chunk_count, remainder = divmod(token_count, chunk_size)
-    if chunk_count > 1 and remainder == 0:
-        batch_size = int(batch["input_ids"].shape[0])
-        chunked_batch = jax.tree.map(
-            lambda value: jnp.swapaxes(
-                value.reshape(
-                    (batch_size, chunk_count, chunk_size, *value.shape[2:])
-                ),
-                0,
-                1,
-            ),
-            batch,
+    recurrent_chunk_count, recurrent_remainder = divmod(
+        token_count, recurrent_chunk_size
+    )
+    if recurrent_chunk_count > 1 and recurrent_remainder == 0:
+        chunked_input_ids = _split_sequence_chunks(
+            batch["input_ids"],
+            recurrent_chunk_count,
+            recurrent_chunk_size,
         )
 
         @nnx.scan(
             in_axes=(nnx.Carry, 0, None),
             out_axes=(nnx.Carry, 0),
         )
-        def scan_chunks(carry, chunk_batch, model):
-            return apply_chunk(model, carry, chunk_batch)
+        def scan_recurrent_chunks(carry, chunk_input_ids, model):
+            return apply_recurrent_chunk(model, carry, chunk_input_ids)
 
-        (current_rwkv, current_screen), chunk_outputs = scan_chunks(
-            (current_rwkv, current_screen),
-            chunked_batch,
-            active_model,
+        (current_rwkv, current_screen), recurrent_outputs = (
+            scan_recurrent_chunks(
+                (current_rwkv, current_screen),
+                chunked_input_ids,
+                active_model,
+            )
         )
-        ce_total = jnp.sum(chunk_outputs["ce_total"], axis=0)
-        ce_count = jnp.sum(chunk_outputs["ce_count"], axis=0)
-        l2_total = jnp.sum(chunk_outputs["l2_total"], axis=0)
-        l2_count = jnp.sum(chunk_outputs["l2_count"], axis=0)
+        hidden = _merge_hidden_chunks(
+            active_model,
+            recurrent_outputs["hidden"],
+        )
         stats_total = jax.tree.map(
-            lambda value: jnp.sum(value, axis=0) * chunk_size,
-            chunk_outputs["stats"],
+            lambda value: jnp.sum(value, axis=0) * recurrent_chunk_size,
+            recurrent_outputs["stats"],
         )
     else:
-        # Keep exact behavior for a final short chunk. The tracked 7B setup is
-        # divisible and takes the compact scan above; this fallback avoids
-        # padding tokens mutating the returned recurrent state.
-        for start in range(0, token_count, chunk_size):
-            stop = min(start + chunk_size, token_count)
-            chunk_batch = {
-                key: value[:, start:stop] for key, value in batch.items()
-            }
-            (current_rwkv, current_screen), chunk_outputs = apply_chunk(
-                active_model,
-                (current_rwkv, current_screen),
-                chunk_batch,
+        hidden_chunks = []
+        # Avoid padding a final short chunk because it would mutate the
+        # returned recurrent state and change exact chunked-BPTT semantics.
+        for start in range(0, token_count, recurrent_chunk_size):
+            stop = min(start + recurrent_chunk_size, token_count)
+            (current_rwkv, current_screen), recurrent_outputs = (
+                apply_recurrent_chunk(
+                    active_model,
+                    (current_rwkv, current_screen),
+                    batch["input_ids"][:, start:stop],
+                )
             )
-            ce_total += chunk_outputs["ce_total"]
-            ce_count += chunk_outputs["ce_count"]
-            l2_total += chunk_outputs["l2_total"]
-            l2_count += chunk_outputs["l2_count"]
+            hidden_chunks.append(recurrent_outputs["hidden"])
             chunk_tokens = jnp.asarray(stop - start, dtype=jnp.float32)
-            stats = chunk_outputs["stats"]
+            stats = recurrent_outputs["stats"]
             if stats_total is None:
                 stats_total = {
                     key: value * chunk_tokens for key, value in stats.items()
@@ -257,6 +269,67 @@ def nnx_model_loss(
                     key: stats_total[key] + value * chunk_tokens
                     for key, value in stats.items()
                 }
+        hidden = (
+            hidden_chunks[0]
+            if len(hidden_chunks) == 1
+            else jnp.concatenate(hidden_chunks, axis=1)
+        )
+
+    def apply_head_chunk(model, chunk_hidden, chunk_batch):
+        return model.compute_training_loss(
+            chunk_hidden,
+            chunk_batch["target_ids"],
+            chunk_batch.get("mask"),
+            target_sharding=target_sharding,
+        )
+
+    loss_batch = {"target_ids": batch["target_ids"]}
+    if "mask" in batch:
+        loss_batch["mask"] = batch["mask"]
+    head_chunk_count, head_remainder = divmod(token_count, head_chunk_size)
+    if head_chunk_count > 1 and head_remainder == 0:
+        chunked_hidden = _split_sequence_chunks(
+            hidden,
+            head_chunk_count,
+            head_chunk_size,
+        )
+        chunked_loss_batch = jax.tree.map(
+            lambda value: _split_sequence_chunks(
+                value,
+                head_chunk_count,
+                head_chunk_size,
+            ),
+            loss_batch,
+        )
+
+        @nnx.scan(in_axes=(0, 0, None), out_axes=0)
+        def scan_head_chunks(chunk_hidden, chunk_batch, model):
+            return apply_head_chunk(model, chunk_hidden, chunk_batch)
+
+        head_outputs = scan_head_chunks(
+            chunked_hidden,
+            chunked_loss_batch,
+            active_model,
+        )
+        ce_total = jnp.sum(head_outputs["ce_total"], axis=0)
+        ce_count = jnp.sum(head_outputs["ce_count"], axis=0)
+        l2_total = jnp.sum(head_outputs["l2_total"], axis=0)
+        l2_count = jnp.sum(head_outputs["l2_count"], axis=0)
+    else:
+        for start in range(0, token_count, head_chunk_size):
+            stop = min(start + head_chunk_size, token_count)
+            chunk_batch = {
+                key: value[:, start:stop] for key, value in loss_batch.items()
+            }
+            head_outputs = apply_head_chunk(
+                active_model,
+                hidden[:, start:stop],
+                chunk_batch,
+            )
+            ce_total += head_outputs["ce_total"]
+            ce_count += head_outputs["ce_count"]
+            l2_total += head_outputs["l2_total"]
+            l2_count += head_outputs["l2_count"]
 
     ce_loss = ce_total / jnp.maximum(ce_count, 1.0)
     l2_loss = l2_total / jnp.maximum(l2_count, 1.0)
