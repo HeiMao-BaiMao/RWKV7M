@@ -103,13 +103,16 @@ def _wkv_gpu_forward_kernel(
         _store_vector(y_ref, t, y_t.astype(output_dtype))
         _store_vector(sa_ref, t, sa_t)
 
+        checkpoint = (t + checkpoint_interval) // checkpoint_interval
+        # JAX 0.10's Triton lowering can incorrectly type the scalar divisor
+        # of ``rem`` as i1 inside a Pallas loop.  Express the same interval
+        # boundary without modulo so Ada compilation remains well typed.
         save_checkpoint = (
-            ((t + 1) % checkpoint_interval) == 0
+            (t + 1) == checkpoint * checkpoint_interval
         ) | ((t + 1) == time)
 
         @pl.when(save_checkpoint)
         def store_checkpoint():
-            checkpoint = (t + checkpoint_interval) // checkpoint_interval
             _store_checkpoint(checkpoints_ref, checkpoint, next_state)
 
         return next_state
@@ -194,11 +197,11 @@ def _wkv_gpu_backward_kernel(
     def reverse_time_loop(reverse_t, carry):
         current_state, current_state_cotangent = carry
         t = time - 1 - reverse_t
+        checkpoint = (t + checkpoint_interval) // checkpoint_interval
         load_checkpoint = (
             (t == time - 1)
-            | (((t + 1) % checkpoint_interval) == 0)
+            | ((t + 1) == checkpoint * checkpoint_interval)
         )
-        checkpoint = (t + checkpoint_interval) // checkpoint_interval
         saved_state = _load_checkpoint(checkpoints_ref, checkpoint)
         current_state = jnp.where(
             load_checkpoint, saved_state, current_state
