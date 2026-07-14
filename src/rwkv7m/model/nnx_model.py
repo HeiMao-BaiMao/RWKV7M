@@ -40,6 +40,14 @@ def _value(variable):
     return variable[...] if isinstance(variable, nnx.Variable) else variable
 
 
+def _dtype_from_name(name: str):
+    if name == "float32":
+        return jnp.float32
+    if name == "bfloat16":
+        return jnp.bfloat16
+    raise ValueError(f"unsupported dtype: {name!r}")
+
+
 @dataclass(frozen=True)
 class NNXShardingConfig:
     """Concrete data/model mesh contract for NNX initialization and calls."""
@@ -103,9 +111,17 @@ def _partitioned_init(
     axes: tuple[str | None, ...] | None,
     sharding: NNXShardingConfig | None,
 ) -> Initializer:
+    def storage_safe_init(key, shape, dtype=jnp.float32):
+        # QR-backed and some random initializers do not support BF16 directly
+        # on every backend. Initialize in FP32 globally, then store in the
+        # configured parameter dtype. This also keeps small/large seeds and
+        # initializer semantics on one path.
+        compute_dtype = jnp.float32 if jnp.dtype(dtype) == jnp.bfloat16 else dtype
+        return initializer(key, shape, compute_dtype).astype(dtype)
+
     if sharding is None or axes is None:
-        return initializer
-    return nnx.with_partitioning(initializer, axes, mesh=sharding.mesh)
+        return storage_safe_init
+    return nnx.with_partitioning(storage_safe_init, axes, mesh=sharding.mesh)
 
 
 def _param(
@@ -132,6 +148,7 @@ def _linear(
     kernel_axes: tuple[str | None, ...] | None = None,
     bias_axes: tuple[str | None, ...] | None = None,
     sharding: NNXShardingConfig | None = None,
+    param_dtype=jnp.float32,
 ) -> nnx.Linear:
     output_model_sharded = bool(
         sharding is not None
@@ -144,6 +161,7 @@ def _linear(
         sharding=sharding,
         output_model_sharded=output_model_sharded,
         use_bias=use_bias,
+        param_dtype=param_dtype,
         kernel_init=_partitioned_init(kernel_init, kernel_axes, sharding),
         bias_init=_partitioned_init(bias_init, bias_axes, sharding),
         rngs=rngs,
@@ -157,12 +175,14 @@ def _layer_norm(
     epsilon: float = 1e-6,
     dtype=None,
     sharding: NNXShardingConfig | None = None,
+    param_dtype=jnp.float32,
 ) -> nnx.LayerNorm:
     axes = (sharding.model_axis,) if sharding is not None else None
     return nnx.LayerNorm(
         features,
         epsilon=epsilon,
         dtype=dtype,
+        param_dtype=param_dtype,
         scale_init=_partitioned_init(initializers.ones_init(), axes, sharding),
         bias_init=_partitioned_init(initializers.zeros_init(), axes, sharding),
         rngs=rngs,
@@ -394,6 +414,7 @@ class NNXRWKV7TimeMix(nnx.Module):
         mix_axes = (model,) if model else None
         row_axes = (model, None) if model else None
         column_axes = (None, model) if model else None
+        param_dtype = _dtype_from_name(config.param_dtype)
 
         ratio_0_to_1 = layer_idx / max(1, config.n_layers - 1)
         ratio_1_to_almost0 = 1.0 - (layer_idx / max(1, config.n_layers))
@@ -406,12 +427,12 @@ class NNXRWKV7TimeMix(nnx.Module):
 
             return init_fn
 
-        self.x_r = _param(rngs, mix_init(0.2), (1, 1, C), axes=mix_axes, sharding=sharding)
-        self.x_w = _param(rngs, mix_init(0.9), (1, 1, C), axes=mix_axes, sharding=sharding)
-        self.x_k = _param(rngs, mix_init(0.7), (1, 1, C), axes=mix_axes, sharding=sharding)
-        self.x_v = _param(rngs, mix_init(0.7), (1, 1, C), axes=mix_axes, sharding=sharding)
-        self.x_a = _param(rngs, mix_init(0.9), (1, 1, C), axes=mix_axes, sharding=sharding)
-        self.x_g = _param(rngs, mix_init(0.2), (1, 1, C), axes=mix_axes, sharding=sharding)
+        self.x_r = _param(rngs, mix_init(0.2), (1, 1, C), axes=mix_axes, sharding=sharding, dtype=param_dtype)
+        self.x_w = _param(rngs, mix_init(0.9), (1, 1, C), axes=mix_axes, sharding=sharding, dtype=param_dtype)
+        self.x_k = _param(rngs, mix_init(0.7), (1, 1, C), axes=mix_axes, sharding=sharding, dtype=param_dtype)
+        self.x_v = _param(rngs, mix_init(0.7), (1, 1, C), axes=mix_axes, sharding=sharding, dtype=param_dtype)
+        self.x_a = _param(rngs, mix_init(0.9), (1, 1, C), axes=mix_axes, sharding=sharding, dtype=param_dtype)
+        self.x_g = _param(rngs, mix_init(0.2), (1, 1, C), axes=mix_axes, sharding=sharding, dtype=param_dtype)
 
         self.receptance = _linear(
             C,
@@ -421,10 +442,11 @@ class NNXRWKV7TimeMix(nnx.Module):
             kernel_axes=row_axes,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
         d_decay = max(32, int(round((2.5 * math.sqrt(C)) / 32) * 32))
-        self.w1 = _param(rngs, initializers.zeros_init(), (C, d_decay), axes=row_axes, sharding=sharding)
-        self.w2 = _param(rngs, initializers.orthogonal(0.1), (d_decay, C), axes=column_axes, sharding=sharding)
+        self.w1 = _param(rngs, initializers.zeros_init(), (C, d_decay), axes=row_axes, sharding=sharding, dtype=param_dtype)
+        self.w2 = _param(rngs, initializers.orthogonal(0.1), (d_decay, C), axes=column_axes, sharding=sharding, dtype=param_dtype)
 
         def w0_init(key, shape, dtype=jnp.float32):
             del key, shape
@@ -435,7 +457,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             )
             return (www + 0.5 + zigzag * 2.5).reshape(1, 1, C).astype(dtype)
 
-        self.w0 = _param(rngs, w0_init, (1, 1, C), axes=hidden_axes, sharding=sharding)
+        self.w0 = _param(rngs, w0_init, (1, 1, C), axes=hidden_axes, sharding=sharding, dtype=param_dtype)
         self.key = _linear(
             C,
             C,
@@ -444,6 +466,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             kernel_axes=row_axes,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
         self.value = _linear(
             C,
@@ -453,27 +476,28 @@ class NNXRWKV7TimeMix(nnx.Module):
             kernel_axes=row_axes,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
 
         if layer_idx > 0:
             d_mv = max(32, int(round((1.7 * math.sqrt(C)) / 32) * 32))
-            self.v1 = _param(rngs, initializers.zeros_init(), (C, d_mv), axes=row_axes, sharding=sharding)
-            self.v2 = _param(rngs, initializers.orthogonal(0.1), (d_mv, C), axes=column_axes, sharding=sharding)
+            self.v1 = _param(rngs, initializers.zeros_init(), (C, d_mv), axes=row_axes, sharding=sharding, dtype=param_dtype)
+            self.v2 = _param(rngs, initializers.orthogonal(0.1), (d_mv, C), axes=column_axes, sharding=sharding, dtype=param_dtype)
 
             def v0_init(key, shape, dtype=jnp.float32):
                 del key, shape
                 linear = jnp.arange(C) / max(1, C - 1) - 0.5
                 return (0.73 - linear * 0.4).reshape(1, 1, C).astype(dtype)
 
-            self.v0 = _param(rngs, v0_init, (1, 1, C), axes=hidden_axes, sharding=sharding)
+            self.v0 = _param(rngs, v0_init, (1, 1, C), axes=hidden_axes, sharding=sharding, dtype=param_dtype)
         else:
             self.v1 = nnx.data(None)
             self.v2 = nnx.data(None)
             self.v0 = nnx.data(None)
 
         d_aaa = max(32, int(round((2.5 * math.sqrt(C)) / 32) * 32))
-        self.a1 = _param(rngs, initializers.zeros_init(), (C, d_aaa), axes=row_axes, sharding=sharding)
-        self.a2 = _param(rngs, initializers.orthogonal(0.1), (d_aaa, C), axes=column_axes, sharding=sharding)
+        self.a1 = _param(rngs, initializers.zeros_init(), (C, d_aaa), axes=row_axes, sharding=sharding, dtype=param_dtype)
+        self.a2 = _param(rngs, initializers.orthogonal(0.1), (d_aaa, C), axes=column_axes, sharding=sharding, dtype=param_dtype)
 
         def a0_init(key, shape, dtype=jnp.float32):
             del key, shape
@@ -482,23 +506,24 @@ class NNXRWKV7TimeMix(nnx.Module):
             zigzag = zigzag * jnp.abs(zigzag)
             return (-0.19 + zigzag * 0.3 + linear * 0.4).reshape(1, 1, C).astype(dtype)
 
-        self.a0 = _param(rngs, a0_init, (1, 1, C), axes=hidden_axes, sharding=sharding)
+        self.a0 = _param(rngs, a0_init, (1, 1, C), axes=hidden_axes, sharding=sharding, dtype=param_dtype)
         d_gate = max(32, int(round((5.0 * math.sqrt(C)) / 32) * 32))
-        self.g1 = _param(rngs, initializers.zeros_init(), (C, d_gate), axes=row_axes, sharding=sharding)
-        self.g2 = _param(rngs, initializers.orthogonal(0.1), (d_gate, C), axes=column_axes, sharding=sharding)
+        self.g1 = _param(rngs, initializers.zeros_init(), (C, d_gate), axes=row_axes, sharding=sharding, dtype=param_dtype)
+        self.g2 = _param(rngs, initializers.orthogonal(0.1), (d_gate, C), axes=column_axes, sharding=sharding, dtype=param_dtype)
 
         def k_k_init(key, shape, dtype=jnp.float32):
             del key, shape
             linear = jnp.arange(C) / max(1, C - 1) - 0.5
             return (0.71 - linear * 0.1).reshape(1, 1, C).astype(dtype)
 
-        self.k_k = _param(rngs, k_k_init, (1, 1, C), axes=hidden_axes, sharding=sharding)
+        self.k_k = _param(rngs, k_k_init, (1, 1, C), axes=hidden_axes, sharding=sharding, dtype=param_dtype)
         self.k_a = _param(
             rngs,
             initializers.constant(1.02),
             (1, 1, C),
             axes=hidden_axes,
             sharding=sharding,
+            dtype=param_dtype,
         )
         vector_axes = (model,) if model else None
         self.ln_x = nnx.GroupNorm(
@@ -511,6 +536,7 @@ class NNXRWKV7TimeMix(nnx.Module):
                 sharding,
             ),
             bias_init=_partitioned_init(initializers.zeros_init(), vector_axes, sharding),
+            param_dtype=param_dtype,
             rngs=rngs,
         )
         self.r_k = _param(
@@ -519,6 +545,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             (H, N),
             axes=(model, None) if model else None,
             sharding=sharding,
+            dtype=param_dtype,
         )
         self.output = _linear(
             C,
@@ -528,6 +555,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             kernel_axes=column_axes,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
 
     def __call__(self, x, v_first, state=None):
@@ -667,6 +695,7 @@ class NNXRWKV7ChannelMix(nnx.Module):
         self.sharding = sharding
         C = config.d_model
         model = sharding.model_axis if sharding is not None else None
+        param_dtype = _dtype_from_name(config.param_dtype)
         ratio = 1.0 - (layer_idx / max(1, config.n_layers))
 
         def mix_init(key, shape, dtype=jnp.float32):
@@ -683,6 +712,7 @@ class NNXRWKV7ChannelMix(nnx.Module):
             (1, 1, C),
             axes=(model,) if model else None,
             sharding=sharding,
+            dtype=param_dtype,
         )
         d_ffn = _get_ffn_dim(config)
         self.key = _linear(
@@ -693,6 +723,7 @@ class NNXRWKV7ChannelMix(nnx.Module):
             kernel_axes=(model, None) if model else None,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
         self.value = _linear(
             d_ffn,
@@ -702,6 +733,7 @@ class NNXRWKV7ChannelMix(nnx.Module):
             kernel_axes=(None, model) if model else None,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
 
     def __call__(self, x, prev_x=None):
@@ -727,12 +759,30 @@ class NNXRWKV7Block(nnx.Module):
         self.layer_idx = layer_idx
         self.sharding = sharding
         self.ln0 = (
-            _layer_norm(config.d_model, epsilon=1e-5, rngs=rngs, sharding=sharding)
+            _layer_norm(
+                config.d_model,
+                epsilon=1e-5,
+                rngs=rngs,
+                sharding=sharding,
+                param_dtype=_dtype_from_name(config.param_dtype),
+            )
             if layer_idx == 0
             else nnx.data(None)
         )
-        self.ln1 = _layer_norm(config.d_model, epsilon=1e-5, rngs=rngs, sharding=sharding)
-        self.ln2 = _layer_norm(config.d_model, epsilon=1e-5, rngs=rngs, sharding=sharding)
+        self.ln1 = _layer_norm(
+            config.d_model,
+            epsilon=1e-5,
+            rngs=rngs,
+            sharding=sharding,
+            param_dtype=_dtype_from_name(config.param_dtype),
+        )
+        self.ln2 = _layer_norm(
+            config.d_model,
+            epsilon=1e-5,
+            rngs=rngs,
+            sharding=sharding,
+            param_dtype=_dtype_from_name(config.param_dtype),
+        )
         self.att = NNXRWKV7TimeMix(config, layer_idx, rngs=rngs, sharding=sharding)
         self.ffn = NNXRWKV7ChannelMix(config, layer_idx, rngs=rngs, sharding=sharding)
 
@@ -770,6 +820,7 @@ class NNXStateLevelScreening(nnx.Module):
         *,
         rngs: nnx.Rngs,
         sharding: NNXShardingConfig | None = None,
+        param_dtype=jnp.float32,
     ):
         self.config = config
         self.sharding = sharding
@@ -779,11 +830,11 @@ class NNXStateLevelScreening(nnx.Module):
         column = (None, model) if model else None
         vector = (model,) if model else None
         slot = (None, model) if model else None
-        self.q_proj_r = _linear(C, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding)
-        self.k_proj_r = _linear(config.d_slot, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding)
-        self.v_proj = _linear(config.d_slot, config.d_v, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding)
-        self.out_proj = _linear(config.d_v, C, use_bias=False, kernel_axes=column, rngs=rngs, sharding=sharding)
-        self.gate_proj = _linear(C, C, kernel_axes=row, rngs=rngs, sharding=sharding)
+        self.q_proj_r = _linear(C, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+        self.k_proj_r = _linear(config.d_slot, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+        self.v_proj = _linear(config.d_slot, config.d_v, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+        self.out_proj = _linear(config.d_v, C, use_bias=False, kernel_axes=column, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+        self.gate_proj = _linear(C, C, kernel_axes=row, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
         # Keep the portable concatenated kernel shape, but shard its d_slot
         # output. Sharding the concatenated input would make x/h/slot slices
         # cross device boundaries and introduce avoidable reshard collectives.
@@ -794,17 +845,18 @@ class NNXStateLevelScreening(nnx.Module):
             bias_axes=vector,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
-        self.screen_ln = _layer_norm(C, dtype=jnp.float32, rngs=rngs, sharding=sharding)
-        self.tau_r_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding)
+        self.screen_ln = _layer_norm(C, dtype=jnp.float32, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+        self.tau_r_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding, dtype=param_dtype)
         lambda_init = math.log(math.expm1(config.lambda_screen_init))
-        self.lambda_raw = _param(rngs, initializers.constant(lambda_init), (), sharding=sharding)
-        self.slot_embed = _param(rngs, initializers.normal(0.02), (config.n_slots, config.d_slot), axes=slot, sharding=sharding)
-        self.mu_by_bank_raw = _param(rngs, initializers.zeros_init(), (3,), sharding=sharding)
+        self.lambda_raw = _param(rngs, initializers.constant(lambda_init), (), sharding=sharding, dtype=param_dtype)
+        self.slot_embed = _param(rngs, initializers.normal(0.02), (config.n_slots, config.d_slot), axes=slot, sharding=sharding, dtype=param_dtype)
+        self.mu_by_bank_raw = _param(rngs, initializers.zeros_init(), (3,), sharding=sharding, dtype=param_dtype)
         if config.use_write_screening:
-            self.q_proj_w = _linear(2 * C, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding)
-            self.k_proj_w = _linear(config.d_slot, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding)
-            self.tau_w_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding)
+            self.q_proj_w = _linear(2 * C, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+            self.k_proj_w = _linear(config.d_slot, config.d_k, use_bias=False, kernel_axes=row, rngs=rngs, sharding=sharding, param_dtype=param_dtype)
+            self.tau_w_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding, dtype=param_dtype)
         else:
             self.q_proj_w = nnx.data(None)
             self.k_proj_w = nnx.data(None)
@@ -975,7 +1027,12 @@ class NNXScreenedRWKVLayer(nnx.Module):
             setattr(
                 self,
                 self._screening_name,
-                NNXStateLevelScreening(config.screening, rngs=rngs, sharding=sharding),
+                NNXStateLevelScreening(
+                    config.screening,
+                    rngs=rngs,
+                    sharding=sharding,
+                    param_dtype=_dtype_from_name(config.param_dtype),
+                ),
             )
 
     def __call__(
@@ -997,6 +1054,31 @@ class NNXScreenedRWKVLayer(nnx.Module):
         return h, v_first, new_rwkv_state, new_screen, stats
 
 
+def _call_screened_layer(
+    layer,
+    x,
+    v_first,
+    rwkv_state,
+    screen_state,
+    phase,
+    deterministic,
+):
+    return layer(
+        x,
+        v_first,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+        deterministic=deterministic,
+    )
+
+
+_remat_screened_layer = nnx.remat(
+    _call_screened_layer,
+    static_argnums=(5, 6),
+)
+
+
 class NNXScreenedRWKVModel(nnx.Module):
     """Complete NNX RWKV7M model with explicit parameter/activation sharding."""
 
@@ -1010,9 +1092,12 @@ class NNXScreenedRWKVModel(nnx.Module):
         self.config = config
         self.sharding = sharding
         model = sharding.model_axis if sharding is not None else None
+        param_dtype = _dtype_from_name(config.param_dtype)
         self.token_embedding = nnx.Embed(
             config.vocab_size,
             config.d_model,
+            dtype=_get_model_dtype(config),
+            param_dtype=param_dtype,
             embedding_init=_partitioned_init(
                 symmetric_uniform_init(1e-4),
                 (None, model) if model else None,
@@ -1032,7 +1117,11 @@ class NNXScreenedRWKVModel(nnx.Module):
                 ),
             )
         self.final_ln = _layer_norm(
-            config.d_model, epsilon=1e-5, rngs=rngs, sharding=sharding
+            config.d_model,
+            epsilon=1e-5,
+            rngs=rngs,
+            sharding=sharding,
+            param_dtype=param_dtype,
         )
         head_gain = (
             0.5 * math.sqrt(config.vocab_size / config.d_model)
@@ -1045,14 +1134,18 @@ class NNXScreenedRWKVModel(nnx.Module):
             head_init = initializers.variance_scaling(
                 head_gain * head_gain, "fan_in", "truncated_normal"
             )
+        head_axes = None
+        if model is not None:
+            head_axes = (None, model) if config.vocab_parallel else (model, None)
         self.lm_head = _linear(
             config.d_model,
             config.vocab_size,
             use_bias=False,
             kernel_init=head_init,
-            kernel_axes=(model, None) if model else None,
+            kernel_axes=head_axes,
             rngs=rngs,
             sharding=sharding,
+            param_dtype=param_dtype,
         )
 
     def __call__(
@@ -1098,13 +1191,17 @@ class NNXScreenedRWKVModel(nnx.Module):
                     usage_ema=jnp.zeros((batch_size, 1), dtype=jnp.float32),
                 )
             layer = getattr(self, f"layer_{layer_idx}")
-            x, v_first, new_rwkv, new_screen, stats = layer(
+            layer_call = (
+                _remat_screened_layer if cfg.remat_blocks else _call_screened_layer
+            )
+            x, v_first, new_rwkv, new_screen, stats = layer_call(
+                layer,
                 x,
                 v_first,
                 rwkv_state[layer_idx],
                 scr_state,
-                phase=phase,
-                deterministic=deterministic,
+                phase,
+                deterministic,
             )
             new_rwkv_layers[layer_idx] = new_rwkv
             if layer_idx in screened_idx:

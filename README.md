@@ -454,7 +454,7 @@ uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-record
 
 TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
 
-### 7B planning and the NNX scale path
+### Model-size presets and the NNX scale path
 
 The runtime, inference, training, distributed train/eval, optimizer, and
 checkpoint lifecycle now use Flax NNX. The former Linen model is retained only
@@ -465,6 +465,77 @@ read-write screening. The full NNX lifecycle covers topology-aware initializatio
 an Optax update, Orbax save/restore, a second update, and logical sharding
 metadata retention.
 
+Five canonical screening-enabled presets are available from the Python API,
+all relevant CLIs through `--model-preset`, and tracked JSON examples:
+
+| Preset | Exact parameters | Layers / width / FFN | Screening layers | Max context | Suggested model axis |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `0.185b` | 184,985,222 | 12 / 768 / 2,688 | 1 | 512 | 1 |
+| `0.3b` | 297,738,764 | 13 / 1,024 / 3,584 | 2 | 1,024 | 1 |
+| `1b` | 985,479,192 | 28 / 1,536 / 5,376 | 4 | 2,048 | 2 |
+| `3b` | 2,943,319,064 | 34 / 2,560 / 8,960 | 4 | 4,096 | 4 |
+| `7b` | 6,994,788,376 | 32 / 4,096 / 15,232 | 4 | 4,096 | 8 |
+
+The names are approximate scale labels; the exact values above come from the
+production NNX parameter tree. The model-axis values are starting points for
+planning, not HBM-fit guarantees. The 1B, 3B, and 7B presets enable
+vocabulary-parallel loss and therefore require an explicit model mesh axis in
+the distributed training CLI.
+
+```python
+import jax
+from rwkv7m import create_train_runtime, model_preset
+
+config = model_preset("0.3b")
+runtime, state = create_train_runtime(jax.random.key(0), config, batch_size=1)
+```
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-preset 1b `
+  --model-axis-size 2 `
+  --dtype-profile config
+
+uv run rwkv7m-train-binidx-dp `
+  --data-file data/corpus `
+  --model-preset 1b `
+  --ctx-len 2048 `
+  --global-batch-size 2 `
+  --gradient-accumulation-steps 2 `
+  --mesh-axis-names data model `
+  --mesh-axis-sizes 1 2 `
+  --param-axis-name model `
+  --steps 100 `
+  --checkpoint-backend orbax `
+  --output-dir out/rwkv7m-1b
+```
+
+Small and large models now use the same `ModelConfig` JSON contract and the
+same NNX implementation. `create_runtime`, `create_train_runtime`, and
+`train_binidx` accept a `ModelConfig`, a JSON-compatible mapping, or a path to
+that JSON. The planner and distributed CLI consume the identical artifact; the
+7B file is no longer a planner-only description. The canonical JSON examples
+are `configs/rwkv7m-0.185b.json.example`, `configs/rwkv7m-0.3b.json.example`,
+`configs/rwkv7m-1b.json.example`, `configs/rwkv7m-3b.json.example`, and
+`configs/rwkv7m-7b-tpu.json.example`. `configs/rwkv7m-small.json.example`
+remains a cheaper smoke-test configuration.
+
+For example, the tracked 7B candidate can be submitted through the same
+distributed entry point used for a tiny smoke model:
+
+```powershell
+uv run rwkv7m-train-binidx-dp `
+  --config configs/rwkv7m-7b-tpu-train.json.example
+```
+
+Edit the example's dataset paths and mesh sizes for the target TPU topology.
+Its model config enables BF16 parameter storage and compute, FP32 parameter
+updates/Adam moments/gradient accumulation, vocabulary-parallel logits and
+loss, block rematerialization, exact state-carrying sequence chunks, and
+microbatch gradient accumulation. Chunk boundaries do not stop gradients.
+These features are integrated and covered by small-model equivalence tests;
+the tracked 7B shape has not yet been executed end-to-end on TPU.
+
 Estimate parameter-related memory for the tracked 7B candidate without
 allocating its tensors:
 
@@ -472,7 +543,7 @@ allocating its tensors:
 uv run rwkv7m-plan-scale `
   --model-config configs/rwkv7m-7b-tpu.json.example `
   --model-axis-size 8 `
-  --dtype-profile memory
+  --dtype-profile config
 ```
 
 The estimate deliberately excludes activations, recurrent/screening runtime
@@ -499,7 +570,10 @@ $env:JAX_NUM_CPU_DEVICES="2"
 uv run rwkv7m-audit-nnx-model-parallel `
   --model-axis-size 2 `
   --screening `
-  --write-screening
+  --write-screening `
+  --vocab-parallel `
+  --remat-blocks `
+  --sequence-chunk-size 2
 ```
 
 The forced CPU run is a deterministic local contract test. A real TPU v5e
@@ -532,6 +606,8 @@ from rwkv7m import (
     create_runtime,
     create_train_runtime,
     generate_ids,
+    load_model_config,
+    model_preset,
     train_batch,
     train_binidx,
     tiny_config,
@@ -554,6 +630,12 @@ Lower-level modules:
 - Flax NNX runtime/training implementation, with Linen retained as the numerical
   and upstream-conversion reference.
 - Full-sequence training path with `jax.lax.scan` inside recurrent components.
+- One shared small/large `ModelConfig` contract across the public runtime,
+  trainer, distributed CLI, and scale planner.
+- BF16 parameter storage/compute with FP32 update, optimizer-state, and gradient
+  accumulation policies; exact sequence chunking, block rematerialization, and
+  microbatch gradient accumulation.
+- Vocabulary-parallel logits, cross entropy, and L2Wrap on an explicit model axis.
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
 - State-level screening with `read_screening_only` and `read_write` phases.
@@ -587,4 +669,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 126 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 optimizer dtype contracts, exact sequence-chunk and microbatch equivalence, vocabulary-parallel loss, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 134 tests.

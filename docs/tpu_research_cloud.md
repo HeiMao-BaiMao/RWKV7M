@@ -21,6 +21,25 @@ Record the exact JAX, jaxlib, Flax, Optax, Orbax, Python, backend, and device
 versions before a TPU run. Distributed `run_config.json` now includes this
 environment manifest automatically.
 
+## Model Presets
+
+The common NNX configuration registry exposes `0.185b`, `0.3b`, `1b`, `3b`,
+and `7b` through `model_preset()` and `--model-preset`. Their exact current
+parameter counts are 184,985,222; 297,738,764; 985,479,192; 2,943,319,064; and
+6,994,788,376 respectively. Suggested initial model-axis sizes are 1, 1, 2, 4,
+and 8. Always run the estimator for the allocated topology because these axis
+sizes do not account for activations or compiler temporaries.
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-preset 3b `
+  --model-axis-size 4 `
+  --dtype-profile config
+```
+
+The equivalent tracked JSON files live under `configs/`; the existing
+`rwkv7m-7b-tpu.json.example` is the canonical 7B JSON preset.
+
 ## 7B Preflight
 
 The tracked candidate is in `configs/rwkv7m-7b-tpu.json.example`. Count its
@@ -30,7 +49,7 @@ current abstract parameter tree and estimate parameter-related memory with:
 uv run rwkv7m-plan-scale `
   --model-config configs/rwkv7m-7b-tpu.json.example `
   --model-axis-size 8 `
-  --dtype-profile memory
+  --dtype-profile config
 ```
 
 The current implementation has 6,994,788,376 parameters for this config:
@@ -43,6 +62,21 @@ than a separately maintained formula. The memory estimate includes parameter
 storage, two Adam moments, FP32 accumulated gradients, and an update workspace.
 It excludes activations, RWKV/screening state, compiler temporaries, and
 collective buffers.
+
+The same model artifact is accepted by the public Python runtime, the scale
+planner, and both training CLIs. A complete distributed run example is tracked
+in `configs/rwkv7m-7b-tpu-train.json.example`:
+
+```powershell
+uv run rwkv7m-train-binidx-dp `
+  --config configs/rwkv7m-7b-tpu-train.json.example
+```
+
+The example uses an eight-way model axis, one sequence per microstep, eight
+microsteps per optimizer update, vocabulary-parallel loss, block rematerialization,
+and exact 256-token chunks. Replace its dataset paths and adapt its mesh to the
+allocated TPU topology. The shared code path is tested on small shapes, but this
+specific 7B launch remains an unexecuted preflight configuration.
 
 ## NNX Lifecycle Gate
 
@@ -71,7 +105,10 @@ $env:JAX_NUM_CPU_DEVICES="2"
 uv run rwkv7m-audit-nnx-model-parallel `
   --model-axis-size 2 `
   --screening `
-  --write-screening
+  --write-screening `
+  --vocab-parallel `
+  --remat-blocks `
+  --sequence-chunk-size 2
 ```
 
 This compiles the complete forward path, counts collectives in the compiled
@@ -203,6 +240,13 @@ Implemented:
   screening projections, norms, states, and LM head.
 - explicit output shardings for embedding gather, row/column linear operations,
   RWKV head reshapes, and screening delta projection.
+- a shared `ModelConfig` artifact for public APIs, small runs, the 7B planner,
+  and distributed training.
+- BF16 parameter storage/compute with explicit FP32 update, Adam-state, and
+  gradient-accumulation policies.
+- vocabulary-parallel logits, distributed cross entropy and L2Wrap, exact
+  state-carrying sequence chunks, block rematerialization, and microbatch
+  gradient accumulation.
 - activation placement `P("data", None, "model")`, RWKV state placement
   `P("data", "model", None, None)`, and screening slot placement
   `P("data", None, "model")` on the Phase 3 path.
@@ -229,7 +273,6 @@ Pending:
 
 - XProf profiling and throughput tuning on multi-device TPU, including the
   three observed all-to-all collectives.
-- vocabulary-sharded loss and distributed L2Wrap.
 - real TPU pod validation of full RWKV7M sharded runtime-state checkpoint/resume
   for carried recurrent/screening state.
 - real TPU pod validation of full RWKV7M Orbax checkpoint save/resume under

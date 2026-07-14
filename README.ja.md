@@ -578,6 +578,7 @@ uv run rwkv7m-train-binidx-dp `
 
 | option | 説明 |
 | --- | --- |
+| `--model-preset` | `0.185b`、`0.3b`、`1b`、`3b`、`7b`から共通NNX model設定を選びます。`--model-config`とは同時指定できません。 |
 | `--global-batch-size` | 全process合計のbatch sizeです。分散runでは `--batch-size` ではなくこちらを使います。 |
 | `--sampling-mode` | `magic` または `sequential` です。`--carry-state` を使う場合は `sequential` が必要です。 |
 | `--carry-state` | 分散train/eval step間でstateを持ち越します。validation は評価用 state を別に進め、lane wrap 境界では state をリセットします。分散ローカルrunでは runtime state も checkpoint/resume されます。実TPU podでのsharded runtime-state checkpoint/resume検証はまだ未完了です。 |
@@ -611,7 +612,7 @@ uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-record
 
 TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md) にあります。
 
-### 7B見積りとNNX scale経路
+### Model size presetとNNX scale経路
 
 runtime、inference、training、distributed train/eval、optimizer、checkpoint
 lifecycleはFlax NNXへ移行しました。旧Linen modelは数値検証とupstream互換性確認の
@@ -620,13 +621,80 @@ referenceとしてのみ残します。全parameter pathを厳密に照合する
 gradient parityを検証します。NNX lifecycleではtopology-aware init、Optax update、
 Orbax save/restore、restore後step、logical sharding metadata維持までを対象にします。
 
+screeningを有効にしたcanonical presetを5種類用意しています。Python API、関連CLIの
+`--model-preset`、tracked JSON exampleから同じ設定を取得できます。
+
+| Preset | 正確なparameter数 | Layers / width / FFN | Screening layers | 最大context | 推奨model axis |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `0.185b` | 184,985,222 | 12 / 768 / 2,688 | 1 | 512 | 1 |
+| `0.3b` | 297,738,764 | 13 / 1,024 / 3,584 | 2 | 1,024 | 1 |
+| `1b` | 985,479,192 | 28 / 1,536 / 5,376 | 4 | 2,048 | 2 |
+| `3b` | 2,943,319,064 | 34 / 2,560 / 8,960 | 4 | 4,096 | 4 |
+| `7b` | 6,994,788,376 | 32 / 4,096 / 15,232 | 4 | 4,096 | 8 |
+
+preset名は概算scale labelであり、正確な値はproduction NNX parameter treeから算出して
+います。model axis値は計画開始時の目安で、HBMへ収まる保証ではありません。1B、3B、
+7Bはvocabulary-parallel lossを有効にするため、distributed training CLIでは明示的な
+model mesh axisが必要です。
+
+```python
+import jax
+from rwkv7m import create_train_runtime, model_preset
+
+config = model_preset("0.3b")
+runtime, state = create_train_runtime(jax.random.key(0), config, batch_size=1)
+```
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-preset 1b `
+  --model-axis-size 2 `
+  --dtype-profile config
+
+uv run rwkv7m-train-binidx-dp `
+  --data-file data/corpus `
+  --model-preset 1b `
+  --ctx-len 2048 `
+  --global-batch-size 2 `
+  --gradient-accumulation-steps 2 `
+  --mesh-axis-names data model `
+  --mesh-axis-sizes 1 2 `
+  --param-axis-name model `
+  --steps 100 `
+  --checkpoint-backend orbax `
+  --output-dir out/rwkv7m-1b
+```
+
+小型モデルと大型モデルは、同じ`ModelConfig` JSON契約と同じNNX実装を使います。
+`create_runtime`、`create_train_runtime`、`train_binidx`は`ModelConfig`、JSON互換mapping、
+または同じJSONファイルへのpathを受け取ります。scale plannerとdistributed CLIも
+同一artifactを読み込むため、7B configは見積り専用ではありません。canonical JSONは
+`configs/rwkv7m-0.185b.json.example`、`configs/rwkv7m-0.3b.json.example`、
+`configs/rwkv7m-1b.json.example`、`configs/rwkv7m-3b.json.example`、
+`configs/rwkv7m-7b-tpu.json.example`です。`configs/rwkv7m-small.json.example`は、
+より低コストなsmoke test用として残します。
+
+tracked 7B候補も、小型smoke modelと同じdistributed entry pointから起動できます。
+
+```powershell
+uv run rwkv7m-train-binidx-dp `
+  --config configs/rwkv7m-7b-tpu-train.json.example
+```
+
+実行前にexample内のdataset pathとmesh sizeを対象TPU topologyへ合わせてください。
+このmodel configはBF16 parameter storage/compute、FP32 parameter update・Adam moment・
+gradient accumulation、vocabulary-parallel logits/loss、block rematerialization、stateを
+正確に引き継ぐsequence chunk、microbatch gradient accumulationを有効にします。
+chunk境界でgradientは切りません。これらは小型モデルでequivalence test済みですが、
+tracked 7B shapeのTPU end-to-end実行はまだ未検証です。
+
 tracked 7B候補のtensorを実体化せず、parameter関連memoryを見積もるには:
 
 ```powershell
 uv run rwkv7m-plan-scale `
   --model-config configs/rwkv7m-7b-tpu.json.example `
   --model-axis-size 8 `
-  --dtype-profile memory
+  --dtype-profile config
 ```
 
 この値にはactivation、RWKV/screening runtime state、compiler一時領域、collective
@@ -651,7 +719,10 @@ $env:JAX_NUM_CPU_DEVICES="2"
 uv run rwkv7m-audit-nnx-model-parallel `
   --model-axis-size 2 `
   --screening `
-  --write-screening
+  --write-screening `
+  --vocab-parallel `
+  --remat-blocks `
+  --sequence-chunk-size 2
 ```
 
 強制2 CPU実行はlocalで再現可能な契約試験です。2026-07-14には実TPU v5e
@@ -700,6 +771,8 @@ from rwkv7m import (
     create_runtime,
     create_train_runtime,
     generate_ids,
+    load_model_config,
+    model_preset,
     train_batch,
     train_binidx,
     tiny_config,
@@ -717,6 +790,10 @@ from rwkv7m import (
 
 - Flax NNX runtime/training実装。Linenは数値比較とupstream変換のreferenceとして維持。
 - recurrent component 内の `jax.lax.scan` による full-sequence training path。
+- public runtime、trainer、distributed CLI、scale plannerで共通の小型/大型`ModelConfig`契約。
+- BF16 parameter storage/compute、FP32 update・optimizer state・gradient accumulation、
+  exact sequence chunking、block rematerialization、microbatch gradient accumulation。
+- explicit model axis上のvocabulary-parallel logits、cross entropy、L2Wrap。
 - RWKV-LM-V7 互換 `.bin/.idx` dataset reader と sampler。
 - reference RWKV state の chunked inference state carry。
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
@@ -750,4 +827,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、NNX public inference/training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、full-model Linen/NNX forward・gradient parity、screening algebra/gradient parity、7B abstract memory planning、NNX Orbax lifecycleが含まれます。現時点の full suite は126 testsです。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、NNX public inference/training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、full-model Linen/NNX forward・gradient parity、screening algebra/gradient parity、5種類すべてのpreset parameter数とJSON契約、BF16/FP32 optimizer dtype契約、exact sequence chunkとmicrobatchのequivalence、vocabulary-parallel loss、7B abstract memory planning、NNX Orbax lifecycleが含まれます。現時点のfull suiteは134 testsです。

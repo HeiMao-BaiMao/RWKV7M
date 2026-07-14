@@ -17,6 +17,13 @@ from .nnx_conversion import (
     load_linen_params_into_nnx,
     nnx_params_to_linen,
 )
+from .presets import (
+    MODEL_PRESET_NAMES,
+    MODEL_PRESET_PARAMETER_COUNTS,
+    MODEL_PRESET_RECOMMENDED_MODEL_AXIS_SIZES,
+    canonical_model_preset_name,
+    model_preset,
+)
 
 __all__ = [
     "LayerRWKVState",
@@ -45,4 +52,9 @@ __all__ = [
     "assert_nnx_linen_parameter_contract",
     "load_linen_params_into_nnx",
     "nnx_params_to_linen",
+    "MODEL_PRESET_NAMES",
+    "MODEL_PRESET_PARAMETER_COUNTS",
+    "MODEL_PRESET_RECOMMENDED_MODEL_AXIS_SIZES",
+    "canonical_model_preset_name",
+    "model_preset",
 ]

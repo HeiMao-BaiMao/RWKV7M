@@ -90,6 +90,16 @@ def test_compute_batch_layout_validates_divisibility():
     assert layout.process_batch_size == 4
     assert layout.per_device_batch_size == 2
 
+    model_parallel_layout = compute_batch_layout(
+        1,
+        process_count=1,
+        local_device_count=4,
+        local_data_shard_count=1,
+    )
+    assert model_parallel_layout.process_batch_size == 1
+    assert model_parallel_layout.per_device_batch_size == 1
+    assert model_parallel_layout.local_data_shard_count == 1
+
     with pytest.raises(ValueError):
         compute_batch_layout(7, process_count=2, local_device_count=1)
 

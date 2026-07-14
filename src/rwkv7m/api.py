@@ -18,6 +18,7 @@ from .model.nnx_model import (
 from .model.nnx_conversion import load_linen_params_into_nnx
 from .model.state import init_screen_state
 from .tokenizer import RWKVTokenizer
+from .io.config import load_model_config
 from .train.train_step import train_step
 from .train.nnx_train import initialize_nnx_train_state
 
@@ -36,11 +37,12 @@ class RWKV7MRuntime:
 
 def create_runtime(
     rng_key,
-    config: ModelConfig,
+    config,
     *,
     batch_size: int = 1,
     sharding: NNXShardingConfig | None = None,
 ) -> RWKV7MRuntime:
+    config = load_model_config(config)
     model = initialize_nnx_model(rng_key, config, sharding=sharding)
     variables = {"params": nnx.state(model, nnx.Param)}
     rwkv_state = init_rwkv_state(batch_size, config)
@@ -59,12 +61,13 @@ def create_runtime(
 
 def create_train_runtime(
     rng_key,
-    config: ModelConfig,
+    config,
     *,
     batch_size: int,
     total_steps: int = 10000,
     sharding: NNXShardingConfig | None = None,
 ):
+    config = load_model_config(config)
     _, init_key = jax.random.split(rng_key)
     train_state = initialize_nnx_train_state(
         init_key,
@@ -188,6 +191,7 @@ def train_batch(
     *,
     phase="read_screening_only",
     carry_state: bool = False,
+    gradient_accumulation_steps: int = 1,
 ):
     if carry_state:
         rwkv_state = runtime.rwkv_state
@@ -207,6 +211,7 @@ def train_batch(
         rwkv_state,
         screen_state,
         phase=phase,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
     if carry_state:
         runtime.rwkv_state = rwkv_state
@@ -228,6 +233,7 @@ def train_binidx(
     carry_state: bool = False,
     sampling_mode: str = "magic",
     print_every: int | None = None,
+    gradient_accumulation_steps: int = 1,
 ):
     if carry_state and sampling_mode != "sequential":
         raise ValueError("carry_state training requires sampling_mode='sequential'")
@@ -258,6 +264,7 @@ def train_binidx(
                 runtime,
                 phase=phase,
                 carry_state=carry_state,
+                gradient_accumulation_steps=gradient_accumulation_steps,
             )
             loss = float(metrics["loss"])
             losses.append(loss)

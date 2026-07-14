@@ -4,7 +4,11 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from rwkv7m import load_train_checkpoint_metadata
+from rwkv7m import (
+    load_train_checkpoint_metadata,
+    model_config_to_dict,
+    tiny_config,
+)
 from rwkv7m.cli.train_binidx_distributed import parse_args, run_distributed_training
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 from rwkv7m.distributed import load_distributed_checkpoint_metadata
@@ -458,3 +462,46 @@ def test_distributed_binidx_training_cli_orbax_accepts_relative_output_dir(
 
     assert int(resumed.train_state.step) == 2
     assert resumed_checkpoint == Path(output_dir) / "ckpt-00000002"
+
+
+def test_distributed_cli_uses_shared_model_config_and_microbatches(tmp_path):
+    prefix = write_dp_train_data(tmp_path)
+    config = tiny_config(
+        vocab_size=32,
+        d_model=16,
+        n_layers=1,
+        n_heads=2,
+        head_size=8,
+        use_screening=False,
+    )
+    config.lm_head_init = "variance_scaled"
+    config.sequence_chunk_size = 2
+    config.remat_blocks = True
+    config_path = tmp_path / "model.json"
+    config_path.write_text(
+        json.dumps(model_config_to_dict(config)),
+        encoding="utf-8",
+    )
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--model-config",
+            str(config_path),
+            "--ctx-len",
+            "4",
+            "--global-batch-size",
+            "2",
+            "--gradient-accumulation-steps",
+            "2",
+            "--steps",
+            "1",
+            "--print-every",
+            "0",
+        ]
+    )
+
+    dist, _ = run_distributed_training(args)
+
+    assert int(dist.train_state.step) == 1
+    assert dist.train_state.model.config == config

@@ -1,8 +1,8 @@
 {
-  "d_model": 4096,
-  "d_ffn": 15232,
-  "n_layers": 32,
-  "n_heads": 64,
+  "d_model": 2560,
+  "d_ffn": 8960,
+  "n_layers": 34,
+  "n_heads": 40,
   "head_size": 64,
   "vocab_size": 65536,
   "max_seq_len": 4096,
@@ -17,12 +17,12 @@
   "sequence_chunk_size": 256,
   "use_screening": true,
   "screening": {
-    "d_model": 4096,
-    "d_slot": 1024,
+    "d_model": 2560,
+    "d_slot": 640,
     "d_k": 128,
-    "d_v": 512,
+    "d_v": 320,
     "n_slots": 16,
-    "screened_layers": [7, 15, 23, 31],
+    "screened_layers": [7, 15, 23, 33],
     "bank_ids": [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2],
     "use_write_screening": true
   }

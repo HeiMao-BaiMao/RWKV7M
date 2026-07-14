@@ -10,6 +10,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from ..api import create_train_runtime, tiny_config
+from ..io import load_model_config
 from ..distributed import (
     audit_lowered_collectives,
     initialize_jax_distributed,
@@ -19,6 +20,7 @@ from ..distributed import (
     train_global_batch_data_parallel,
 )
 from ..model.nnx_model import NNXShardingConfig
+from ..model import MODEL_PRESET_NAMES, model_preset
 
 
 def parse_args(argv=None):
@@ -29,6 +31,11 @@ def parse_args(argv=None):
         )
     )
     parser.add_argument("--model-axis-size", type=int, default=None)
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument("--model-config", default=None)
+    model_source.add_argument(
+        "--model-preset", choices=MODEL_PRESET_NAMES, default=None
+    )
     parser.add_argument("--d-model", type=int, default=16)
     parser.add_argument("--n-heads", type=int, default=2)
     parser.add_argument("--head-size", type=int, default=8)
@@ -36,6 +43,9 @@ def parse_args(argv=None):
     parser.add_argument("--vocab-size", type=int, default=32)
     parser.add_argument("--screening", action="store_true")
     parser.add_argument("--write-screening", action="store_true")
+    parser.add_argument("--vocab-parallel", action="store_true")
+    parser.add_argument("--remat-blocks", action="store_true")
+    parser.add_argument("--sequence-chunk-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args(argv)
 
@@ -65,11 +75,28 @@ def run_audit(args):
         raise ValueError(
             "model-axis-size must be positive and divide the global device count"
         )
-    if args.d_model != args.n_heads * args.head_size:
+    if (
+        args.model_config is None
+        and args.model_preset is None
+        and args.d_model != args.n_heads * args.head_size
+    ):
         raise ValueError("d-model must equal n-heads * head-size")
+    if args.model_config is not None:
+        config = load_model_config(args.model_config)
+    elif args.model_preset is not None:
+        config = model_preset(args.model_preset)
+    else:
+        config = tiny_config(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_layers=2 if args.screening else 1,
+            n_heads=args.n_heads,
+            head_size=args.head_size,
+            use_screening=args.screening,
+        )
     for name, value in (
-        ("d-model", args.d_model),
-        ("n-heads", args.n_heads),
+        ("d-model", config.d_model),
+        ("n-heads", config.n_heads),
     ):
         if value % model_axis_size != 0:
             raise ValueError(f"{name} must be divisible by model-axis-size")
@@ -83,18 +110,22 @@ def run_audit(args):
             jax.sharding.AxisType.Explicit,
         ),
     )
-    config = tiny_config(
-        vocab_size=args.vocab_size,
-        d_model=args.d_model,
-        n_layers=2 if args.screening else 1,
-        n_heads=args.n_heads,
-        head_size=args.head_size,
-        use_screening=args.screening,
-    )
-    config.lm_head_init = "variance_scaled"
-    config.screening.use_write_screening = args.write_screening
-    if args.screening and config.screening.d_slot % model_axis_size != 0:
+    if args.model_config is None and args.model_preset is None:
+        config.lm_head_init = "variance_scaled"
+        config.screening.use_write_screening = args.write_screening
+        config.vocab_parallel = args.vocab_parallel
+        config.remat_blocks = args.remat_blocks
+        config.sequence_chunk_size = args.sequence_chunk_size
+    if args.ctx_len > config.max_seq_len:
+        raise ValueError("ctx-len exceeds model max_seq_len")
+    if (
+        config.use_screening
+        and config.screening.screened_layers
+        and config.screening.d_slot % model_axis_size != 0
+    ):
         raise ValueError("screening d_slot must be divisible by model-axis-size")
+    if config.vocab_parallel and config.vocab_size % model_axis_size != 0:
+        raise ValueError("vocab_size must be divisible by model-axis-size")
 
     sharding = NNXShardingConfig(mesh)
     runtime, train_state = create_train_runtime(

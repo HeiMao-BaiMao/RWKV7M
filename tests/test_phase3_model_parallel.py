@@ -33,6 +33,10 @@ def test_full_nnx_model_parallel_path_on_two_cpu_devices():
             "2",
             "--screening",
             "--write-screening",
+            "--vocab-parallel",
+            "--remat-blocks",
+            "--sequence-chunk-size",
+            "2",
         ],
         cwd=Path(__file__).resolve().parents[1],
         env=env,
@@ -62,6 +66,12 @@ def test_full_nnx_model_parallel_path_on_two_cpu_devices():
     )
     assert report["states"]["screening_slots"]["sharding"] == (
         "P('data', None, 'model')"
+    )
+    assert report["states"]["logits"]["sharding"] == (
+        "P('data', None, 'model')"
+    )
+    assert report["parameters"]["lm_head/kernel"]["sharding"] == (
+        "P(None, 'model')"
     )
     assert report["parameters"]["token_embedding/embedding"]["sharding"] == (
         "P(None, 'model')"

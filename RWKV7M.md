@@ -45,11 +45,18 @@ Implemented:
     complete-model forward/backward/optimizer step, plus a separate-process
     small NNX Orbax lifecycle probe.
 16. Installable library API: `from rwkv7m import ...`.
+17. Shared `0.185b`, `0.3b`, `1b`, `3b`, and `7b` `ModelConfig` presets used by
+    public runtime/training APIs, evaluation and benchmark CLIs, distributed
+    training, and the scale planner, with exact NNX-tree parameter-count tests.
+18. BF16/FP32 dtype policies, vocabulary-parallel loss and L2Wrap, block
+    rematerialization, exact sequence chunking, and microbatch accumulation in
+    the NNX training path.
 
 Important limitation:
 
-The current code is a JAX/Flax NNX research path with real-TPU functional
-coverage for a small model, not a production-scale 7B trainer. It is suitable
+The current code is a unified JAX/Flax NNX small-to-7B training path with
+real-TPU functional coverage for a small model, not a TPU-validated
+production-scale 7B trainer. It is suitable
 for correctness testing, small experiments, portable artifact validation, and
 distributed smoke tests. It does not yet provide production fused RWKV kernels,
 pretrained RWKV checkpoint conversion, XProf-tuned TPU sharding, full RWKV7M

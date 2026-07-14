@@ -83,6 +83,10 @@ the upstream `small` profile: L12-D768, FFN 2688, vocabulary 65,536, context
 length 512, BF16, and global batch 1. State-level screening used 16 slots with
 the read/write phase enabled on layer 6. The resulting model contained
 184,985,222 trainable parameters (approximately 0.185B).
+This architecture is now the canonical `model_preset("0.185b")` and
+`configs/rwkv7m-0.185b.json.example` shape. The newer NNX remat/chunk execution
+options still require a post-integration CUDA rerun before being described as
+part of this historical validation record.
 
 One optimizer step was run from initialization, then the Orbax train-state
 checkpoint was restored and training continued through steps 2 and 3. The loss

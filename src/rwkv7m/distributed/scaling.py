@@ -2,9 +2,10 @@ from dataclasses import asdict, dataclass
 import math
 
 import jax
-from flax.traverse_util import flatten_dict
+from flax import nnx
 
-from ..model.screened_rwkv import ModelConfig, create_model_variables
+from ..model.screened_rwkv import ModelConfig
+from ..model.nnx_model import NNXScreenedRWKVModel
 
 
 _DTYPE_BYTES = {
@@ -32,6 +33,16 @@ class DTypePolicy:
     @classmethod
     def memory(cls):
         return cls(param_storage_dtype="bfloat16")
+
+    @classmethod
+    def from_config(cls, config: ModelConfig):
+        return cls(
+            param_storage_dtype=config.param_dtype,
+            param_update_dtype=config.param_update_dtype,
+            compute_dtype=config.dtype,
+            optimizer_state_dtype=config.optimizer_state_dtype,
+            gradient_accum_dtype=config.gradient_accum_dtype,
+        )
 
     def __post_init__(self):
         for value in asdict(self).values():
@@ -70,16 +81,18 @@ class TrainingMemoryEstimate:
 
 
 def abstract_parameter_summary(config: ModelConfig) -> ParameterSummary:
-    """Count current model parameters without materializing their arrays."""
+    """Count the production NNX model without materializing its arrays."""
 
-    variables = jax.eval_shape(
-        lambda key: create_model_variables(key, config, batch_size=1)[0],
-        jax.random.PRNGKey(0),
+    model = nnx.eval_shape(
+        lambda: NNXScreenedRWKVModel(
+            config,
+            rngs=nnx.Rngs(params=jax.random.key(0)),
+        )
     )
-    flat_params = flatten_dict(variables["params"])
     core = 0
     screening = 0
-    for path, value in flat_params.items():
+    for path, variable in nnx.to_flat_state(nnx.state(model, nnx.Param)):
+        value = variable.get_value()
         count = math.prod(value.shape)
         if any(str(part).startswith("screening_") for part in path):
             screening += count

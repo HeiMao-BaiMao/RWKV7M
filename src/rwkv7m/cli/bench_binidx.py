@@ -1,11 +1,18 @@
 import argparse
+import copy
 import time
 
 import jax
 
 from ..api import create_train_runtime, train_batch
 from ..data import create_binidx_dataset
-from ..model import ModelConfig, ScreeningConfig
+from ..io import load_model_config
+from ..model import (
+    MODEL_PRESET_NAMES,
+    ModelConfig,
+    ScreeningConfig,
+    model_preset,
+)
 from .config import parse_args_with_config
 
 
@@ -21,6 +28,20 @@ def default_bank_ids(n_slots):
 
 def build_config(args, variant):
     use_screening = variant != "baseline"
+    if args.model_config is not None or args.model_preset is not None:
+        config = copy.deepcopy(
+            load_model_config(args.model_config)
+            if args.model_config is not None
+            else model_preset(args.model_preset)
+        )
+        if args.ctx_len > config.max_seq_len:
+            raise ValueError(
+                f"ctx_len={args.ctx_len} exceeds model max_seq_len={config.max_seq_len}"
+            )
+        config.use_screening = use_screening
+        if use_screening:
+            config.screening.use_write_screening = variant == "read_write"
+        return config
     screening = ScreeningConfig()
     if use_screening:
         screened_layers = tuple(args.screened_layers)
@@ -98,6 +119,11 @@ def run_variant(args, variant):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Train small rwkv7m variants on a binidx file.")
     parser.add_argument("--data-file", required=True)
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument("--model-config", default=None)
+    model_source.add_argument(
+        "--model-preset", choices=MODEL_PRESET_NAMES, default=None
+    )
     parser.add_argument("--ctx-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=5)
