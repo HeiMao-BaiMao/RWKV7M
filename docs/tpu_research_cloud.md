@@ -6,9 +6,10 @@ implementation is frozen as the numerical and upstream-conversion reference.
 
 Phase 3 now provides an executable Explicit model-parallel path and post-SPMD
 HLO collective audit. Its small complete-model path has been functionally
-validated on a four-device TPU v5e slice. Still pending: XProf-based collective
-tuning, full RWKV7M train/runtime-state checkpoint validation on TPU pods, and
-production-scale throughput tuning.
+validated on a four-device TPU v5e slice, and the `0.185b` and `1b` presets have
+completed single-host v5e throughput runs. Still pending: XProf-based collective
+tuning, full RWKV7M train/runtime-state checkpoint validation on TPU pods, 7B
+and multi-host execution, and production-scale throughput tuning.
 
 ## Install
 
@@ -146,6 +147,87 @@ NNX/Optax/Orbax lifecycle only. It does not validate the full RWKV7M distributed
 train-state checkpoint, carried recurrent/screening runtime-state checkpoint,
 a 7B model, or multi-host TPU execution.
 
+## Single-Host TPU v5e Performance Record
+
+A performance pass was run later on 2026-07-14 at commit
+`9faf9aa8e6c7db51a5e6fd4d39d586c835c71146`. It used a temporary single-host
+`v5litepod-4` in `us-west4-a`, with four TPU v5e devices. The environment was
+Python 3.13.14, JAX/jaxlib 0.10.0, Flax 0.12.7, Optax 0.2.8,
+Orbax-checkpoint 0.11.39, and libtpu 0.0.40. Transparent huge pages were enabled
+before measurement to reduce TPU runtime startup and shutdown overhead.
+
+The input was a synthetic RWKV-compatible binidx file containing 4,194,304
+tokens. It removes storage and network variability but does not provide a model
+quality result. Preset runs kept the tracked dtype, rematerialization, sequence
+chunking, vocabulary-parallel, and screening settings unchanged. The
+no-screening comparison used the same L12-D768-FFN2688 core dimensions as the
+`0.185b` preset.
+
+The distributed CLI starts each step timer after yielding the prefetched global
+batch and stops it only after blocking on the complete updated model and
+optimizer state. The first step was excluded because it includes XLA
+compilation. `Measured steps` below therefore counts steps after step 1. The
+mean includes every post-compilation stall; the median shows the normal steady
+step more clearly.
+
+The main 30-step measurement used:
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/home/rumia/jax_cache \
+  uv run rwkv7m-train-binidx-dp \
+  --data-file data/bench/synthetic \
+  --model-preset 0.185b \
+  --ctx-len 512 \
+  --global-batch-size 4 \
+  --steps 30 \
+  --phase read_write \
+  --mesh-axis-names data \
+  --mesh-axis-sizes 4 \
+  --prefetch-size 2
+```
+
+| Model and phase | Context | Global batch | Mesh | Measured steps | Median token/s | Mean token/s |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 0.185B core dimensions, no screening | 512 | 4 | `data=4` | 11 | 18,680 | 18,611 |
+| `0.185b`, read-only screening | 512 | 4 | `data=4` | 11 | 13,021 | 12,315 |
+| `0.185b`, read/write screening | 512 | 4 | `data=4` | 29 | 11,931 | 11,510 |
+| `0.185b`, read/write screening | 512 | 4 | `data=1, model=4` | 11 | 8,812 | 8,811 |
+| `0.185b`, read/write screening | 512 | 1 | `data=1, model=4` | 7 | 4,909 | 4,911 |
+| `1b`, read/write screening | 256 | 1 | `data=1, model=4` | 5 | 879 | 786 |
+| `1b`, read/write screening | 256 | 4 | `data=1, model=4` | 5 | 2,397 | 2,249 |
+
+Main findings:
+
+- The 30-step `0.185b` data-parallel run had 29 post-compilation observations.
+  Twenty-seven formed a narrow 11,858-11,963 token/s band, while two isolated
+  stalls reached 6,694 and 5,170 token/s. The mean of the non-stall observations
+  was 11,923 token/s.
+- At global batch 4, replicating the `0.185b` model over `data=4` was 1.35 times
+  faster by median than four-way model sharding. The model fits on each device,
+  so model-sharding communication was not throughput-justified in this test.
+- Relative to the no-screening median, read-only screening reduced throughput
+  by 30.3%. Enabling writes reduced the read-only result by a further 8.4%; the
+  complete read/write path was 36.1% below the no-screening core.
+- Increasing the model-sharded `1b` run from global batch 1 to 4 improved median
+  throughput by 2.73 times. Both configurations fit in v5e HBM and completed
+  finite forward, backward, and optimizer updates.
+- The current small-model audit with vocabulary parallelism, rematerialization,
+  and sequence chunking enabled reported 15 forward collectives: 12 all-reduces,
+  3 all-to-alls, and no all-gathers. This is a different compile configuration
+  from the earlier 16-collective functional record above.
+- No OOM, TPU runtime restart, or hardware health error was observed. Cloud
+  Monitoring agent errors occurred near the test window, but no causal link to
+  the isolated slow steps was established.
+
+These results establish useful single-host v5e execution for the current
+`0.185b` and `1b` paths. They do not establish multi-host scaling, 7B fit or
+throughput, controlled run-to-run variance, power or cost efficiency, or
+XProf-guided collective efficiency.
+
+The temporary node `rwkv7m-bench-260714-9faf9aa` was deleted after the run. The
+delete operation completed successfully, and the target name was absent from
+all four zones in which allocation had been attempted.
+
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
 
 ```powershell
@@ -254,6 +336,8 @@ Implemented:
   forward/backward/optimizer regression test.
 - real four-device TPU v5e functional validation of the small complete-model
   Phase 3 forward/backward/optimizer path and its compiled collective audit.
+- real single-host TPU v5e throughput measurements for the `0.185b` and `1b`
+  presets, including data/model mesh and screening-phase comparisons.
 - real TPU validation of the independent small NNX Orbax lifecycle probe across
   separate create/restore processes.
 - process-aware host binidx sampling.
@@ -271,7 +355,7 @@ Implemented:
 
 Pending:
 
-- XProf profiling and throughput tuning on multi-device TPU, including the
+- XProf profiling and further throughput tuning on multi-device TPU, including the
   three observed all-to-all collectives.
 - real TPU pod validation of full RWKV7M sharded runtime-state checkpoint/resume
   for carried recurrent/screening state.
