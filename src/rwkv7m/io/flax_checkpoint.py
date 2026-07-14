@@ -2,11 +2,12 @@ import json
 from pathlib import Path
 
 import jax.numpy as jnp
-from flax import serialization
+from flax import nnx, serialization
 
 from ..model import ModelConfig
 from .config import model_config_from_dict, model_config_to_dict
 from .safetensors import save_model_safetensors
+from ..train.nnx_train import NNXTrainState
 
 
 CHECKPOINT_JSON = "checkpoint.json"
@@ -35,7 +36,14 @@ def save_train_checkpoint(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     state_path = checkpoint_dir / TRAIN_STATE_MSGPACK
-    state_path.write_bytes(serialization.to_bytes(train_state))
+    serializable_state = (
+        nnx.to_pure_dict(
+            nnx.state((train_state.model, train_state.optimizer))
+        )
+        if isinstance(train_state, NNXTrainState)
+        else train_state
+    )
+    state_path.write_bytes(serialization.to_bytes(serializable_state))
     if runtime_state is not None:
         runtime_state_path = checkpoint_dir / RUNTIME_STATE_MSGPACK
         runtime_state_path.write_bytes(serialization.to_bytes(runtime_state))
@@ -76,7 +84,19 @@ def load_train_checkpoint(checkpoint_dir, train_state_template):
     checkpoint_dir = Path(checkpoint_dir)
     config, payload = load_train_checkpoint_metadata(checkpoint_dir)
     state_bytes = (checkpoint_dir / TRAIN_STATE_MSGPACK).read_bytes()
-    train_state = serialization.from_bytes(train_state_template, state_bytes)
+    if isinstance(train_state_template, NNXTrainState):
+        target = nnx.state(
+            (train_state_template.model, train_state_template.optimizer)
+        )
+        pure_target = nnx.to_pure_dict(target)
+        restored = serialization.from_bytes(pure_target, state_bytes)
+        nnx.replace_by_pure_dict(target, restored)
+        nnx.update(
+            (train_state_template.model, train_state_template.optimizer), target
+        )
+        train_state = train_state_template
+    else:
+        train_state = serialization.from_bytes(train_state_template, state_bytes)
     return train_state, config, payload
 
 

@@ -2,9 +2,11 @@ from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from ..model.screened_rwkv import cross_entropy_loss
 from ..train.train_step import train_step
+from ..train.nnx_train import NNXTrainState
 from .metrics import aggregate_metrics
 from .sharding import host_batch_to_global_arrays
 
@@ -65,7 +67,7 @@ def train_batch_data_parallel(
 
 
 @jax.jit(static_argnames=["phase"])
-def eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
+def _linen_eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
     logits, new_rwkv_state, new_screen_state, stats = train_state.apply_fn(
         {"params": train_state.params},
         batch["input_ids"],
@@ -83,6 +85,50 @@ def eval_step_data_parallel(train_state, batch, rwkv_state, screen_state, phase=
         "rel_write_mean": stats.get("rel_write_mean", jnp.zeros(())),
         "rel_write_effective_mean": stats.get("rel_write_effective_mean", jnp.zeros(())),
     }, new_rwkv_state, new_screen_state
+
+
+@nnx.jit(static_argnames=("phase",))
+def _nnx_eval_step_data_parallel(
+    model, batch, rwkv_state, screen_state, phase="read_screening_only"
+):
+    logits, new_rwkv_state, new_screen_state, stats = model(
+        batch["input_ids"],
+        rwkv_state,
+        screen_state,
+        phase=phase,
+        deterministic=True,
+    )
+    loss = cross_entropy_loss(logits, batch["target_ids"], batch.get("mask"))
+    return {
+        "loss": loss,
+        "rel_read_mean": stats.get("rel_read_mean", jnp.zeros(())),
+        "active_slots_mean": stats.get("active_slots_mean", jnp.zeros(())),
+        "u_norm_mean": stats.get("u_norm_mean", jnp.zeros(())),
+        "rel_write_mean": stats.get("rel_write_mean", jnp.zeros(())),
+        "rel_write_effective_mean": stats.get(
+            "rel_write_effective_mean", jnp.zeros(())
+        ),
+    }, new_rwkv_state, new_screen_state
+
+
+def eval_step_data_parallel(
+    train_state, batch, rwkv_state, screen_state, phase="read_screening_only"
+):
+    if isinstance(train_state, NNXTrainState):
+        return _nnx_eval_step_data_parallel(
+            train_state.model,
+            batch,
+            rwkv_state,
+            screen_state,
+            phase=phase,
+        )
+    return _linen_eval_step_data_parallel(
+        train_state,
+        batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+    )
 
 
 def evaluate_global_batch_data_parallel(

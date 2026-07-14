@@ -5,7 +5,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 
-from ..api import create_runtime
+from ..api import create_runtime, load_runtime_params
 from ..data import create_binidx_dataset
 from ..io import load_model_safetensors
 from ..model import ModelConfig, ScreeningConfig
@@ -86,7 +86,7 @@ def evaluate_binidx(args):
         batch_size=args.batch_size,
     )
     if params is not None:
-        runtime.variables = {"params": params}
+        load_runtime_params(runtime, params)
 
     @jax.jit
     def eval_step(input_ids, target_ids, mask, rwkv_state, screen_state):

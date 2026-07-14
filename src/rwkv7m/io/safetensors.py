@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import jax.numpy as jnp
+from flax import nnx
 from flax.traverse_util import flatten_dict, unflatten_dict
 from safetensors import safe_open
 from safetensors.flax import load_file, save_file
@@ -46,6 +47,11 @@ def _standard_metadata(config: ModelConfig, tokenizer_metadata=None):
 
 
 def _flatten_params(params):
+    if isinstance(params, nnx.State):
+        return {
+            "/".join(str(part) for part in path): jnp.asarray(value[...])
+            for path, value in nnx.to_flat_state(params)
+        }
     flat = flatten_dict(params, sep="/")
     return {name: jnp.asarray(value) for name, value in flat.items()}
 

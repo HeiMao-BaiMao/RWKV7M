@@ -25,6 +25,10 @@ class ModelConfig:
     vocab_size: int = 50257
     max_seq_len: int = 2048
     dtype: str = "bfloat16"
+    # The global orthogonal LM-head initializer is retained for reference
+    # parity on small models. Large sharded models should use
+    # ``variance_scaled`` to avoid a global QR decomposition during init.
+    lm_head_init: str = "orthogonal"
 
     # Screening config
     use_screening: bool = True
@@ -44,6 +48,10 @@ class ModelConfig:
     def __post_init__(self):
         if self.d_model != self.n_heads * self.head_size:
             raise ValueError("d_model must equal n_heads * head_size")
+        if self.lm_head_init not in ("orthogonal", "variance_scaled"):
+            raise ValueError(
+                "lm_head_init must be 'orthogonal' or 'variance_scaled'"
+            )
         self.screening.screened_layers = tuple(self.screening.screened_layers)
         self.screening.bank_ids = tuple(self.screening.bank_ids)
         if not self.use_screening or not self.screening.screened_layers:
@@ -140,10 +148,18 @@ class ScreenedRWKVModel(nn.Module):
             head_gain = 0.5 * math.sqrt(cfg.vocab_size / cfg.d_model)
         else:
             head_gain = 0.5
+        if cfg.lm_head_init == "orthogonal":
+            head_init = nn.initializers.orthogonal(scale=head_gain)
+        else:
+            head_init = nn.initializers.variance_scaling(
+                scale=head_gain * head_gain,
+                mode="fan_in",
+                distribution="truncated_normal",
+            )
         self.lm_head = nn.Dense(
             cfg.vocab_size,
             use_bias=False,
-            kernel_init=nn.initializers.orthogonal(scale=head_gain),
+            kernel_init=head_init,
             name="lm_head",
         )
 

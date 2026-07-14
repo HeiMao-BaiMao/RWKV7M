@@ -31,6 +31,7 @@ from ..distributed import (
     write_metric_record,
 )
 from ..io import model_config_to_dict
+from ..model.nnx_model import NNXShardingConfig
 from .config import parse_args_with_config
 from .train_binidx import build_config
 
@@ -349,7 +350,10 @@ def run_distributed_training(args):
         raise ValueError("mesh_axis_names must include 'data'")
     if args.carry_state and args.sampling_mode != "sequential":
         raise ValueError("--carry-state requires --sampling-mode sequential")
-    mesh = make_mesh(tuple(args.mesh_axis_names), axis_sizes=args.mesh_axis_sizes)
+    mesh = make_mesh(
+        tuple(args.mesh_axis_names),
+        axis_sizes=args.mesh_axis_sizes,
+    )
     if args.resume:
         checkpoint_payload = load_distributed_checkpoint_metadata(args.resume)
         config = checkpoint_payload.config
@@ -382,11 +386,28 @@ def run_distributed_training(args):
             local_device_count=info["local_device_count"],
             sampling_mode=args.sampling_mode,
         )
+    if args.param_axis_name == "data":
+        data_axis_index = tuple(mesh.axis_names).index("data")
+        if int(mesh.devices.shape[data_axis_index]) != 1:
+            raise ValueError(
+                "NNX model parallelism requires a parameter axis distinct "
+                "from the data axis"
+            )
+        # Preserve the historical one-device smoke invocation. There is no
+        # physical model sharding to perform on an axis of size one.
+        nnx_sharding = None
+    else:
+        nnx_sharding = (
+            NNXShardingConfig(mesh, model_axis=args.param_axis_name)
+            if args.param_axis_name is not None
+            else None
+        )
     runtime, train_state = create_train_runtime(
         jax.random.PRNGKey(args.seed),
         config,
         batch_size=args.global_batch_size,
         total_steps=max(start_step + args.steps, 1),
+        sharding=nnx_sharding,
     )
     if args.resume:
         train_state, checkpoint_payload = restore_distributed_train_state(
@@ -394,7 +415,7 @@ def run_distributed_training(args):
             train_state,
         )
         config = checkpoint_payload.config
-        runtime.variables = {"params": train_state.params}
+        runtime.variables = {"params": train_state.nnx_params}
         if args.carry_state:
             runtime_state = restore_distributed_runtime_state(
                 args.resume,
@@ -454,7 +475,12 @@ def run_distributed_training(args):
             # throughput, so wait for the complete updated train state before
             # stopping the timer. The TPU-scale NNX path will measure larger
             # asynchronous windows instead of synchronizing every step.
-            jax.block_until_ready(dist.train_state)
+            ready_state = (
+                dist.train_state.ready_state()
+                if hasattr(dist.train_state, "ready_state")
+                else dist.train_state
+            )
+            jax.block_until_ready(ready_state)
             elapsed = time.perf_counter() - step_start
             host_metrics = metrics_to_host_dict(metrics)
             completed_step = int(dist.train_state.step)

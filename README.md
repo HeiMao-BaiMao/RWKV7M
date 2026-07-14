@@ -454,12 +454,14 @@ TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cl
 
 ### 7B planning and the NNX scale path
 
-The small/reference model API remains on Flax Linen while the TPU-scale path is
-being migrated to Flax NNX. The migration is gated by numerical parity rather
-than replacing the reference implementation in one step. The first NNX gate
-already covers topology-aware sharded initialization, an Optax Adam update,
-Orbax save, restore in a new Python process, a second update, and preservation
-of parameter and optimizer-state sharding.
+The runtime, inference, training, distributed train/eval, optimizer, and
+checkpoint lifecycle now use Flax NNX. The former Linen model is retained only
+as a numerical/upstream-compatibility reference. A strict tensor-path converter
+checks every parameter, and small full-model tests cover forward, recurrent and
+screening state, statistics, and gradient parity for both read-only and
+read-write screening. The full NNX lifecycle covers topology-aware initialization,
+an Optax update, Orbax save/restore, a second update, and logical sharding
+metadata retention.
 
 Estimate parameter-related memory for the tracked 7B candidate without
 allocating its tensors:
@@ -482,10 +484,12 @@ uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
 uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
 ```
 
-The existing distributed Linen CLI now uses topology-aware `jax.make_mesh()`
-and synchronizes the complete updated train state before reporting per-step
-throughput. The future NNX scale trainer will use larger asynchronous timing
-windows.
+The distributed CLI is NNX-native, uses Orbax for TPU-scale checkpoints, uses
+topology-aware `jax.make_mesh()`, and synchronizes the complete updated NNX
+model/optimizer state before reporting a timing window. Explicit model-parallel
+`dot_general` output shardings and collective/HLO tuning remain Phase 3 work;
+Phase 2 records row/column parameter axes and activation constraints under the
+Auto mesh path.
 
 ## Public API
 
@@ -496,6 +500,7 @@ from rwkv7m import (
     create_binidx_dataset,
     ModelConfig,
     ScreeningConfig,
+    NNXScreenedRWKVModel,
     ScreenedRWKVModel,
     create_model_variables,
     create_runtime,
@@ -506,6 +511,10 @@ from rwkv7m import (
     tiny_config,
 )
 ```
+
+`NNXScreenedRWKVModel` is the implementation used by the public runtime and
+training APIs. `ScreenedRWKVModel` and `create_model_variables` are Linen
+reference interfaces retained for parity and upstream conversion tests.
 
 Lower-level modules:
 
@@ -549,4 +558,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, screening algebra/gradient parity, 7B abstract memory planning, and the cross-process NNX lifecycle. The current full suite is 120 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 123 tests.

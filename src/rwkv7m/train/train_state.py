@@ -1,6 +1,7 @@
 import flax
 import optax
 import jax.numpy as jnp
+from flax import nnx
 from dataclasses import dataclass
 from flax.training import train_state as flax_train_state
 
@@ -34,6 +35,14 @@ def rwkv_warmup_cosine_schedule(lr_init, lr_final, warmup_steps, total_steps):
 
 
 def decay_mask_fn(params):
+    if isinstance(params, nnx.State):
+        return nnx.from_flat_state(
+            (
+                path,
+                value[...].ndim >= 2 and path[-1] in ("kernel", "embedding"),
+            )
+            for path, value in nnx.to_flat_state(params)
+        )
     # Upstream RWKV-LM decays only true matmul weights. Matching that here
     # keeps token-shift mix params, w0/a0/v0/k_k/k_a/r_k anchors, LoRA
     # matrices, norms, biases, tau/lambda scalars, and slot_embed decay-free.
@@ -46,6 +55,10 @@ def decay_mask_fn(params):
 
 
 def rwkv_w0_mask_fn(params):
+    if isinstance(params, nnx.State):
+        return nnx.from_flat_state(
+            (path, path[-1] == "w0") for path, _ in nnx.to_flat_state(params)
+        )
     """Select the decay anchor that upstream RWKV trains at 2x base LR."""
     flat = flax.traverse_util.flatten_dict(params)
     mask = {path: path[-1] == "w0" for path in flat}

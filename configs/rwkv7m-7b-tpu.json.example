@@ -7,6 +7,7 @@
   "vocab_size": 65536,
   "max_seq_len": 4096,
   "dtype": "bfloat16",
+  "lm_head_init": "variance_scaled",
   "use_screening": true,
   "screening": {
     "d_model": 4096,

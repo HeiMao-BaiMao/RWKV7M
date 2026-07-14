@@ -72,10 +72,9 @@ def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None, axis_types
     # topology. A plain reshape preserves enumeration order and can produce a
     # needlessly expensive collective layout on TPU pods.
     if axis_types is None:
-        # The existing Linen distributed path relies on automatic GSPMD
-        # propagation. JAX 0.10 defaults jax.make_mesh to Explicit axes, which
-        # turns otherwise valid constraints into assertions and makes gathers
-        # such as the token embedding ambiguous.
+        # Keep the data-only compatibility path automatic. The NNX scale CLI
+        # opts into Explicit axes when model parallelism is requested, making
+        # that parameter/activation contract enforceable for collective audit.
         axis_types = (jax.sharding.AxisType.Auto,) * len(axis_names)
     else:
         axis_types = tuple(axis_types)

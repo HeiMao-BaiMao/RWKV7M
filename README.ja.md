@@ -611,11 +611,12 @@ TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_clou
 
 ### 7B見積りとNNX scale経路
 
-小型/reference model APIはFlax Linenのまま維持し、TPU-scale経路をFlax
-NNXへ段階移行します。reference実装を一度に置き換えるのではなく、数値一致を
-gateにします。最初のNNX gateでは、topology-aware sharded init、Optax Adam
-update、Orbax保存、別Python processでのrestore、restore後の再update、parameter
-とoptimizer stateのsharding維持までを検証します。
+runtime、inference、training、distributed train/eval、optimizer、checkpoint
+lifecycleはFlax NNXへ移行しました。旧Linen modelは数値検証とupstream互換性確認の
+referenceとしてのみ残します。全parameter pathを厳密に照合するconverterを設け、
+小型full modelでread-only/read-write両方のforward、RWKV/screening state、統計、
+gradient parityを検証します。NNX lifecycleではtopology-aware init、Optax update、
+Orbax save/restore、restore後step、logical sharding metadata維持までを対象にします。
 
 tracked 7B候補のtensorを実体化せず、parameter関連memoryを見積もるには:
 
@@ -636,9 +637,11 @@ uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
 uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
 ```
 
-既存のLinen distributed CLIも、topology-awareな`jax.make_mesh()`を使い、per-step
-throughputを記録する前に更新後train state全体の完了を待つようになっています。今後の
-NNX scale trainerでは、より大きい非同期measurement windowを使います。
+distributed CLIもNNX-nativeとなり、TPU-scale checkpointにはOrbaxを使います。
+topology-awareな`jax.make_mesh()`を使い、timing window終了時に更新済みNNX
+model/optimizer state全体の完了を待ちます。明示的model-parallel `dot_general`
+output shardingとcollective/HLO tuningはPhase 3に残し、Phase 2ではAuto mesh上で
+row/column parameter axesとactivation constraintを記録します。
 
 ## Python API
 
@@ -665,6 +668,7 @@ from rwkv7m import (
     create_binidx_dataset,
     ModelConfig,
     ScreeningConfig,
+    NNXScreenedRWKVModel,
     ScreenedRWKVModel,
     create_model_variables,
     create_runtime,
@@ -718,4 +722,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、screening algebra/gradient parity、7B abstract memory planning、別processでのNNX lifecycleが含まれます。現時点の full suite は120 testsです。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、NNX public inference/training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、full-model Linen/NNX forward・gradient parity、screening algebra/gradient parity、7B abstract memory planning、NNX Orbax lifecycleが含まれます。現時点の full suite は123 testsです。

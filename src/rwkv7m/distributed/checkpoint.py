@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import shutil
 
-from flax import serialization
+from flax import nnx, serialization
 import jax
 import jax.numpy as jnp
 
@@ -15,6 +15,7 @@ from ..io import (
 )
 from ..io.config import model_config_from_dict, model_config_to_dict
 from ..io.flax_checkpoint import RUNTIME_STATE_MSGPACK
+from ..train.nnx_train import NNXTrainState
 
 
 CHECKPOINT_JSON = "checkpoint.json"
@@ -150,7 +151,12 @@ def save_orbax_train_state(checkpoint_dir, train_state, *, force=True):
     state_dir = (Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR).resolve()
     checkpointer = ocp.StandardCheckpointer()
     try:
-        checkpointer.save(state_dir, train_state, force=force)
+        target = (
+            nnx.state((train_state.model, train_state.optimizer))
+            if isinstance(train_state, NNXTrainState)
+            else train_state
+        )
+        checkpointer.save(state_dir, target, force=force)
         checkpointer.wait_until_finished()
     finally:
         checkpointer.close()
@@ -174,6 +180,16 @@ def load_orbax_train_state(checkpoint_dir, train_state_template):
     state_dir = (Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR).resolve()
     checkpointer = ocp.StandardCheckpointer()
     try:
+        if isinstance(train_state_template, NNXTrainState):
+            target = nnx.state(
+                (train_state_template.model, train_state_template.optimizer)
+            )
+            restored = checkpointer.restore(state_dir, target=target)
+            nnx.update(
+                (train_state_template.model, train_state_template.optimizer),
+                restored,
+            )
+            return train_state_template
         return checkpointer.restore(state_dir, train_state_template)
     finally:
         checkpointer.close()
@@ -237,9 +253,14 @@ def save_data_parallel_checkpoint(
     if process_info["process_index"] != 0:
         return None
 
+    host_train_state = (
+        dist.train_state
+        if isinstance(dist.train_state, NNXTrainState)
+        else jax.device_get(dist.train_state)
+    )
     return save_train_checkpoint(
         checkpoint_dir,
-        jax.device_get(dist.train_state),
+        host_train_state,
         config,
         rng_key=rng_key,
         dataset_position=dataset_position,

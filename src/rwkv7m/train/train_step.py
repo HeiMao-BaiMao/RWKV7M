@@ -29,7 +29,7 @@ def l2wrap_loss(logits, factor=_L2WRAP_FACTOR):
 
 
 @jax.jit(static_argnames=["phase"], donate_argnums=(0,))
-def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
+def _linen_train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
     def loss_fn(params):
         logits, new_rwkv_state, new_screen_state, stats = train_state.apply_fn(
             {"params": params},
@@ -74,6 +74,28 @@ def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screeni
 
     metrics["total_loss"] = loss
     return train_state, new_rwkv_state, new_screen_state, metrics
+
+
+def train_step(train_state, batch, rwkv_state, screen_state, phase="read_screening_only"):
+    """Dispatch to the NNX training path or frozen Linen reference path."""
+
+    from .nnx_train import NNXTrainState, nnx_train_step
+
+    if isinstance(train_state, NNXTrainState):
+        return nnx_train_step(
+            train_state,
+            batch,
+            rwkv_state,
+            screen_state,
+            phase=phase,
+        )
+    return _linen_train_step(
+        train_state,
+        batch,
+        rwkv_state,
+        screen_state,
+        phase=phase,
+    )
 
 
 def compute_aux_losses(stats, phase="read_screening_only"):

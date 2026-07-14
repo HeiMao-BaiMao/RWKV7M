@@ -1,8 +1,12 @@
 # TPU Research Cloud Training
 
-This document describes the TPU path for `rwkv7m`. The current Linen code provides a local-testable data-parallel reference layer. The production-scale path is being implemented with Flax NNX, while Linen remains the numerical reference until the NNX model passes forward, gradient, loss, and checkpoint parity gates.
+This document describes the TPU path for `rwkv7m`. Flax NNX now owns the
+runtime, optimizer, distributed train/eval, and checkpoint lifecycle. The Linen
+implementation is frozen as the numerical and upstream-conversion reference.
 
-Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy validation on real TPU pods, and production-scale throughput tuning.
+Still pending: Phase 3 explicit model-parallel matmul/collective design, Orbax
+checkpoint policy validation on real TPU pods, and production-scale throughput
+tuning.
 
 ## Install
 
@@ -40,7 +44,7 @@ collective buffers.
 
 ## NNX Lifecycle Gate
 
-Before porting a full RWKV block, validate the framework lifecycle independently:
+Validate the small independent framework probe when changing JAX/Flax/Orbax:
 
 ```powershell
 uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
@@ -52,6 +56,11 @@ topology-aware sharded initialization, forward/backward, one Adam update,
 preservation of explicit output shardings, Orbax save, sharded restore, and a
 second update. On a real TPU slice, inspect the reported `PartitionSpec` values
 and device topology in addition to successful completion.
+
+The repository also runs the same lifecycle against the complete NNX RWKV7M
+model: Linen-to-NNX parameter conversion, forward/gradient parity, sharded
+model and Adam initialization, update, Orbax save/restore, and a post-restore
+update. Use `tests/test_nnx_model.py` as the Phase 2 acceptance test.
 
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
 
@@ -125,7 +134,11 @@ uv run rwkv7m-train-binidx-dp `
   --param-axis-name model
 ```
 
-The default remains replicated parameters over a 1D `data` mesh. `--param-axis-name` enables rule-based placement for model params and shape-based placement for optimizer leaves over that mesh axis; full tuned per-parameter sharding rules are still future work.
+The default remains replicated parameters over a 1D `data` mesh.
+`--param-axis-name model` constructs the NNX model and Adam state directly under
+the target mesh using declared row/column logical axes; it does not first build
+a full unsharded model. Explicit matmul output shardings and collective tuning
+remain Phase 3 work.
 
 ## Current Implementation Boundary
 
@@ -133,10 +146,14 @@ Implemented:
 
 - `jax.distributed.initialize()` environment-based setup.
 - topology-aware 1D and multi-axis JAX mesh construction with `jax.make_mesh()`.
-- NNX sharded init/update/Orbax/restore lifecycle probe.
+- complete NNX RWKV core, screening, model, optimizer, runtime, distributed
+  train/eval, and checkpoint lifecycle.
+- full-model Linen-to-NNX tensor-path conversion and forward/gradient parity.
+- NNX sharded init/update/Orbax/restore lifecycle probe and full-model test.
 - abstract parameter counting, dtype policy, and parameter-related HBM estimator.
 - exact package/runtime manifest in distributed run configuration.
-- rule-based parameter placement for embeddings, dense kernels, LM head weights, and fallback array leaves.
+- declared row/column NNX parameter axes for embeddings, RWKV projections,
+  screening projections, norms, states, and LM head.
 - process-aware host binidx sampling.
 - data-parallel batch placement with `jax.make_array_from_process_local_data`.
 - train/eval step boundaries for local distributed tests.
@@ -152,8 +169,9 @@ Implemented:
 
 Pending:
 
-- full RWKV7M model migration from the Linen reference to the NNX scale path.
-- tuned sharding specs per parameter and activation group.
+- Phase 3 explicit model-parallel `dot_general` output shardings, collective
+  placement, and HLO audit on a multi-device accelerator.
+- tuned activation/state sharding and vocabulary-sharded loss.
 - real TPU pod validation of sharded runtime-state checkpoint/resume for carried recurrent/screening state.
 - real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
 - TPU pod throughput tuning and failure recovery drills.
@@ -161,9 +179,13 @@ Pending:
 
 ## Resume
 
-Two checkpoint backends are available:
+Two checkpoint backends are available. The local-compatible msgpack backend is
+the CLI default; select Orbax explicitly for TPU-scale runs:
 
-- `--checkpoint-backend flax`: process 0 materializes and writes `train_state.msgpack` plus `model.safetensors`; this remains the default and is useful for small/local runs and portable artifact export. With `--carry-state`, it also writes `runtime_state.msgpack`.
+- `--checkpoint-backend flax`: process 0 writes the NNX model/optimizer pure
+  state as `train_state.msgpack` plus `model.safetensors`; use it for small/local
+  runs and portable artifact export. With `--carry-state`, it also writes
+  `runtime_state.msgpack`.
 - `--checkpoint-backend orbax`: all processes write an Orbax train-state checkpoint under `orbax_train_state`, while process 0 writes `checkpoint.json`; use this for TPU-scale runs where materializing the full train state on process 0 is not viable. With `--carry-state`, it also writes `orbax_runtime_state`.
 
 Resume works for both backends:
@@ -191,7 +213,7 @@ When `--output-dir` is set, the distributed CLI writes:
 - `metrics.jsonl`
 - `metrics.csv`
 
-`run_config.json` stores CLI args, model config, process count, device count, device names, and exact runtime/package versions. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. The reference distributed CLI synchronizes the complete updated train state before stopping each per-step timer; the NNX scale trainer will use asynchronous multi-step timing windows.
+`run_config.json` stores CLI args, model config, process count, device count, device names, and exact runtime/package versions. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. The NNX distributed CLI synchronizes the complete updated model/optimizer state at the end of the timing window.
 
 Use `--log-jsonl`, `--log-csv`, and `--summary-json` to override output paths. `--summary-every` controls periodic summary writes. `--best-metric` and `--best-mode` choose the validation metric to track, and `--save-best-checkpoint` saves a checkpoint when that metric improves. Best checkpoints are protected from checkpoint rotation.
 
