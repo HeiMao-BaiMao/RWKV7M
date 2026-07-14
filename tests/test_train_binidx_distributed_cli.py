@@ -1,3 +1,4 @@
+import gc
 import json
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from rwkv7m import (
     model_config_to_dict,
     tiny_config,
 )
+from rwkv7m.cli import train_binidx_distributed as distributed_cli
 from rwkv7m.cli.train_binidx_distributed import parse_args, run_distributed_training
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 from rwkv7m.distributed import load_distributed_checkpoint_metadata
@@ -21,6 +23,34 @@ def write_dp_train_data(tmp_path):
     builder.end_document()
     builder.finalize(index_file_path(prefix))
     return prefix
+
+
+def test_distributed_cli_can_disable_and_restore_python_gc(monkeypatch):
+    observed = []
+    was_enabled = gc.isenabled()
+    gc.enable()
+    monkeypatch.setattr(
+        distributed_cli,
+        "run_distributed_training",
+        lambda args: observed.append((args.disable_python_gc, gc.isenabled())),
+    )
+    try:
+        distributed_cli.main(
+            [
+                "--data-file",
+                "unused",
+                "--ctx-len",
+                "1",
+                "--steps",
+                "0",
+                "--disable-python-gc",
+            ]
+        )
+        assert observed == [(True, False)]
+        assert gc.isenabled()
+    finally:
+        if not was_enabled:
+            gc.disable()
 
 
 def test_distributed_binidx_training_cli_runs_one_step(tmp_path):

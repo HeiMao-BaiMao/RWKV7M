@@ -1,4 +1,5 @@
 import argparse
+import gc
 from dataclasses import replace
 from datetime import datetime, timezone
 import json
@@ -130,6 +131,14 @@ def parse_args(argv=None):
     parser.add_argument("--log-csv", default=None)
     parser.add_argument("--summary-json", default=None)
     parser.add_argument("--summary-every", type=int, default=10)
+    parser.add_argument(
+        "--disable-python-gc",
+        action="store_true",
+        help=(
+            "disable CPython cyclic GC during the training process; reference "
+            "counting remains active and the prior GC state is restored on exit"
+        ),
+    )
     parser.add_argument("--save-best-checkpoint", action="store_true")
     parser.add_argument("--best-metric", default="loss")
     parser.add_argument("--best-mode", choices=["min", "max"], default="min")
@@ -754,7 +763,14 @@ def run_distributed_training(args):
 
 def main(argv=None):
     args = parse_args(argv)
-    run_distributed_training(args)
+    gc_was_enabled = gc.isenabled()
+    if args.disable_python_gc and gc_was_enabled:
+        gc.disable()
+    try:
+        run_distributed_training(args)
+    finally:
+        if args.disable_python_gc and gc_was_enabled:
+            gc.enable()
 
 
 if __name__ == "__main__":
