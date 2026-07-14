@@ -26,6 +26,22 @@ from .checkpoint import (
     save_orbax_runtime_state,
 )
 from .metrics import aggregate_metrics, mean_metric_dict, metrics_to_host_dict, write_metric_record
+from .environment import runtime_version_manifest
+from .scaling import (
+    DTypePolicy,
+    ParameterSummary,
+    TrainingMemoryEstimate,
+    abstract_parameter_summary,
+    estimate_training_memory,
+)
+from .nnx_lifecycle import (
+    NNXShardingProbe,
+    initialize_nnx_probe,
+    nnx_state_sharding_summary,
+    restore_nnx_probe_checkpoint,
+    save_nnx_probe_checkpoint,
+    train_nnx_probe_step,
+)
 from .partitioning import (
     mesh_axis_size,
     parameter_partition_summary,
@@ -81,6 +97,18 @@ __all__ = [
     "mean_metric_dict",
     "metrics_to_host_dict",
     "write_metric_record",
+    "runtime_version_manifest",
+    "DTypePolicy",
+    "ParameterSummary",
+    "TrainingMemoryEstimate",
+    "abstract_parameter_summary",
+    "estimate_training_memory",
+    "NNXShardingProbe",
+    "initialize_nnx_probe",
+    "nnx_state_sharding_summary",
+    "restore_nnx_probe_checkpoint",
+    "save_nnx_probe_checkpoint",
+    "train_nnx_probe_step",
     "mesh_axis_size",
     "parameter_partition_summary",
     "parameter_partition_spec",

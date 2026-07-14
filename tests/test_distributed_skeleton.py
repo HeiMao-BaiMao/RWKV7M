@@ -59,6 +59,32 @@ def test_make_mesh_validates_axis_sizes():
         make_mesh(("data", "model"))
 
 
+def test_make_mesh_delegates_device_ordering_to_jax(monkeypatch):
+    sentinel = object()
+    calls = []
+
+    def fake_make_mesh(axis_sizes, axis_names, *, devices, axis_types):
+        calls.append((axis_sizes, axis_names, devices, axis_types))
+        return sentinel
+
+    monkeypatch.setattr(jax, "make_mesh", fake_make_mesh)
+    fake_devices = [object()]
+    result = make_mesh(
+        ("data", "model"),
+        axis_sizes=(1, 1),
+        devices=fake_devices,
+    )
+    assert result is sentinel
+    assert calls == [
+        (
+            (1, 1),
+            ("data", "model"),
+            fake_devices,
+            (jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
+        )
+    ]
+
+
 def test_compute_batch_layout_validates_divisibility():
     layout = compute_batch_layout(8, process_count=2, local_device_count=2)
     assert layout.process_batch_size == 4

@@ -1,8 +1,7 @@
 import os
+import math
 
 import jax
-import numpy as np
-from jax.sharding import Mesh
 
 
 def process_info():
@@ -46,7 +45,7 @@ def make_1d_mesh(axis_name="data", devices=None):
     return make_mesh((axis_name,), devices=devices)
 
 
-def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None):
+def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None, axis_types=None):
     if isinstance(axis_names, str):
         axis_names = (axis_names,)
     axis_names = tuple(axis_names)
@@ -66,7 +65,21 @@ def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None):
         raise ValueError("axis_sizes must have the same length as axis_names")
     if any(size <= 0 for size in axis_sizes):
         raise ValueError("axis_sizes must be positive")
-    if int(np.prod(axis_sizes)) != len(devices):
+    if math.prod(axis_sizes) != len(devices):
         raise ValueError("product of axis_sizes must equal number of devices")
 
-    return Mesh(np.asarray(devices).reshape(axis_sizes), axis_names)
+    # jax.make_mesh maps the logical axes onto the physical accelerator
+    # topology. A plain reshape preserves enumeration order and can produce a
+    # needlessly expensive collective layout on TPU pods.
+    if axis_types is None:
+        # The existing Linen distributed path relies on automatic GSPMD
+        # propagation. JAX 0.10 defaults jax.make_mesh to Explicit axes, which
+        # turns otherwise valid constraints into assertions and makes gathers
+        # such as the token embedding ambiguous.
+        axis_types = (jax.sharding.AxisType.Auto,) * len(axis_names)
+    else:
+        axis_types = tuple(axis_types)
+    if len(axis_types) != len(axis_names):
+        raise ValueError("axis_types must have the same length as axis_names")
+    kwargs = {"devices": devices, "axis_types": axis_types}
+    return jax.make_mesh(axis_sizes, axis_names, **kwargs)

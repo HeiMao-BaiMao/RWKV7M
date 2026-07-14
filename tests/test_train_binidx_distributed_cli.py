@@ -314,6 +314,8 @@ def test_distributed_binidx_training_cli_logs_eval_and_rotates(tmp_path):
     run_config = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
     assert run_config["args"]["global_batch_size"] == 1
     assert run_config["model_config"]["vocab_size"] == 32
+    assert run_config["environment"]["packages"]["jax"]
+    assert run_config["environment"]["packages"]["flax"]
     assert "token_embedding/embedding" in run_config["parameter_partition_summary"]
 
     jsonl_path = output_dir / "metrics.jsonl"

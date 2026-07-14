@@ -76,6 +76,10 @@ def run_variant(args, variant):
             losses.append(loss)
             if args.print_every and (step % args.print_every == 0 or step == args.steps - 1):
                 print(f"{variant} step={step} loss={loss:.6f}")
+        # Waiting on the final loss is not sufficient to prove that every
+        # optimizer output leaf has completed. Synchronize the complete final
+        # state once at the end of this measurement window.
+        jax.block_until_ready(state)
     finally:
         dataset.close()
     elapsed = time.perf_counter() - start

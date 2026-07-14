@@ -1,6 +1,6 @@
 # TPU Research Cloud Training
 
-This document describes the TPU path for `rwkv7m`. The current code provides a local-testable data-parallel training layer with process-aware checkpoints, checkpoint rotation, structured logs, run summaries, validation hooks, best-eval checkpoint tracking, device prefetching, and optional multi-axis mesh / rule-based parameter placement hooks.
+This document describes the TPU path for `rwkv7m`. The current Linen code provides a local-testable data-parallel reference layer. The production-scale path is being implemented with Flax NNX, while Linen remains the numerical reference until the NNX model passes forward, gradient, loss, and checkpoint parity gates.
 
 Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy validation on real TPU pods, and production-scale throughput tuning.
 
@@ -10,6 +10,48 @@ Still pending: fully tuned per-parameter sharding rules, Orbax checkpoint policy
 uv sync --extra tpu
 uv run pytest -q tests/test_distributed_skeleton.py tests/test_distributed_train_state.py tests/test_distributed_trainer.py tests/test_train_binidx_distributed_cli.py
 ```
+
+Record the exact JAX, jaxlib, Flax, Optax, Orbax, Python, backend, and device
+versions before a TPU run. Distributed `run_config.json` now includes this
+environment manifest automatically.
+
+## 7B Preflight
+
+The tracked candidate is in `configs/rwkv7m-7b-tpu.json.example`. Count its
+current abstract parameter tree and estimate parameter-related memory with:
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-config configs/rwkv7m-7b-tpu.json.example `
+  --model-axis-size 8 `
+  --dtype-profile memory
+```
+
+The current implementation has 6,994,788,376 parameters for this config:
+
+- RWKV core and common model parameters: 6,871,986,176.
+- four screening layers: 122,802,200.
+
+The count comes from `jax.eval_shape` over the current model initializer rather
+than a separately maintained formula. The memory estimate includes parameter
+storage, two Adam moments, FP32 accumulated gradients, and an update workspace.
+It excludes activations, RWKV/screening state, compiler temporaries, and
+collective buffers.
+
+## NNX Lifecycle Gate
+
+Before porting a full RWKV block, validate the framework lifecycle independently:
+
+```powershell
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
+```
+
+The two commands run in different Python processes. Together they validate
+topology-aware sharded initialization, forward/backward, one Adam update,
+preservation of explicit output shardings, Orbax save, sharded restore, and a
+second update. On a real TPU slice, inspect the reported `PartitionSpec` values
+and device topology in addition to successful completion.
 
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
 
@@ -90,7 +132,10 @@ The default remains replicated parameters over a 1D `data` mesh. `--param-axis-n
 Implemented:
 
 - `jax.distributed.initialize()` environment-based setup.
-- 1D and multi-axis JAX mesh construction.
+- topology-aware 1D and multi-axis JAX mesh construction with `jax.make_mesh()`.
+- NNX sharded init/update/Orbax/restore lifecycle probe.
+- abstract parameter counting, dtype policy, and parameter-related HBM estimator.
+- exact package/runtime manifest in distributed run configuration.
 - rule-based parameter placement for embeddings, dense kernels, LM head weights, and fallback array leaves.
 - process-aware host binidx sampling.
 - data-parallel batch placement with `jax.make_array_from_process_local_data`.
@@ -107,7 +152,8 @@ Implemented:
 
 Pending:
 
-- tuned sharding specs per parameter group.
+- full RWKV7M model migration from the Linen reference to the NNX scale path.
+- tuned sharding specs per parameter and activation group.
 - real TPU pod validation of sharded runtime-state checkpoint/resume for carried recurrent/screening state.
 - real TPU pod validation of Orbax checkpoint save/resume under sharded train states.
 - TPU pod throughput tuning and failure recovery drills.
@@ -145,7 +191,7 @@ When `--output-dir` is set, the distributed CLI writes:
 - `metrics.jsonl`
 - `metrics.csv`
 
-`run_config.json` stores CLI args, model config, process count, device count, and device names. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps.
+`run_config.json` stores CLI args, model config, process count, device count, device names, and exact runtime/package versions. When `--param-axis-name` is set, it also records a parameter partition summary with shapes and `PartitionSpec` strings. `run_summary.json` is updated during training with status, current step, completed steps, token counts, latest checkpoint, last train/eval records, and best eval. Metric records include `split`, `step`, `loss`, screening metrics, tokens, and `tokens_per_sec` for train steps. The reference distributed CLI synchronizes the complete updated train state before stopping each per-step timer; the NNX scale trainer will use asynchronous multi-step timing windows.
 
 Use `--log-jsonl`, `--log-csv`, and `--summary-json` to override output paths. `--summary-every` controls periodic summary writes. `--best-metric` and `--best-mode` choose the validation metric to track, and `--save-best-checkpoint` saves a checkpoint when that metric improves. Best checkpoints are protected from checkpoint rotation.
 
@@ -176,7 +222,11 @@ Current checkpoint backends persist distributed carry-state runtime state and re
 
 ## Export Contract
 
-Each checkpoint directory includes `model.safetensors`. This is the canonical artifact for external runtimes:
+Flax-backend checkpoint directories include `model.safetensors`. Orbax training
+checkpoints contain sharded train state and metadata but do not implicitly
+materialize portable weights. A final/export operation must write complete
+tensors one at a time or in small groups without gathering the whole model at
+once. `model.safetensors` remains the canonical external-runtime artifact:
 
 - `rwkv7m_config_json` stores the full model config.
 - top-level metadata stores architecture, dtype, dimensions, screening summary, and tokenizer vocabulary identity.

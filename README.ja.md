@@ -609,6 +609,37 @@ uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-record
 
 TPU setup と実行メモは [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md) にあります。
 
+### 7B見積りとNNX scale経路
+
+小型/reference model APIはFlax Linenのまま維持し、TPU-scale経路をFlax
+NNXへ段階移行します。reference実装を一度に置き換えるのではなく、数値一致を
+gateにします。最初のNNX gateでは、topology-aware sharded init、Optax Adam
+update、Orbax保存、別Python processでのrestore、restore後の再update、parameter
+とoptimizer stateのsharding維持までを検証します。
+
+tracked 7B候補のtensorを実体化せず、parameter関連memoryを見積もるには:
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-config configs/rwkv7m-7b-tpu.json.example `
+  --model-axis-size 8 `
+  --dtype-profile memory
+```
+
+この値にはactivation、RWKV/screening runtime state、compiler一時領域、collective
+bufferを含みません。実行前のgateには使えますが、HBMへ収まる保証値ではありません。
+
+NNX lifecycleを別processで検証するには:
+
+```powershell
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
+```
+
+既存のLinen distributed CLIも、topology-awareな`jax.make_mesh()`を使い、per-step
+throughputを記録する前に更新後train state全体の完了を待つようになっています。今後の
+NNX scale trainerでは、より大きい非同期measurement windowを使います。
+
 ## Python API
 
 ```python
@@ -687,4 +718,4 @@ from rwkv7m import (
 uv run pytest -q
 ```
 
-現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary が含まれます。現時点の full suite は 91 tests です。
+現在の smoke coverage には、math helper、shape check、phase/config validation、scan consistency、public API inference、public API training、binidx data loading、sequential carry-state reset/eval behavior、safetensors/checkpoint boundary、local distributed training boundary、screening algebra/gradient parity、7B abstract memory planning、別processでのNNX lifecycleが含まれます。現時点の full suite は120 testsです。

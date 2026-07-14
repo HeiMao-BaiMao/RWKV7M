@@ -452,6 +452,41 @@ uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-record
 
 TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
 
+### 7B planning and the NNX scale path
+
+The small/reference model API remains on Flax Linen while the TPU-scale path is
+being migrated to Flax NNX. The migration is gated by numerical parity rather
+than replacing the reference implementation in one step. The first NNX gate
+already covers topology-aware sharded initialization, an Optax Adam update,
+Orbax save, restore in a new Python process, a second update, and preservation
+of parameter and optimizer-state sharding.
+
+Estimate parameter-related memory for the tracked 7B candidate without
+allocating its tensors:
+
+```powershell
+uv run rwkv7m-plan-scale `
+  --model-config configs/rwkv7m-7b-tpu.json.example `
+  --model-axis-size 8 `
+  --dtype-profile memory
+```
+
+The estimate deliberately excludes activations, recurrent/screening runtime
+state, compiler temporaries, and collective buffers. It is a launch gate, not
+an HBM-fit guarantee.
+
+Validate the NNX lifecycle in two separate processes:
+
+```powershell
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode create
+uv run rwkv7m-verify-nnx-lifecycle --checkpoint-dir out/nnx-probe --mode restore
+```
+
+The existing distributed Linen CLI now uses topology-aware `jax.make_mesh()`
+and synchronizes the complete updated train state before reporting per-step
+throughput. The future NNX scale trainer will use larger asynchronous timing
+windows.
+
 ## Public API
 
 Common imports:
@@ -514,4 +549,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, and local distributed training boundaries. The current full suite is 91 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, public API inference, public API training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, screening algebra/gradient parity, 7B abstract memory planning, and the cross-process NNX lifecycle. The current full suite is 120 tests.

@@ -25,6 +25,7 @@ from ..distributed import (
     restore_distributed_train_state,
     restore_distributed_runtime_state,
     rotate_checkpoints,
+    runtime_version_manifest,
     save_data_parallel_checkpoint,
     train_global_batch_data_parallel,
     write_metric_record,
@@ -243,6 +244,7 @@ def _write_run_config(args, config, info, *, params=None, mesh=None):
             if key != "devices"
         },
         "devices": info.get("devices", []),
+        "environment": runtime_version_manifest(),
     }
     if args.param_axis_name is not None and params is not None and mesh is not None:
         payload["parameter_partition_summary"] = parameter_partition_summary(
@@ -447,6 +449,12 @@ def run_distributed_training(args):
                 phase=args.phase,
                 carry_state=args.carry_state,
             )
+            # The loss output can become ready before every parameter and
+            # optimizer-state leaf. This reference CLI reports per-step
+            # throughput, so wait for the complete updated train state before
+            # stopping the timer. The TPU-scale NNX path will measure larger
+            # asynchronous windows instead of synchronizing every step.
+            jax.block_until_ready(dist.train_state)
             elapsed = time.perf_counter() - step_start
             host_metrics = metrics_to_host_dict(metrics)
             completed_step = int(dist.train_state.step)

@@ -58,6 +58,36 @@ def update_rate_from_half_life(half_life_tokens):
     return -jnp.expm1(-jnp.log(2.0) / half_life_tokens)
 
 
+def compute_slot_delta(x, h, slot_embed, kernel, bias):
+    """Apply the concatenated delta projection without materializing it.
+
+    The original projection is ``concat([x, h, slot_embed]) @ kernel + bias``
+    for every slot. Splitting the kernel along its input axis avoids the
+    ``[..., n_slots, 2 * d_model + d_slot]`` intermediate and avoids repeating
+    the x/h projections once per slot.
+    """
+    d_model = x.shape[-1]
+    d_slot = slot_embed.shape[-1]
+    if h.shape[-1] != d_model:
+        raise ValueError("x and h must have the same final dimension")
+    if kernel.shape[0] != 2 * d_model + d_slot:
+        raise ValueError("delta kernel input dimension does not match x/h/slot dimensions")
+
+    x_kernel = kernel[:d_model, :]
+    h_kernel = kernel[d_model : 2 * d_model, :]
+    slot_kernel = kernel[2 * d_model :, :]
+
+    x_term = jnp.einsum("...c,co->...o", x, x_kernel)
+    h_term = jnp.einsum("...c,co->...o", h, h_kernel)
+    slot_term = jnp.einsum("ms,so->mo", slot_embed, slot_kernel)
+    return jnp.tanh(
+        x_term[..., None, :]
+        + h_term[..., None, :]
+        + slot_term
+        + bias
+    )
+
+
 @dataclass
 class ScreeningConfig:
     d_model: int = 512
@@ -167,7 +197,7 @@ class StateLevelScreening(nn.Module):
 
         cfg = self.config
         phase = normalize_phase(phase)
-        B, T, C = x_seq.shape
+        _, T, _ = x_seq.shape
 
         # During init, create all params via dummy call
         if self.is_initializing():
@@ -217,13 +247,6 @@ class StateLevelScreening(nn.Module):
             q_w_seq = None
             tau_w = jnp.zeros(())
 
-        # Broadcast slot embed for delta computation
-        slot_embed_b = jnp.broadcast_to(slot_embed[None, None, :, :], (B, T, cfg.n_slots, cfg.d_slot))
-        x_rep = jnp.broadcast_to(x_ln_seq[:, :, None, :], (B, T, cfg.n_slots, C))
-        h_rep = jnp.broadcast_to(h_base_seq.astype(jnp.float32)[:, :, None, :], (B, T, cfg.n_slots, C))
-        delta_in_all = jnp.concatenate([x_rep, h_rep, slot_embed_b], axis=-1)
-        delta_s_all = jnp.tanh(jnp.einsum("btmi,io->btmo", delta_in_all, delta_w) + delta_b)
-
         def step(carry, t):
             """Pure function - no Flax modules called here."""
             slots_t, ages_t, usage_t = carry
@@ -255,10 +278,18 @@ class StateLevelScreening(nn.Module):
             read_out = jnp.einsum("bv,vc->bc", u, out_w)
             h_t = h_base_seq[:, t, :] + lambda_screen * gate * read_out.astype(h_base_seq.dtype)
 
-            # Slot update
+            # Slot update. Compute the split projection inside the time scan so
+            # no [B, T, M, d_slot] delta activation is retained.
+            delta_s_t = compute_slot_delta(
+                x_ln_seq[:, t, :],
+                h_base_seq[:, t, :].astype(jnp.float32),
+                slot_embed,
+                delta_w,
+                delta_b,
+            )
             if not write_enabled:
                 update_strength = mu[None, :, None]
-                new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
+                new_slots = slots_t + update_strength * (delta_s_t - slots_t)
                 new_ages = ages_t
                 rel_w = jnp.zeros_like(rel_r)
                 rel_w_effective = jnp.ones_like(rel_r)
@@ -270,7 +301,7 @@ class StateLevelScreening(nn.Module):
                 rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
                 rel_w_effective = jnp.maximum(rel_w, cfg.write_rel_floor)
                 update_strength = mu[None, :, None] * rel_w_effective[:, :, None]
-                new_slots = slots_t + update_strength * (delta_s_all[:, t, :, :] - slots_t)
+                new_slots = slots_t + update_strength * (delta_s_t - slots_t)
                 new_ages = jnp.where(rel_w > 1e-3, 0.0, ages_t + 1.0)
 
             update_delta = new_slots - slots_t
