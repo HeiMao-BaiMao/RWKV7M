@@ -268,8 +268,6 @@ def _screening_step(
     ages_1d = ages[:, 0]
     usage_1d = usage[:, 0]
     mu_1d = mu[:, 0]
-    q_read_1d = q_read[0]
-    q_write_1d = q_write[0]
     admission_scalar = admission[0, 0]
     bank_logits_1d = bank_logits[0]
     n_slots, key_size = read_keys.shape
@@ -283,7 +281,9 @@ def _screening_step(
     if use_age_mask:
         age_scores = (age_ref - ages_1d) / (age_sigma + eps)
         age_gate = jax.nn.sigmoid(age_scores)
-    read_activity = jnp.zeros_like(ages_1d)
+    read_activity_values = [
+        jnp.asarray(0.0, dtype=jnp.float32)
+    ] * n_slots
     read_relevance_sum = jnp.asarray(0.0, dtype=jnp.float32)
     read_relevance_max = jnp.asarray(0.0, dtype=jnp.float32)
     z_tiles = []
@@ -300,47 +300,51 @@ def _screening_step(
             values, value_start, value_limit, axis=1
         )
         q_read_tile = jax.lax.slice_in_dim(
-            q_read_1d, key_start, key_limit, axis=0
-        )
-        normalized_read_keys = _unit_norm(read_keys_tile, eps)
-        normalized_values = values_tile
-        if use_value_unit_norm:
-            normalized_values = _unit_norm(values_tile, eps)
-        read_similarity = jnp.sum(
-            normalized_read_keys * q_read_tile[None, :], axis=-1
+            q_read, key_start, key_limit, axis=1
         )
         tau_read_tile = tau_read[tile]
-        if use_leaky_warmup:
-            hard = _trim_square(read_similarity, tau_read_tile, eps)
-            soft = jax.nn.sigmoid(
-                leaky_gamma * (read_similarity - tau_read_tile)
+        z_tile = jnp.zeros((1, value_tile_size), dtype=jnp.float32)
+        for slot in range(n_slots):
+            read_key_row = jax.lax.slice_in_dim(
+                read_keys_tile, slot, slot + 1, axis=0
             )
-            read_relevance_tile = (
-                (1.0 - leaky_alpha) * hard + leaky_alpha * soft
+            value_row = jax.lax.slice_in_dim(
+                values_tile, slot, slot + 1, axis=0
             )
-        else:
-            read_relevance_tile = _trim_square(
-                read_similarity, tau_read_tile, eps
+            normalized_read_key = _unit_norm(read_key_row, eps)
+            normalized_value = value_row
+            if use_value_unit_norm:
+                normalized_value = _unit_norm(value_row, eps)
+            read_similarity = jnp.sum(
+                normalized_read_key * q_read_tile
             )
-        read_relevance_tile *= age_gate
-        z_tile = jnp.sum(
-            read_relevance_tile[:, None] * normalized_values, axis=0
-        )
+            if use_leaky_warmup:
+                hard = _trim_square(read_similarity, tau_read_tile, eps)
+                soft = jax.nn.sigmoid(
+                    leaky_gamma * (read_similarity - tau_read_tile)
+                )
+                read_relevance = (
+                    (1.0 - leaky_alpha) * hard + leaky_alpha * soft
+                )
+            else:
+                read_relevance = _trim_square(
+                    read_similarity, tau_read_tile, eps
+                )
+            read_relevance *= age_gate[slot]
+            z_tile += read_relevance * normalized_value
+            read_activity_values[slot] = jnp.maximum(
+                read_activity_values[slot], read_relevance
+            )
+            read_relevance_sum += read_relevance
+            read_relevance_max = jnp.maximum(
+                read_relevance_max, read_relevance
+            )
         u_tile = _tanh_norm(z_tile, tanh_norm_cap, eps)
         z_tiles.append(z_tile)
         u_tiles.append(u_tile)
-        read_activity = jnp.maximum(read_activity, read_relevance_tile)
-        # Reducing a short sliced vector can require an unsupported Mosaic
-        # layout-offset change. Slot count is static, so aggregate these two
-        # diagnostic scalars explicitly instead of introducing a reduction.
-        for slot in range(n_slots):
-            relevance_scalar = read_relevance_tile[slot]
-            read_relevance_sum += relevance_scalar
-            read_relevance_max = jnp.maximum(
-                read_relevance_max, relevance_scalar
-            )
-    z = jnp.concatenate(tuple(z_tiles), axis=0)[None, :]
-    u = jnp.concatenate(tuple(u_tiles), axis=0)[None, :]
+    read_activity = jnp.stack(tuple(read_activity_values))
+    z = jnp.concatenate(tuple(z_tiles), axis=1)
+    u = jnp.concatenate(tuple(u_tiles), axis=1)
 
     resolved_mode = write_mode
     if resolved_mode is None:
@@ -352,16 +356,17 @@ def _screening_step(
     effective_admission = jnp.asarray(0.0, dtype=jnp.float32)
     is_novel = jnp.asarray(False)
     if resolved_mode in ("legacy_threshold", "competitive_novel"):
-        normalized_write_keys = _unit_norm(write_keys, eps)
-        write_similarity = jnp.sum(
-            normalized_write_keys * q_write_1d[None, :], axis=-1
-        )
-        write_relevance = jnp.stack(
-            tuple(
-                _trim_square(write_similarity[slot], tau_write, eps)
-                for slot in range(n_slots)
+        write_relevance_values = []
+        for slot in range(n_slots):
+            write_key_row = jax.lax.slice_in_dim(
+                write_keys, slot, slot + 1, axis=0
             )
-        )
+            normalized_write_key = _unit_norm(write_key_row, eps)
+            write_similarity = jnp.sum(normalized_write_key * q_write)
+            write_relevance_values.append(
+                _trim_square(write_similarity, tau_write, eps)
+            )
+        write_relevance = jnp.stack(tuple(write_relevance_values))
     else:
         write_relevance = jnp.zeros_like(read_activity)
 
