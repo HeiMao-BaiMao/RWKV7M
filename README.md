@@ -598,6 +598,12 @@ loss, block rematerialization, exact state-carrying recurrent chunks, and
 microbatch gradient accumulation. Recurrent and LM-head chunk sizes are
 independent; `head_chunk_size: null` inherits `sequence_chunk_size` for
 backward-compatible memory behavior. Chunk boundaries do not stop gradients.
+For an unsharded accelerator run that is limited by head memory,
+`--training-vocab-tile-size 4096` enables the backend-specific Pallas streaming
+loss; `--no-training-vocab-tiling` forces full logits. Tiling is not enabled by
+default because the measured TPU v5e path saved 16x logit memory but was slower
+than XLA's full-vocabulary head. Explicitly sharded vocabulary-parallel loss
+continues to use its existing collective-aware XLA path.
 These features are integrated and covered by small-model equivalence tests;
 the tracked 7B shape has not yet been executed end-to-end on TPU.
 
@@ -747,4 +753,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 140 tests.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 161 tests, with four real-accelerator or optional-runtime checks skipped on CPU.

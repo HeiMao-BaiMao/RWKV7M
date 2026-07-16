@@ -45,6 +45,10 @@ class ModelConfig:
     # None inherits sequence_chunk_size in the training path. This preserves
     # existing preset memory behavior while allowing independent head tuning.
     head_chunk_size: int | None = None
+    # Optional memory-saving path. Real TPU measurements show that XLA's full
+    # head is faster for the tracked 0.185B shape, so tiling is opt-in until a
+    # backend/shape-specific performance record clears the train-step gate.
+    training_vocab_tile_size: int | None = None
 
     # Screening config
     use_screening: bool = True
@@ -81,6 +85,22 @@ class ModelConfig:
             raise ValueError("sequence_chunk_size must be positive when set")
         if self.head_chunk_size is not None and self.head_chunk_size <= 0:
             raise ValueError("head_chunk_size must be positive when set")
+        if (
+            self.training_vocab_tile_size is not None
+            and self.training_vocab_tile_size <= 0
+        ):
+            raise ValueError(
+                "training_vocab_tile_size must be positive when set"
+            )
+        if (
+            self.training_vocab_tile_size is not None
+            and self.vocab_size > self.training_vocab_tile_size
+            and self.vocab_size % self.training_vocab_tile_size != 0
+        ):
+            raise ValueError(
+                "vocab_size must be divisible by training_vocab_tile_size "
+                "when multiple vocabulary tiles are required"
+            )
         if self.lm_head_init not in ("orthogonal", "variance_scaled"):
             raise ValueError(
                 "lm_head_init must be 'orthogonal' or 'variance_scaled'"

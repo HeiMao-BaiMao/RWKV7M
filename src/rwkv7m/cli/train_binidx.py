@@ -14,7 +14,11 @@ from ..io import (
     save_train_checkpoint,
 )
 from ..model import MODEL_PRESET_NAMES, ModelConfig, ScreeningConfig, model_preset
-from .config import apply_execution_overrides, parse_args_with_config
+from .config import (
+    add_training_vocab_tiling_args,
+    apply_execution_overrides,
+    parse_args_with_config,
+)
 from .eval_binidx import evaluate_binidx, parse_args as parse_eval_args
 
 
@@ -149,6 +153,7 @@ def parse_args(argv=None):
     head_chunk_group = parser.add_mutually_exclusive_group()
     head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
     head_chunk_group.add_argument("--no-head-chunking", action="store_true")
+    add_training_vocab_tiling_args(parser)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)

@@ -23,8 +23,16 @@ from benchmark_common import (
     timing_summary,
 )
 from rwkv7m.api import create_train_runtime
-from rwkv7m.cli.config import apply_execution_overrides
+from rwkv7m.cli.config import (
+    add_training_vocab_tiling_args,
+    apply_execution_overrides,
+)
 from rwkv7m.io import load_model_config
+from rwkv7m.kernels import (
+    resolve_screening_backend,
+    resolve_training_loss_backend,
+    resolve_wkv_backend,
+)
 from rwkv7m.model import MODEL_PRESET_NAMES, model_preset
 from rwkv7m.train.nnx_train import nnx_model_loss
 
@@ -57,6 +65,7 @@ def parse_args(argv=None):
     head = parser.add_mutually_exclusive_group()
     head.add_argument("--head-chunk-size", type=int, default=None)
     head.add_argument("--no-head-chunking", action="store_true")
+    add_training_vocab_tiling_args(parser)
     args = parser.parse_args(argv)
     if args.ctx_len <= 0 or args.batch_size <= 0:
         parser.error("--ctx-len and --batch-size must be positive")
@@ -281,6 +290,14 @@ def main(argv=None):
             "remat_blocks": config.remat_blocks,
             "sequence_chunk_size": config.sequence_chunk_size,
             "head_chunk_size": config.head_chunk_size,
+            "training_vocab_tile_size": config.training_vocab_tile_size,
+            "wkv_backend": resolve_wkv_backend(),
+            "screening_backend": resolve_screening_backend(),
+            "training_loss_backend": (
+                resolve_training_loss_backend()
+                if config.training_vocab_tile_size is not None
+                else "full_logits_xla"
+            ),
         },
         "fixed_batch": {
             "path": str(args.fixed_batch.resolve()),

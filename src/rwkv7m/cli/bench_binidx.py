@@ -13,7 +13,11 @@ from ..model import (
     ScreeningConfig,
     model_preset,
 )
-from .config import apply_execution_overrides, parse_args_with_config
+from .config import (
+    add_training_vocab_tiling_args,
+    apply_execution_overrides,
+    parse_args_with_config,
+)
 
 
 def default_bank_ids(n_slots):
@@ -153,6 +157,7 @@ def parse_args(argv=None):
     head_chunk_group = parser.add_mutually_exclusive_group()
     head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
     head_chunk_group.add_argument("--no-head-chunking", action="store_true")
+    add_training_vocab_tiling_args(parser)
     parser.add_argument("--vocab-size", type=int, default=65536)
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--d-ffn", type=int, default=128)

@@ -36,6 +36,13 @@ common WKV API + custom VJP + sharding contract
     CPU/tests          -> lax.scan reference
 ```
 
+The NVIDIA implementations now pass an explicit backend compiler object.
+Triton uses `pltriton.CompilerParams`; Mosaic GPU uses
+`plgpu.CompilerParams` with parallel grid semantics and 6 KiB of cross-warp
+reduction scratch. Previously the Mosaic dispatch name did not pass Mosaic
+compiler parameters, so it was not evidence of a distinct lowering. Real
+Hopper/Blackwell validation is still required.
+
 Forward and backward tuning are independent. A tuning record may select
 different `rows_per_program`, warp count, pipeline depth, checkpoint interval,
 and reduction strategy. Dispatch keys include GPU compute capability, batch
@@ -82,9 +89,20 @@ collectives as part of its sharding contract.
 The NNX training path now retains the recurrent hidden sequence and runs the LM
 head with an independently selected `head_chunk_size`. When that value is
 `None`, it inherits `sequence_chunk_size` to preserve the memory behavior of
-existing presets. Each head chunk still creates its full BF16 vocabulary logits
-and casts them to FP32 for cross entropy. Vocabulary tiling and online
-log-sum-exp are therefore still pending.
+existing presets.
+
+An opt-in vocabulary-tiled training path keeps GEMMs in XLA and dispatches the
+per-tile maximum, exponential sum, target logit, and maximum-count reduction to
+separate TPU and GPU Pallas kernels. A common custom VJP reconstructs each tile
+and computes hidden, head-weight, mask, cross-entropy, and L2Wrap gradients
+without retaining a full FP32 vocabulary tensor.
+
+Use `--training-vocab-tile-size N`; `--no-training-vocab-tiling` forces the
+portable full-logits path. This is a memory option, not the speed default. On
+TPU v5e, XLA's full-vocabulary head was faster for every measured 0.185B head
+shape, so `training_vocab_tile_size` defaults to `None`. The tiled path also
+stays out of explicitly sharded/vocabulary-parallel execution until that path
+has a dedicated single-collective contract.
 
 ## Screening recurrence boundary
 
@@ -169,8 +187,11 @@ not accepted as proof of the limiting resource.
    interpret-mode parity, real TPU v5e lowering, full-model BF16 gradient, and
    four-way model-sharded train-step checks. Broader shape profiling and
    autotuning remain pending.
-7. **Partial:** token-axis head chunking is implemented; vocabulary-tiled
-   streaming/fused cross entropy is pending.
+7. **Implemented, opt-in memory path:** token-axis head chunking and
+   vocabulary-tiled online cross entropy/L2Wrap with a common analytic VJP and
+   separate TPU/GPU Pallas reducers. The TPU speed gate failed, so full XLA
+   logits remain the default. Vocabulary-parallel single-collective fusion and
+   a real GPU performance gate remain pending.
 8. **Implemented foundation:** optional FFI registration and explicit dispatch
    contracts exist; no native FFI implementation is bundled or selected by
    default.
@@ -270,3 +291,34 @@ the required end-to-end preset benchmarks or XProf tuning.
 The temporary TPU VM `rwkv7m-pallas-260714` was deleted after validation. The
 delete operation completed successfully, and the TPU VM list for `us-west4-a`
 was empty afterward.
+
+## TPU v5e training-head gate
+
+The vocabulary-tiled path was tested on 2026-07-16 on a temporary
+`v5litepod-4` named `rwkv7m-head-260716`. Inputs were fixed and resident on one
+TPU device; JIT compilation was excluded; 10 calls were measured for the
+initial 4,096 tile gate and 20 for each larger tile, with every call blocked on
+all outputs. The tracked head shape used BF16, 128 positions, hidden size 768,
+and vocabulary size 65,536. Ratios below are
+`full-XLA median / tiled-Pallas median`, so values below 1.0 are regressions.
+
+| Vocabulary tile | Largest BF16 logits | Forward ratio | Forward + backward ratio |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 1 MiB | 0.40x | 0.38x |
+| 8,192 | 2 MiB | 0.51x | 0.49x |
+| 16,384 | 4 MiB | 0.59x | 0.59x |
+| 32,768 | 8 MiB | 0.58x | 0.63x |
+| 65,536 | 16 MiB | 0.79x | 0.83x |
+
+The untiled BF16 logits tensor is 16 MiB for this head chunk. At tile 4,096,
+the maximum component error was `3.66e-4` and the maximum gradient error was
+`1.91e-6`, but median forward/backward time rose from 0.648 ms to 1.699 ms.
+At 512 positions, tile 16,384 reduced the largest logits tensor from 64 MiB to
+16 MiB but achieved only 0.54x of full-XLA forward/backward speed. These results
+support the memory-saving implementation, but reject automatic speed dispatch
+on TPU v5e.
+
+The real-accelerator regression test passed both the standalone custom VJP and
+the NNX model training-head integration with `pallas_tpu`. After the gate, the
+temporary VM was deleted; the zone list was empty and describing the VM returned
+`NOT_FOUND`.

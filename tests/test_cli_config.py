@@ -1,8 +1,11 @@
 import json
 
+import pytest
+
 from rwkv7m.cli.bench_binidx import parse_args as parse_bench_args
 from rwkv7m.cli.eval_binidx import parse_args as parse_eval_args
 from rwkv7m.cli.train_binidx import parse_args as parse_train_args
+from rwkv7m.cli.train_binidx import build_config as build_train_config
 
 
 def write_config(tmp_path, data):
@@ -37,3 +40,33 @@ def test_eval_and_bench_config_file_parse(tmp_path):
     assert bench_args.data_file == "data/minipile"
     assert eval_args.ctx_len == 128
     assert bench_args.ctx_len == 128
+
+
+def test_training_vocab_tiling_execution_overrides():
+    common = [
+        "--data-file",
+        "unused",
+        "--ctx-len",
+        "8",
+        "--no-screening",
+    ]
+    tiled = build_train_config(
+        parse_train_args([*common, "--training-vocab-tile-size", "2048"])
+    )
+    untiled = build_train_config(
+        parse_train_args([*common, "--no-training-vocab-tiling"])
+    )
+    assert tiled.training_vocab_tile_size == 2048
+    assert untiled.training_vocab_tile_size is None
+    with pytest.raises(ValueError, match="must be divisible"):
+        build_train_config(
+            parse_train_args(
+                [
+                    *common,
+                    "--vocab-size",
+                    "130",
+                    "--training-vocab-tile-size",
+                    "64",
+                ]
+            )
+        )

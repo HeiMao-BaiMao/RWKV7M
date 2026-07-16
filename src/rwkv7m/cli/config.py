@@ -2,6 +2,26 @@ import argparse
 import json
 
 
+def add_training_vocab_tiling_args(parser: argparse.ArgumentParser):
+    """Add execution-only vocabulary-tiling controls to a CLI parser."""
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--training-vocab-tile-size",
+        type=int,
+        default=None,
+        help=(
+            "vocabulary tile used by the accelerator streaming training "
+            "loss; the model-config value is retained when omitted"
+        ),
+    )
+    group.add_argument(
+        "--no-training-vocab-tiling",
+        action="store_true",
+        help="use the portable full-logits training loss",
+    )
+
+
 def apply_execution_overrides(config, args):
     """Apply opt-in remat/chunk controls without replacing model presets."""
     remat_blocks = getattr(args, "remat_blocks", None)
@@ -35,6 +55,23 @@ def apply_execution_overrides(config, args):
         if head_chunk_size <= 0:
             raise ValueError("--head-chunk-size must be positive")
         config.head_chunk_size = int(head_chunk_size)
+
+    vocab_tile_size = getattr(args, "training_vocab_tile_size", None)
+    no_vocab_tiling = getattr(args, "no_training_vocab_tiling", False)
+    if no_vocab_tiling:
+        config.training_vocab_tile_size = None
+    elif vocab_tile_size is not None:
+        if vocab_tile_size <= 0:
+            raise ValueError("--training-vocab-tile-size must be positive")
+        if (
+            config.vocab_size > vocab_tile_size
+            and config.vocab_size % vocab_tile_size != 0
+        ):
+            raise ValueError(
+                "vocab_size must be divisible by "
+                "--training-vocab-tile-size when multiple tiles are required"
+            )
+        config.training_vocab_tile_size = int(vocab_tile_size)
     return config
 
 

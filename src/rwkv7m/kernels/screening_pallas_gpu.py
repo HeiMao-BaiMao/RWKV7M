@@ -588,6 +588,13 @@ def _compiler_params(
     *,
     interpret: bool,
 ):
+    if lowering == "mosaic" and not interpret:
+        from jax.experimental.pallas import mosaic_gpu as plgpu
+
+        return plgpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            reduction_scratch_bytes=6144,
+        )
     if lowering == "triton" and not interpret:
         from jax.experimental.pallas import triton as pltriton
 

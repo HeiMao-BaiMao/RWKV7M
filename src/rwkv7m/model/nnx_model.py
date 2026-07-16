@@ -16,6 +16,10 @@ from flax import nnx
 from flax.linen import initializers
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from rwkv7m.kernels.training_loss_backend import (
+    resolve_training_loss_backend,
+)
+
 from .losses import cross_entropy_components, l2wrap_components
 from .rwkv_core import _get_ffn_dim, _time_shift, symmetric_uniform_init
 from .screened_rwkv import ModelConfig, _get_model_dtype
@@ -42,6 +46,7 @@ from .screening_recurrence import (
     screening_recurrence_sharded,
 )
 from .state import LayerRWKVState, LayerScreenState, ModelScreenState
+from .training_head import tiled_training_loss_components
 from .wkv import wkv7, wkv7_sharded
 
 
@@ -1456,6 +1461,46 @@ class NNXScreenedRWKVModel(nnx.Module):
         target_sharding=None,
     ):
         """Return reducible CE/L2 components without exposing training logits."""
+        tile_size = self.config.training_vocab_tile_size
+        backend = (
+            resolve_training_loss_backend()
+            if tile_size is not None
+            else "reference"
+        )
+        vocab_size = self.config.vocab_size
+        use_tiled_head = (
+            tile_size is not None
+            and backend != "reference"
+            and self.sharding is None
+            and (vocab_size <= tile_size or vocab_size % tile_size == 0)
+        )
+        if use_tiled_head:
+            normalized = _apply_norm_in_float32(
+                self.final_ln,
+                hidden,
+                output_dtype=_get_model_dtype(self.config),
+            )
+            loss_mask = (
+                jnp.ones(targets.shape, dtype=jnp.float32)
+                if mask is None
+                else mask
+            )
+            ce_total, ce_count, l2_total, l2_count = (
+                tiled_training_loss_components(
+                    normalized,
+                    _value(self.lm_head.kernel),
+                    targets,
+                    loss_mask,
+                    int(tile_size),
+                    backend,
+                )
+            )
+            return {
+                "ce_total": ce_total,
+                "ce_count": ce_count,
+                "l2_total": l2_total,
+                "l2_count": l2_count,
+            }
         logits = self.compute_logits(hidden)
         ce_total, ce_count = cross_entropy_components(
             logits,

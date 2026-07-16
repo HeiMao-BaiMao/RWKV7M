@@ -245,6 +245,24 @@ for tracked presets, then use XProf to tune checkpoint intervals, VMEM usage,
 and program layout. Kernel-level numbers should remain diagnostic evidence, not
 the final dispatch criterion.
 
+## Vocabulary-tiled training-head gate
+
+On 2026-07-16, a separate `v5litepod-4` run evaluated the TPU-specific Pallas
+tile reducer used by the opt-in streaming training head. With BF16, 128
+positions, hidden size 768, and vocabulary 65,536, tile sizes from 4,096 through
+65,536 all passed component and gradient parity. They did not pass the speed
+gate: forward ratios ranged from 0.40x to 0.79x and forward/backward ratios from
+0.38x to 0.83x relative to the full XLA head. Tile 4,096 reduced the largest
+BF16 logits allocation from 16 MiB to 1 MiB, establishing its value as a memory
+control rather than a default throughput optimization.
+
+The tracked benchmark is `scripts/benchmark_training_head_accelerator.py`. It
+uses fixed device-resident inputs, excludes compilation, records forward and
+forward/backward independently, blocks on all leaves after each call, and
+reports both component and gradient parity. The default model configuration
+therefore leaves `training_vocab_tile_size=None`; users can opt in with
+`--training-vocab-tile-size` when memory is the binding constraint.
+
 ## Resource cleanup
 
 After all correctness, sharding, and timing checks completed, the temporary TPU
@@ -256,3 +274,7 @@ The 2026-07-16 screening VM `rwkv7m-screening-260716` was likewise deleted
 after its final four-device audit. A subsequent `tpu-vm list` for
 `us-west4-a` returned no rows, and an explicit describe of that VM returned
 `NOT_FOUND`.
+
+The 2026-07-16 training-head VM `rwkv7m-head-260716` was deleted after its
+standalone and NNX integration gates. The zone list returned no rows and an
+explicit describe returned `NOT_FOUND`.
