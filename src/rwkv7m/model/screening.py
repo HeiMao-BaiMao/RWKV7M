@@ -208,7 +208,9 @@ def competitive_write_routing(
     if hard_admission:
         admission = (admission >= admission_threshold).astype(jnp.float32)
 
-    bank_index = jnp.arange(3, dtype=jnp.float32)
+    # Mosaic TPU requires ``iota`` itself to have an integer/index dtype.
+    # Convert only after materializing the tie-break indices.
+    bank_index = jnp.arange(3, dtype=jnp.int32).astype(jnp.float32)
     available_banks = jnp.stack(
         [jnp.any(bank_ids == bank_id) for bank_id in range(3)]
     )
@@ -230,7 +232,7 @@ def competitive_write_routing(
     ).astype(jnp.float32)
     bank_route = bank_soft + jax.lax.stop_gradient(bank_hard - bank_soft)
 
-    slot_index = jnp.arange(slot_count, dtype=jnp.float32)
+    slot_index = jnp.arange(slot_count, dtype=jnp.int32).astype(jnp.float32)
     victim_route = jnp.zeros_like(eligibility, dtype=jnp.float32)
     for bank_id in range(3):
         mask = bank_ids == bank_id
