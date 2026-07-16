@@ -140,6 +140,11 @@ contracts, WKV state `P("data", "model", None, None)`, screening slots
 `P("data", None, "model")`, and 16 post-SPMD collectives: 13 all-reduces,
 3 all-to-alls, and no all-gathers.
 
+After projected Pallas screening was integrated, the same small audit was
+rerun on 2026-07-16. It completed finite loss `3.95950198` and optimizer step 1
+with 18 post-SPMD collectives: 13 all-reduces, 3 all-to-alls, and 2 explicit
+slot-feature all-gathers at the screening recurrence boundary.
+
 The independent small NNX lifecycle probe was then run as separate `create` and
 `restore` processes on the same slice. It restored the Orbax checkpoint and
 completed optimizer step 2 with finite loss. This result validates the isolated
@@ -211,10 +216,11 @@ Main findings:
 - Increasing the model-sharded `1b` run from global batch 1 to 4 improved median
   throughput by 2.73 times. Both configurations fit in v5e HBM and completed
   finite forward, backward, and optimizer updates.
-- The current small-model audit with vocabulary parallelism, rematerialization,
-  and sequence chunking enabled reported 15 forward collectives: 12 all-reduces,
-  3 all-to-alls, and no all-gathers. This is a different compile configuration
-  from the earlier 16-collective functional record above.
+- A separate 2026-07-14 small-model audit with vocabulary parallelism,
+  rematerialization, and sequence chunking enabled reported 15 forward
+  collectives: 12 all-reduces, 3 all-to-alls, and no all-gathers. This is a
+  historical, different compile configuration from both functional records
+  above.
 - No OOM, TPU runtime restart, or hardware health error was observed. Cloud
   Monitoring agent errors occurred near the test window, but no causal link to
   the isolated slow steps was established.

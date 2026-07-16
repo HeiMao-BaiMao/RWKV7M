@@ -683,26 +683,27 @@ def screening_recurrence_sharded(
             replicated(outputs[5]),
         )
 
+    input_specs = (
+        time_data,
+        time_data,
+        time_data_model,
+        time_data_replicated,
+        time_data_replicated,
+        time_data_replicated,
+        data_slots,
+        data_vectors,
+        data_vectors,
+        data_vectors,
+        data_scalars,
+        data_scalars,
+        replicated_vector,
+        replicated_scalar,
+        replicated_scalar,
+    )
     mapped_recurrence = jax.shard_map(
         mapped,
         mesh=mesh,
-        in_specs=(
-            time_data,
-            time_data,
-            time_data_model,
-            time_data_replicated,
-            time_data_replicated,
-            time_data_replicated,
-            data_slots,
-            data_vectors,
-            data_vectors,
-            data_vectors,
-            data_scalars,
-            data_scalars,
-            replicated_vector,
-            replicated_scalar,
-            replicated_scalar,
-        ),
+        in_specs=input_specs,
         out_specs=(
             time_data,
             data_slots,
@@ -713,7 +714,7 @@ def screening_recurrence_sharded(
         ),
         check_vma=False,
     )
-    return mapped_recurrence(
+    inputs = (
         q_read,
         q_write,
         delta_slots,
@@ -730,6 +731,11 @@ def screening_recurrence_sharded(
         tau_read,
         tau_write,
     )
+    placed_inputs = tuple(
+        jax.reshard(value, jax.NamedSharding(mesh, spec))
+        for value, spec in zip(inputs, input_specs, strict=True)
+    )
+    return mapped_recurrence(*placed_inputs)
 
 
 __all__ = [

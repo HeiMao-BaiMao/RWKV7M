@@ -1,4 +1,4 @@
-# TPU Pallas WKV Performance Validation
+# TPU Pallas WKV and Screening Performance Validation
 
 ## Summary
 
@@ -18,6 +18,21 @@ older end-to-end preset measurements as if they used the same workload.
 The matching L40S shape and full GPU training results are recorded separately
 in the [L40S Pallas performance report](gpu_l40s_pallas_performance.md).
 
+On 2026-07-16, the projected state-level-screening recurrence was validated on
+the same TPU type. For the `0.185b` preset recurrence shape
+`T=128, B=1, M=16, d_slot=128, d_k=d_v=64`, the TPU Pallas path was 5.04x
+faster in inference forward and 5.92x faster in synchronized
+forward-plus-backward than the equivalent `lax.scan` reference.
+
+| Screening operation | Pallas TPU | `lax.scan` reference | Speedup | Latency reduction |
+| --- | ---: | ---: | ---: | ---: |
+| Forward | 0.257 ms | 1.298 ms | 5.04x | 80.2% |
+| Forward + backward | 0.380 ms | 2.251 ms | 5.92x | 83.1% |
+
+These ratios apply only to the projected screening recurrence. A complete
+`0.185b` train step includes the RWKV blocks, dense projections, vocabulary
+head, loss, and optimizer, so its end-to-end ratio is necessarily different.
+
 ## Implementation change
 
 The previous accelerator path expressed the time recurrence as `lax.scan` over
@@ -34,6 +49,13 @@ general JAX operations. The new path uses:
 Automatic dispatch now selects `pallas_tpu` on TPU. CPU continues to use the
 reference recurrence. FFI is not selected automatically.
 
+The screening kernel uses the same external BF16-vector/FP32-state contract,
+but its TPU body keeps vector values in rank-two physical tiles such as
+`[1, feature]` and `[slots, 1]`. The initial rank-one implementation triggered
+a TPU compiler `VectorLayout::join` assertion before execution. Keeping the
+rank-two layout inside Pallas, then squeezing only at the public boundary,
+removed the compiler failure without changing the public shapes.
+
 ## Test environment
 
 | Item | Value |
@@ -48,9 +70,10 @@ reference recurrence. FFI is not selected automatically.
 | State and accumulation dtype | FP32 |
 | Transparent hugepages | disabled |
 
-The temporary VM name was `rwkv7m-pallas-260714`.
+The WKV session used `rwkv7m-pallas-260714`. The screening session used
+`rwkv7m-screening-260716`; both were `v5litepod-4` TPU VMs in `us-west4-a`.
 
-## Microbenchmark method
+## WKV microbenchmark method
 
 The benchmark used six random BF16 vector inputs and one random FP32 initial
 state with the following WKV shape:
@@ -87,6 +110,23 @@ The Pallas and reference final FP32 states had a measured maximum absolute
 difference of `0.0` in this run. Separate real-accelerator parity tests also
 checked BF16 outputs and gradients for all seven differentiable inputs.
 
+### 2026-07-16 WKV revalidation
+
+The current schema-v2 benchmark harness was rerun on the screening-session VM
+with the same WKV shape. It used five excluded warmups, 100 synchronized
+iterations, a fixed PCG64-generated input, and disabled Python GC.
+
+| Operation | Pallas TPU | `lax.scan` reference | Speedup |
+| --- | ---: | ---: | ---: |
+| Forward | 0.276 ms | 0.309 ms | 1.12x |
+| Forward + backward | 0.528 ms | 0.657 ms | 1.24x |
+
+This revalidation is the current reproducible WKV result. The 2026-07-14 raw
+numbers above are retained as the historical first validation rather than
+silently replacing a prior measurement. The change in reference
+forward-plus-backward latency reflects the revised measurement harness, so the
+two dates should not be combined into a trend claim.
+
 ## Integration validation
 
 The timing result was interpreted only after the following real-TPU checks
@@ -119,6 +159,68 @@ uv run rwkv7m-audit-nnx-model-parallel \
   --write-screening
 ```
 
+## Screening correctness and performance
+
+The screening accelerator test enabled writes, value normalization, leaky
+warmup, and the age mask. It compared all six public outputs and gradients for
+all 15 differentiable inputs with the reference on a real TPU. The test passed
+with BF16 public output and FP32 state boundaries intact:
+
+```bash
+uv run pytest tests/test_screening_pallas_accelerator.py -q
+```
+
+The performance run used the `0.185b` screening recurrence shape, the fixed
+random seed 31, three excluded warmups, 20 measured iterations, disabled
+Python GC, and a synchronization after every call. Pallas and reference used
+the same arrays and objective. Compilation, input construction, and host to
+device transfer were outside the measurement windows.
+
+```bash
+uv run python scripts/benchmark_screening_accelerator.py \
+  --warmup 3 \
+  --iterations 20 \
+  --disable-python-gc
+```
+
+The maximum absolute output error was `5.96e-8`; the maximum absolute gradient
+error over all 15 inputs was also `5.96e-8`. The scalar training-loss
+difference was `0.0`.
+
+The four-device `data=1, model=4` audit also passed after the screening change.
+It executed finite forward output and one complete optimizer step with loss
+`3.95950198`. Screening slots had sharding
+`P('data', None, 'model')`. The post-SPMD executable contained 2 all-gathers,
+13 all-reduces, and 3 all-to-alls. The two all-gathers are the explicit slot
+feature gathers at the screening recurrence boundary.
+
+## Complete-model compute-only check
+
+A fixed device-resident `1 x 128` batch was used with the `0.185b` preset on
+one TPU device. Both variants disabled block rematerialization, sequence
+chunking, and head chunking so that their execution settings were identical.
+Each result used two excluded warmups, ten synchronized iterations, and
+disabled Python GC.
+
+| Variant | Median full step | Median throughput |
+| --- | ---: | ---: |
+| Baseline | 20.394 ms | 6,276 token/s |
+| Read-write screening | 21.002 ms | 6,095 token/s |
+
+For this shape, read-write screening added about 3.0% median latency, or 2.9%
+throughput cost, while adding 1,028,486 parameters. This is a complete-model
+comparison between variants, not a Pallas-versus-reference comparison: both
+variants use the production TPU Pallas WKV path, and the read-write variant
+also uses Pallas screening.
+
+The preset-default rematerialized read-write path was separately exercised
+with five iterations and completed at a median 22.735 ms, or 5,630 token/s.
+This shorter run is a compatibility check, not the primary comparison above.
+The corrected compute-only harness now performs optimizer-only and full-step
+windows through the functional NNX model/optimizer state, matching the actual
+NNX optimizer node types instead of passing array gradients to an incompatible
+raw Optax state tree.
+
 ## Interpretation and limitations
 
 The measured result supports the narrower conclusion that the current Pallas
@@ -132,6 +234,12 @@ v5e shape, especially in backward. It does not yet establish:
 - results with transparent hugepages enabled;
 - production stability across future experimental Pallas API changes.
 
+The new screening result likewise establishes a substantial recurrence-level
+improvement and successful one-host SPMD integration for the tested shapes. It
+does not establish multi-host scaling, other preset shapes, or that screening
+improves model quality. The complete-model result shows low overhead for this
+small batch; it is not evidence for screening's validation-loss benefit.
+
 The next performance gate should compare complete steady-state training steps
 for tracked presets, then use XProf to tune checkpoint intervals, VMEM usage,
 and program layout. Kernel-level numbers should remain diagnostic evidence, not
@@ -143,3 +251,8 @@ After all correctness, sharding, and timing checks completed, the temporary TPU
 VM `rwkv7m-pallas-260714` was deleted. The Google Cloud delete operation
 completed successfully, and a subsequent TPU VM listing for `us-west4-a`
 returned no remaining TPU VMs.
+
+The 2026-07-16 screening VM `rwkv7m-screening-260716` was likewise deleted
+after its final four-device audit. A subsequent `tpu-vm list` for
+`us-west4-a` returned no rows, and an explicit describe of that VM returned
+`NOT_FOUND`.

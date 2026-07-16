@@ -13,8 +13,8 @@ _STEP_STAT_COUNT = 8
 
 
 def _load_time_vector(ref, index):
-    block = ref[pl.dslice(index, 1), :, :]
-    return block[0, 0, :]
+    block = ref[pl.dslice(index, 1), :, :, :]
+    return block[0, 0, :, :]
 
 
 def _load_time_matrix(ref, index):
@@ -27,11 +27,11 @@ def _load_state_matrix(ref):
 
 
 def _load_state_vector(ref):
-    return ref[:][0, :]
+    return ref[:][0, :, :]
 
 
 def _store_time_vector(ref, index, value):
-    ref[pl.dslice(index, 1), :, :] = value[None, None, :]
+    ref[pl.dslice(index, 1), :, :, :] = value[None, None, :, :]
 
 
 def _store_time_matrix(ref, index, value):
@@ -43,7 +43,7 @@ def _store_state_matrix(ref, value):
 
 
 def _store_state_vector(ref, value):
-    ref[:] = value[None, :]
+    ref[:] = value[None, :, :]
 
 
 def _unit_norm(value, eps):
@@ -93,7 +93,7 @@ def _screening_step(
         _unit_norm(values, eps) if use_value_unit_norm else values
     )
     read_similarity = jnp.sum(
-        normalized_read_keys * q_read[None, :], axis=-1
+        normalized_read_keys * q_read, axis=-1, keepdims=True
     )
     if use_leaky_warmup:
         hard = _trim_square(read_similarity, tau_read, eps)
@@ -104,13 +104,13 @@ def _screening_step(
     if use_age_mask:
         age_scores = (age_ref - ages) / (age_sigma + eps)
         read_relevance *= jax.nn.sigmoid(age_scores)
-    z = jnp.sum(read_relevance[:, None] * normalized_values, axis=0)
+    z = jnp.sum(read_relevance * normalized_values, axis=0, keepdims=True)
     u = _tanh_norm(z, tanh_norm_cap, eps)
 
     if write_enabled:
         normalized_write_keys = _unit_norm(write_keys, eps)
         write_similarity = jnp.sum(
-            normalized_write_keys * q_write[None, :], axis=-1
+            normalized_write_keys * q_write, axis=-1, keepdims=True
         )
         write_relevance = _trim_square(write_similarity, tau_write, eps)
         effective_write_relevance = jnp.maximum(
@@ -126,17 +126,16 @@ def _screening_step(
         strength = mu
         next_ages = ages
 
-    strength_vector = strength[:, None]
-    next_slots = slots + strength_vector * (delta_slots - slots)
-    next_read_keys = read_keys + strength_vector * (
+    next_slots = slots + strength * (delta_slots - slots)
+    next_read_keys = read_keys + strength * (
         delta_read_keys - read_keys
     )
-    next_values = values + strength_vector * (delta_values - values)
-    next_write_keys = write_keys + strength_vector * (
+    next_values = values + strength * (delta_values - values)
+    next_write_keys = write_keys + strength * (
         delta_write_keys - write_keys
     )
     update = next_slots - slots
-    update_squared = jnp.sum(update * update, axis=-1)
+    update_squared = jnp.sum(update * update, axis=-1, keepdims=True)
     activity = jnp.maximum(
         read_relevance,
         write_relevance if write_enabled else read_relevance,
@@ -144,17 +143,18 @@ def _screening_step(
     next_usage = usage_ema_decay * usage + (
         1.0 - usage_ema_decay
     ) * activity
-    statistics = jnp.stack(
+    statistics = jnp.concatenate(
         (
-            jnp.mean(read_relevance),
-            jnp.max(read_relevance),
-            jnp.sum(read_relevance > 1e-3).astype(jnp.float32),
-            jnp.sqrt(jnp.sum(z * z)),
-            jnp.sqrt(jnp.sum(u * u)),
-            jnp.mean(write_relevance),
-            jnp.mean(effective_write_relevance),
-            jnp.mean(next_usage),
-        )
+            jnp.mean(read_relevance, keepdims=True),
+            jnp.max(read_relevance, keepdims=True),
+            jnp.sum(read_relevance > 1e-3, keepdims=True).astype(jnp.float32),
+            jnp.sqrt(jnp.sum(z * z, keepdims=True)),
+            jnp.sqrt(jnp.sum(u * u, keepdims=True)),
+            jnp.mean(write_relevance, keepdims=True),
+            jnp.mean(effective_write_relevance, keepdims=True),
+            jnp.mean(next_usage, keepdims=True),
+        ),
+        axis=-1,
     )
     return (
         u,
@@ -215,9 +215,9 @@ def _screening_tpu_forward_kernel(
     write_keys = _load_state_matrix(initial_write_keys_ref).astype(jnp.float32)
     ages = _load_state_vector(initial_ages_ref).astype(jnp.float32)
     usage = _load_state_vector(initial_usage_ref).astype(jnp.float32)
-    mu = mu_ref[:].astype(jnp.float32)
-    tau_read = tau_read_ref[:][0].astype(jnp.float32)
-    tau_write = tau_write_ref[:][0].astype(jnp.float32)
+    mu = mu_ref[:][0, :, :].astype(jnp.float32)
+    tau_read = tau_read_ref[:][0, 0].astype(jnp.float32)
+    tau_write = tau_write_ref[:][0, 0].astype(jnp.float32)
 
     initial_carry = (slots, read_keys, values, write_keys, ages, usage)
 
@@ -227,105 +227,34 @@ def _screening_tpu_forward_kernel(
         q_read_t = _load_time_vector(q_read_ref, t).astype(jnp.float32)
         q_write_t = _load_time_vector(q_write_ref, t).astype(jnp.float32)
 
-        normalized_read_keys = _unit_norm(read_keys_t, eps)
-        normalized_values = values_t
-        if use_value_unit_norm:
-            normalized_values = _unit_norm(values_t, eps)
-        read_similarity = jnp.sum(
-            normalized_read_keys * q_read_t[None, :], axis=-1
-        )
-        if use_leaky_warmup:
-            hard = _trim_square(read_similarity, tau_read, eps)
-            soft = jax.nn.sigmoid(
-                leaky_gamma * (read_similarity - tau_read)
-            )
-            read_relevance = (
-                (1.0 - leaky_alpha) * hard + leaky_alpha * soft
-            )
-        else:
-            read_relevance = _trim_square(
-                read_similarity, tau_read, eps
-            )
-        if use_age_mask:
-            age_scores = (age_ref - ages_t) / (age_sigma + eps)
-            read_relevance *= jax.nn.sigmoid(age_scores)
-
-        z = jnp.sum(
-            read_relevance[:, None] * normalized_values, axis=0
-        )
-        u = _tanh_norm(z, tanh_norm_cap, eps)
-
-        if write_enabled:
-            normalized_write_keys = _unit_norm(write_keys_t, eps)
-            write_similarity = jnp.sum(
-                normalized_write_keys * q_write_t[None, :], axis=-1
-            )
-            write_relevance = _trim_square(
-                write_similarity, tau_write, eps
-            )
-            effective_write_relevance = jnp.maximum(
-                write_relevance, write_rel_floor
-            )
-            strength = mu * effective_write_relevance
-            next_ages = jnp.where(
-                write_relevance > 1e-3, 0.0, ages_t + 1.0
-            )
-        else:
-            write_relevance = jnp.zeros_like(read_relevance)
-            effective_write_relevance = write_relevance
-            strength = mu
-            next_ages = ages_t
-
-        strength_vector = strength[:, None]
-        next_slots = slots_t + strength_vector * (
-            _load_time_matrix(delta_slots_ref, t).astype(jnp.float32)
-            - slots_t
-        )
-        next_read_keys = read_keys_t + strength_vector * (
-            _load_time_matrix(delta_read_keys_ref, t).astype(jnp.float32)
-            - read_keys_t
-        )
-        next_values = values_t + strength_vector * (
-            _load_time_matrix(delta_values_ref, t).astype(jnp.float32)
-            - values_t
-        )
-        next_write_keys = write_keys_t + strength_vector * (
-            _load_time_matrix(delta_write_keys_ref, t).astype(jnp.float32)
-            - write_keys_t
-        )
-        update = next_slots - slots_t
-        update_squared = jnp.sum(update * update, axis=-1)
-
-        activity = jnp.maximum(
-            read_relevance,
-            write_relevance if write_enabled else read_relevance,
-        )
-        next_usage = usage_ema_decay * usage_t + (
-            1.0 - usage_ema_decay
-        ) * activity
-        statistics = jnp.stack(
-            (
-                jnp.mean(read_relevance),
-                jnp.max(read_relevance),
-                jnp.sum(read_relevance > 1e-3).astype(jnp.float32),
-                jnp.sqrt(jnp.sum(z * z)),
-                jnp.sqrt(jnp.sum(u * u)),
-                jnp.mean(write_relevance),
-                jnp.mean(effective_write_relevance),
-                jnp.mean(next_usage),
-            )
+        u, next_carry, statistics, update_squared = _screening_step(
+            carry,
+            q_read_t,
+            q_write_t,
+            _load_time_matrix(delta_slots_ref, t).astype(jnp.float32),
+            _load_time_matrix(delta_read_keys_ref, t).astype(jnp.float32),
+            _load_time_matrix(delta_values_ref, t).astype(jnp.float32),
+            _load_time_matrix(delta_write_keys_ref, t).astype(jnp.float32),
+            mu,
+            tau_read,
+            tau_write,
+            write_enabled=write_enabled,
+            use_value_unit_norm=use_value_unit_norm,
+            use_leaky_warmup=use_leaky_warmup,
+            leaky_alpha=leaky_alpha,
+            leaky_gamma=leaky_gamma,
+            use_age_mask=use_age_mask,
+            age_ref=age_ref,
+            age_sigma=age_sigma,
+            write_rel_floor=write_rel_floor,
+            usage_ema_decay=usage_ema_decay,
+            tanh_norm_cap=tanh_norm_cap,
+            eps=eps,
         )
         _store_time_vector(u_ref, t, u.astype(output_dtype))
         _store_time_vector(statistics_ref, t, statistics)
         _store_time_vector(update_squared_ref, t, update_squared)
-        return (
-            next_slots,
-            next_read_keys,
-            next_values,
-            next_write_keys,
-            next_ages,
-            next_usage,
-        )
+        return next_carry
 
     final_carry = time_loop
     _store_state_matrix(final_slots_ref, final_carry[0])
@@ -373,9 +302,9 @@ def _screening_tpu_training_forward_kernel(
         _load_state_vector(initial_ages_ref).astype(jnp.float32),
         _load_state_vector(initial_usage_ref).astype(jnp.float32),
     )
-    mu = mu_ref[:].astype(jnp.float32)
-    tau_read = tau_read_ref[:][0].astype(jnp.float32)
-    tau_write = tau_write_ref[:][0].astype(jnp.float32)
+    mu = mu_ref[:][0, :, :].astype(jnp.float32)
+    tau_read = tau_read_ref[:][0, 0].astype(jnp.float32)
+    tau_write = tau_write_ref[:][0, 0].astype(jnp.float32)
 
     @pl.loop(0, time, init_carry=carry)
     def time_loop(t, carry_t):
@@ -453,9 +382,10 @@ def _screening_tpu_backward_kernel(
     **step_config,
 ):
     time = step_config.pop("time")
-    mu = mu_ref[:].astype(jnp.float32)
-    tau_read = tau_read_ref[:][0].astype(jnp.float32)
-    tau_write = tau_write_ref[:][0].astype(jnp.float32)
+    gradient_dtypes = step_config.pop("gradient_dtypes")
+    mu = mu_ref[:][0, :, :].astype(jnp.float32)
+    tau_read = tau_read_ref[:][0, 0].astype(jnp.float32)
+    tau_write = tau_write_ref[:][0, 0].astype(jnp.float32)
     reverse_carry = (
         _load_state_matrix(cotangent_final_slots_ref).astype(jnp.float32),
         jnp.zeros_like(_load_state_matrix(initial_read_keys_ref), dtype=jnp.float32),
@@ -531,12 +461,30 @@ def _screening_tpu_backward_kernel(
                 gradient_carry[:6],
             )
         )
-        _store_time_vector(grad_q_read_ref, t, gradients[1])
-        _store_time_vector(grad_q_write_ref, t, gradients[2])
-        _store_time_matrix(grad_delta_slots_ref, t, gradients[3])
-        _store_time_matrix(grad_delta_read_keys_ref, t, gradients[4])
-        _store_time_matrix(grad_delta_values_ref, t, gradients[5])
-        _store_time_matrix(grad_delta_write_keys_ref, t, gradients[6])
+        _store_time_vector(
+            grad_q_read_ref, t, gradients[1].astype(gradient_dtypes[0])
+        )
+        _store_time_vector(
+            grad_q_write_ref, t, gradients[2].astype(gradient_dtypes[1])
+        )
+        _store_time_matrix(
+            grad_delta_slots_ref, t, gradients[3].astype(gradient_dtypes[2])
+        )
+        _store_time_matrix(
+            grad_delta_read_keys_ref,
+            t,
+            gradients[4].astype(gradient_dtypes[3]),
+        )
+        _store_time_matrix(
+            grad_delta_values_ref,
+            t,
+            gradients[5].astype(gradient_dtypes[4]),
+        )
+        _store_time_matrix(
+            grad_delta_write_keys_ref,
+            t,
+            gradients[6].astype(gradient_dtypes[5]),
+        )
         return (
             *gradients[0],
             gradient_carry[6] + gradients[7],
@@ -545,13 +493,30 @@ def _screening_tpu_backward_kernel(
         )
 
     final_gradients = reverse_loop
-    _store_state_matrix(grad_initial_slots_ref, final_gradients[0])
-    _store_state_matrix(grad_initial_read_keys_ref, final_gradients[1])
-    _store_state_matrix(grad_initial_values_ref, final_gradients[2])
-    _store_state_matrix(grad_initial_write_keys_ref, final_gradients[3])
-    _store_state_vector(grad_initial_ages_ref, final_gradients[4])
-    _store_state_vector(grad_initial_usage_ref, final_gradients[5])
-    grad_mu_ref[:] = final_gradients[6][None, :]
+    _store_state_matrix(
+        grad_initial_slots_ref, final_gradients[0].astype(gradient_dtypes[6])
+    )
+    _store_state_matrix(
+        grad_initial_read_keys_ref,
+        final_gradients[1].astype(gradient_dtypes[7]),
+    )
+    _store_state_matrix(
+        grad_initial_values_ref,
+        final_gradients[2].astype(gradient_dtypes[8]),
+    )
+    _store_state_matrix(
+        grad_initial_write_keys_ref,
+        final_gradients[3].astype(gradient_dtypes[9]),
+    )
+    _store_state_vector(
+        grad_initial_ages_ref,
+        final_gradients[4].astype(gradient_dtypes[10]),
+    )
+    _store_state_vector(
+        grad_initial_usage_ref,
+        final_gradients[5].astype(gradient_dtypes[11]),
+    )
+    grad_mu_ref[:] = final_gradients[6][None, :, :]
     grad_tau_read_ref[:] = jnp.reshape(final_gradients[7], (1, 1))
     grad_tau_write_ref[:] = jnp.reshape(final_gradients[8], (1, 1))
 
@@ -582,38 +547,8 @@ def screening_pallas_tpu_forward(
     _, n_slots, slot_size = initial_slots.shape
     value_size = initial_values.shape[-1]
 
-    q_spec = pl.BlockSpec(
-        (time, 1, key_size), lambda batch_id: (0, batch_id, 0)
-    )
-
-    def time_matrix_spec(feature_size):
-        return pl.BlockSpec(
-            (time, 1, n_slots, feature_size),
-            lambda batch_id: (0, batch_id, 0, 0),
-        )
-
-    def state_matrix_spec(feature_size):
-        return pl.BlockSpec(
-            (1, n_slots, feature_size),
-            lambda batch_id: (batch_id, 0, 0),
-        )
-
-    state_vector_spec = pl.BlockSpec(
-        (1, n_slots), lambda batch_id: (batch_id, 0)
-    )
-    shared_vector_spec = pl.BlockSpec(
-        (n_slots,), lambda batch_id: (0,)
-    )
-    shared_scalar_spec = pl.BlockSpec((1,), lambda batch_id: (0,))
-    u_spec = pl.BlockSpec(
-        (time, 1, value_size), lambda batch_id: (0, batch_id, 0)
-    )
-    statistics_spec = pl.BlockSpec(
-        (time, 1, _STEP_STAT_COUNT),
-        lambda batch_id: (0, batch_id, 0),
-    )
-    update_spec = pl.BlockSpec(
-        (time, 1, n_slots), lambda batch_id: (0, batch_id, 0)
+    specs = _screening_tpu_specs(
+        time, key_size, n_slots, slot_size, value_size
     )
 
     kernel = partial(
@@ -633,51 +568,45 @@ def screening_pallas_tpu_forward(
         eps=config.eps,
         output_dtype=delta_values.dtype,
     )
-    return pl.pallas_call(
+    result = pl.pallas_call(
         kernel,
         out_shape=(
             jax.ShapeDtypeStruct(
-                (time, batch, value_size), delta_values.dtype
+                (time, batch, 1, value_size), delta_values.dtype
             ),
             jax.ShapeDtypeStruct(initial_slots.shape, jnp.float32),
-            jax.ShapeDtypeStruct(initial_ages.shape, jnp.float32),
-            jax.ShapeDtypeStruct(initial_usage.shape, jnp.float32),
+            jax.ShapeDtypeStruct((*initial_ages.shape, 1), jnp.float32),
+            jax.ShapeDtypeStruct((*initial_usage.shape, 1), jnp.float32),
             jax.ShapeDtypeStruct(
-                (time, batch, _STEP_STAT_COUNT), jnp.float32
+                (time, batch, 1, _STEP_STAT_COUNT), jnp.float32
             ),
-            jax.ShapeDtypeStruct((time, batch, n_slots), jnp.float32),
+            jax.ShapeDtypeStruct((time, batch, n_slots, 1), jnp.float32),
         ),
         grid=(batch,),
         in_specs=(
-            q_spec,
-            q_spec,
-            time_matrix_spec(slot_size),
-            time_matrix_spec(key_size),
-            time_matrix_spec(value_size),
-            time_matrix_spec(key_size),
-            state_matrix_spec(slot_size),
-            state_matrix_spec(key_size),
-            state_matrix_spec(value_size),
-            state_matrix_spec(key_size),
-            state_vector_spec,
-            state_vector_spec,
-            shared_vector_spec,
-            shared_scalar_spec,
-            shared_scalar_spec,
+            specs["q"], specs["q"],
+            specs["time_matrix"](slot_size),
+            specs["time_matrix"](key_size),
+            specs["time_matrix"](value_size),
+            specs["time_matrix"](key_size),
+            specs["state_matrix"](slot_size),
+            specs["state_matrix"](key_size),
+            specs["state_matrix"](value_size),
+            specs["state_matrix"](key_size),
+            specs["state_vector"], specs["state_vector"],
+            specs["shared_vector"], specs["shared_scalar"],
+            specs["shared_scalar"],
         ),
         out_specs=(
-            u_spec,
-            state_matrix_spec(slot_size),
-            state_vector_spec,
-            state_vector_spec,
-            statistics_spec,
-            update_spec,
+            specs["u"], specs["state_matrix"](slot_size),
+            specs["state_vector"], specs["state_vector"],
+            specs["statistics"], specs["update"],
         ),
         interpret=interpret,
         name="rwkv7_screening_tpu_forward",
     )(
-        q_read,
-        q_write,
+        q_read[:, :, None, :],
+        q_write[:, :, None, :],
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -686,11 +615,19 @@ def screening_pallas_tpu_forward(
         initial_read_keys,
         initial_values,
         initial_write_keys,
-        initial_ages,
-        initial_usage,
-        mu,
-        jnp.reshape(tau_read, (1,)),
-        jnp.reshape(tau_write, (1,)),
+        initial_ages[:, :, None],
+        initial_usage[:, :, None],
+        mu[None, :, None],
+        jnp.reshape(tau_read, (1, 1)),
+        jnp.reshape(tau_write, (1, 1)),
+    )
+    return (
+        result[0][:, :, 0, :],
+        result[1],
+        result[2][:, :, 0],
+        result[3][:, :, 0],
+        result[4][:, :, 0, :],
+        result[5][:, :, :, 0],
     )
 
 
@@ -702,7 +639,7 @@ def _screening_tpu_specs(
     value_size: int,
 ):
     q = pl.BlockSpec(
-        (time, 1, key_size), lambda batch_id: (0, batch_id, 0)
+        (time, 1, 1, key_size), lambda batch_id: (0, batch_id, 0, 0)
     )
 
     def time_matrix(feature_size):
@@ -718,27 +655,31 @@ def _screening_tpu_specs(
         )
 
     state_vector = pl.BlockSpec(
-        (1, n_slots), lambda batch_id: (batch_id, 0)
+        (1, n_slots, 1), lambda batch_id: (batch_id, 0, 0)
     )
     return {
         "q": q,
         "time_matrix": time_matrix,
         "state_matrix": state_matrix,
         "state_vector": state_vector,
-        "shared_vector": pl.BlockSpec((n_slots,), lambda batch_id: (0,)),
-        "shared_scalar": pl.BlockSpec((1,), lambda batch_id: (0,)),
+        "shared_vector": pl.BlockSpec(
+            (1, n_slots, 1), lambda batch_id: (0, 0, 0)
+        ),
+        "shared_scalar": pl.BlockSpec((1, 1), lambda batch_id: (0, 0)),
         "u": pl.BlockSpec(
-            (time, 1, value_size), lambda batch_id: (0, batch_id, 0)
+            (time, 1, 1, value_size),
+            lambda batch_id: (0, batch_id, 0, 0),
         ),
         "statistics": pl.BlockSpec(
-            (time, 1, _STEP_STAT_COUNT),
-            lambda batch_id: (0, batch_id, 0),
+            (time, 1, 1, _STEP_STAT_COUNT),
+            lambda batch_id: (0, batch_id, 0, 0),
         ),
         "update": pl.BlockSpec(
-            (time, 1, n_slots), lambda batch_id: (0, batch_id, 0)
+            (time, 1, n_slots, 1),
+            lambda batch_id: (0, batch_id, 0, 0),
         ),
         "per_batch_vector": pl.BlockSpec(
-            (1, n_slots), lambda batch_id: (batch_id, 0)
+            (1, n_slots, 1), lambda batch_id: (batch_id, 0, 0)
         ),
         "per_batch_scalar": pl.BlockSpec(
             (1, 1), lambda batch_id: (batch_id, 0)
@@ -800,15 +741,15 @@ def screening_pallas_tpu_forward_with_aux(
         ),
         out_shape=(
             jax.ShapeDtypeStruct(
-                (time, batch, value_size), delta_values.dtype
+                (time, batch, 1, value_size), delta_values.dtype
             ),
             jax.ShapeDtypeStruct(initial_slots.shape, jnp.float32),
-            jax.ShapeDtypeStruct(initial_ages.shape, jnp.float32),
-            jax.ShapeDtypeStruct(initial_usage.shape, jnp.float32),
+            jax.ShapeDtypeStruct((*initial_ages.shape, 1), jnp.float32),
+            jax.ShapeDtypeStruct((*initial_usage.shape, 1), jnp.float32),
             jax.ShapeDtypeStruct(
-                (time, batch, _STEP_STAT_COUNT), jnp.float32
+                (time, batch, 1, _STEP_STAT_COUNT), jnp.float32
             ),
-            jax.ShapeDtypeStruct((time, batch, n_slots), jnp.float32),
+            jax.ShapeDtypeStruct((time, batch, n_slots, 1), jnp.float32),
             jax.ShapeDtypeStruct(
                 (time, batch, n_slots, slot_size), jnp.float32
             ),
@@ -821,8 +762,8 @@ def screening_pallas_tpu_forward_with_aux(
             jax.ShapeDtypeStruct(
                 (time, batch, n_slots, key_size), jnp.float32
             ),
-            jax.ShapeDtypeStruct((time, batch, n_slots), jnp.float32),
-            jax.ShapeDtypeStruct((time, batch, n_slots), jnp.float32),
+            jax.ShapeDtypeStruct((time, batch, n_slots, 1), jnp.float32),
+            jax.ShapeDtypeStruct((time, batch, n_slots, 1), jnp.float32),
         ),
         grid=(batch,),
         in_specs=(
@@ -852,12 +793,28 @@ def screening_pallas_tpu_forward_with_aux(
         interpret=interpret,
         name="rwkv7_screening_tpu_training_forward",
     )(
-        q_read, q_write, delta_slots, delta_read_keys, delta_values,
+        q_read[:, :, None, :], q_write[:, :, None, :],
+        delta_slots, delta_read_keys, delta_values,
         delta_write_keys, initial_slots, initial_read_keys,
-        initial_values, initial_write_keys, initial_ages, initial_usage,
-        mu, jnp.reshape(tau_read, (1,)), jnp.reshape(tau_write, (1,)),
+        initial_values, initial_write_keys,
+        initial_ages[:, :, None], initial_usage[:, :, None],
+        mu[None, :, None], jnp.reshape(tau_read, (1, 1)),
+        jnp.reshape(tau_write, (1, 1)),
     )
-    return result[:6], result[6:]
+    outputs = (
+        result[0][:, :, 0, :],
+        result[1],
+        result[2][:, :, 0],
+        result[3][:, :, 0],
+        result[4][:, :, 0, :],
+        result[5][:, :, :, 0],
+    )
+    aux = (
+        *result[6:10],
+        result[10][:, :, :, 0],
+        result[11][:, :, :, 0],
+    )
+    return outputs, aux
 
 
 def screening_pallas_tpu_backward(
@@ -899,22 +856,28 @@ def screening_pallas_tpu_backward(
         time, key_size, n_slots, slot_size, value_size
     )
     arrays = (
-        q_read, q_write, delta_slots, delta_read_keys, delta_values,
+        q_read[:, :, None, :], q_write[:, :, None, :],
+        delta_slots, delta_read_keys, delta_values,
         delta_write_keys, initial_slots, initial_read_keys,
-        initial_values, initial_write_keys, initial_ages, initial_usage,
-        mu, jnp.reshape(tau_read, (1,)), jnp.reshape(tau_write, (1,)),
-        cotangent_u, cotangent_final_slots, cotangent_final_ages,
-        cotangent_final_usage, tape_slots, tape_read_keys, tape_values,
-        tape_write_keys, tape_ages, tape_usage,
+        initial_values, initial_write_keys,
+        initial_ages[:, :, None], initial_usage[:, :, None],
+        mu[None, :, None], jnp.reshape(tau_read, (1, 1)),
+        jnp.reshape(tau_write, (1, 1)),
+        cotangent_u[:, :, None, :], cotangent_final_slots,
+        cotangent_final_ages[:, :, None],
+        cotangent_final_usage[:, :, None],
+        tape_slots, tape_read_keys, tape_values, tape_write_keys,
+        tape_ages[:, :, :, None], tape_usage[:, :, :, None],
     )
     result = pl.pallas_call(
         partial(
             _screening_tpu_backward_kernel,
+            gradient_dtypes=tuple(value.dtype for value in arrays[:12]),
             **_screening_step_config(config, time),
         ),
         out_shape=(
             *(jax.ShapeDtypeStruct(value.shape, value.dtype) for value in arrays[:12]),
-            jax.ShapeDtypeStruct((batch, n_slots), jnp.float32),
+            jax.ShapeDtypeStruct((batch, n_slots, 1), jnp.float32),
             jax.ShapeDtypeStruct((batch, 1), jnp.float32),
             jax.ShapeDtypeStruct((batch, 1), jnp.float32),
         ),
@@ -958,8 +921,12 @@ def screening_pallas_tpu_backward(
         name="rwkv7_screening_tpu_backward",
     )(*arrays)
     return (
-        *result[:12],
-        jnp.sum(result[12], axis=0).astype(mu.dtype),
+        result[0][:, :, 0, :],
+        result[1][:, :, 0, :],
+        *result[2:10],
+        result[10][:, :, 0],
+        result[11][:, :, 0],
+        jnp.sum(result[12], axis=0)[:, 0].astype(mu.dtype),
         jnp.sum(result[13], axis=0).reshape(tau_read.shape).astype(tau_read.dtype),
         jnp.sum(result[14], axis=0).reshape(tau_write.shape).astype(tau_write.dtype),
     )

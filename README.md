@@ -240,8 +240,19 @@ select `reference`, `pallas_tpu`, `pallas_gpu_mosaic`, or
 with an FP32 carry tape. Model sharding gathers the slot feature once at the
 recurrence boundary, averages replicated outputs for a single logical
 transpose contribution, and slices final slots back to their owners. These new
-screening paths are implemented but have not yet been correctness- or
-performance-validated.
+screening paths have real-TPU forward, gradient, four-device model-sharding,
+optimizer-step, and recurrence-performance validation. GPU screening remains
+implemented but still requires real-accelerator validation on each target
+architecture.
+
+Run the synchronized screening recurrence benchmark with:
+
+```bash
+uv run python scripts/benchmark_screening_accelerator.py \
+  --warmup 3 \
+  --iterations 20 \
+  --disable-python-gc
+```
 
 Run the synchronized accelerator/reference WKV benchmark with:
 
@@ -631,13 +642,19 @@ uv run rwkv7m-audit-nnx-model-parallel `
   --head-chunk-size 4
 ```
 
-The forced CPU run is a deterministic local contract test. A real TPU v5e
-(`v5litepod-4`, four devices) was also verified on 2026-07-14 with a
+The forced CPU run is a deterministic local contract test. Before the
+projected screening recurrence change, a real TPU v5e (`v5litepod-4`, four
+devices) was verified on 2026-07-14 with a
 `data=1, model=4` mesh and a small complete RWKV7M configuration with read/write
 screening. The audit completed finite forward/backward computation and one
 optimizer update, retained `P("data", "model", None, None)` WKV state and
 `P("data", None, "model")` screening-slot placement, and reported 16 compiled
 collectives: 13 all-reduces, 3 all-to-alls, and no all-gathers.
+
+The projected Pallas screening path was revalidated on 2026-07-16. The updated
+audit completed loss `3.95950198` and optimizer step 1 with the same slot
+placement. It reported 18 collectives: the previous 13 all-reduces and 3
+all-to-alls plus 2 explicit all-gathers at the screening recurrence boundary.
 
 The independent NNX lifecycle probe also completed Orbax create and restore in
 separate processes on the same TPU slice, advancing the optimizer from step 1
@@ -713,7 +730,7 @@ Not yet included:
 
 - production accelerator profiling and shape-specific Pallas autotuning beyond
   the validated L40S shapes,
-- real-accelerator screening parity/performance validation and a non-duplicated
+- real-GPU screening parity/performance validation and a non-duplicated
   model-axis screening recurrence,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),

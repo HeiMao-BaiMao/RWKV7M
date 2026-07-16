@@ -122,8 +122,9 @@ slots are sliced back to their owning shard. This makes the collective and VJP
 contract explicit without inserting a collective inside the time loop. It
 duplicates screening recurrence compute across the model axis, so a later
 hardware profile may justify a more specialized distributed kernel. These new
-forward/backward and sharded paths have not yet passed parity or hardware
-performance gates.
+forward/backward and sharded paths have passed forward/gradient parity,
+four-device model-sharding, and recurrence-performance gates on TPU v5e. GPU
+screening validation remains architecture-specific and pending.
 
 ## Performance gate
 
@@ -176,12 +177,14 @@ not accepted as proof of the limiting resource.
 9. **Partial:** an L40S/Ada measured dispatch record now covers four WKV shapes
    and tracked 0.185B train-step configurations. Hopper/Blackwell and broader
    production-shape records remain pending.
-10. **Implemented, unvalidated:** screening dense projections are hoisted out
-    of the time loop; the projected reference, independent backend dispatch,
-    separate TPU/GPU persistent forward and reverse-time Pallas kernels, FP32
-    training carry tape, and explicit data/model sharding transpose are
-    integrated. Parity tests and real-hardware screening performance gates
-    remain pending by request.
+10. **Implemented; TPU gate passed:** screening dense projections are hoisted
+    out of the time loop; the projected reference, independent backend
+    dispatch, separate TPU/GPU persistent forward and reverse-time Pallas
+    kernels, FP32 training carry tape, and explicit data/model sharding
+    transpose are integrated. TPU v5e passed all-output and all-input-gradient
+    parity, four-device model-sharding, a full optimizer step, and the tracked
+    `0.185b` recurrence microbenchmark. Real GPU screening gates remain
+    pending.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:
@@ -222,7 +225,7 @@ fusion and layout work now precede further WKV replacement work on Ada.
 
 The complete methodology, raw timings, correctness gates, limitations, and
 resource cleanup record are documented in
-[TPU Pallas WKV Performance Validation](tpu_pallas_performance.md).
+[TPU Pallas WKV and Screening Performance Validation](tpu_pallas_performance.md).
 
 The first real-hardware Pallas gate ran on 2026-07-14 using JAX/jaxlib 0.10.0
 and libtpu 0.0.40 on a temporary single-host `v5litepod-4` in `us-west4-a`.
@@ -236,6 +239,11 @@ The following checks passed with the automatic `pallas_tpu` backend and
   3.9594927, and optimizer step 1;
 - unchanged post-SPMD collective counts: 13 all-reduces, 3 all-to-alls, and no
   all-gathers.
+
+The projected screening gate was then run on 2026-07-16 on the same TPU type.
+It passed all six outputs, gradients for all 15 inputs, a four-device optimizer
+step, and the tracked `0.185b` recurrence benchmark. Its explicit model-axis
+screening boundary adds 2 all-gathers, bringing that audit to 18 collectives.
 
 Pallas kernels require manual mesh axes in JAX 0.10. The NNX path therefore
 wraps only WKV in `jax.shard_map`, with vectors using

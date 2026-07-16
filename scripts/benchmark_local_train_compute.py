@@ -14,7 +14,6 @@ import time
 from flax import nnx
 import jax
 import jax.numpy as jnp
-import optax
 import numpy as np
 
 from benchmark_common import (
@@ -91,42 +90,40 @@ def _measure(function, arguments, *, warmup, iterations):
 
 def _measure_full_step(
     function,
-    params,
-    opt_state,
+    train_state,
     *,
     warmup,
     iterations,
 ):
     for _ in range(warmup):
-        params, opt_state, loss = function(params, opt_state)
-        jax.block_until_ready((params, opt_state, loss))
+        train_state, loss = function(train_state)
+        jax.block_until_ready((train_state, loss))
     samples = []
     last_loss = None
     for _ in range(iterations):
         started = time.perf_counter_ns()
-        params, opt_state, last_loss = function(params, opt_state)
-        jax.block_until_ready((params, opt_state, last_loss))
+        train_state, last_loss = function(train_state)
+        jax.block_until_ready((train_state, last_loss))
         samples.append((time.perf_counter_ns() - started) / 1_000_000.0)
     return timing_summary(samples), last_loss
 
 
 def _measure_optimizer(
     function,
-    params,
-    opt_state,
+    train_state,
     gradients,
     *,
     warmup,
     iterations,
 ):
     for _ in range(warmup):
-        params, opt_state = function(params, opt_state, gradients)
-        jax.block_until_ready((params, opt_state))
+        train_state = function(train_state, gradients)
+        jax.block_until_ready(train_state)
     samples = []
     for _ in range(iterations):
         started = time.perf_counter_ns()
-        params, opt_state = function(params, opt_state, gradients)
-        jax.block_until_ready((params, opt_state))
+        train_state = function(train_state, gradients)
+        jax.block_until_ready(train_state)
         samples.append((time.perf_counter_ns() - started) / 1_000_000.0)
     return timing_summary(samples)
 
@@ -169,8 +166,9 @@ def main(argv=None):
     fixed_screen = jax.device_put(runtime.initial_screen_state)
     graphdef, params = nnx.split(train_state.model, nnx.Param)
     parameter_count = sum(value.size for value in jax.tree.leaves(params))
-    tx = train_state.optimizer.tx
-    opt_state = nnx.as_pure(train_state.optimizer.opt_state)
+    bundle_graphdef, bundle_state = nnx.split(
+        (train_state.model, train_state.optimizer)
+    )
 
     def loss_function(active_params):
         model = nnx.merge(graphdef, active_params)
@@ -193,20 +191,30 @@ def main(argv=None):
     jax.block_until_ready(gradients)
 
     @jax.jit
-    def optimizer_step(active_params, active_opt_state, active_gradients):
-        updates, next_opt_state = tx.update(
-            active_gradients, active_opt_state, active_params
-        )
-        return optax.apply_updates(active_params, updates), next_opt_state
+    def optimizer_step(active_state, active_gradients):
+        model, optimizer = nnx.merge(bundle_graphdef, active_state)
+        optimizer.update(model, active_gradients)
+        return nnx.state((model, optimizer))
 
     @jax.jit
-    def full_step(active_params, active_opt_state):
-        loss, active_gradients = jax.value_and_grad(loss_function)(active_params)
-        updates, next_opt_state = tx.update(
-            active_gradients, active_opt_state, active_params
-        )
-        next_params = optax.apply_updates(active_params, updates)
-        return next_params, next_opt_state, loss
+    def full_step(active_state):
+        model, optimizer = nnx.merge(bundle_graphdef, active_state)
+
+        def active_loss(active_model):
+            loss, _ = nnx_model_loss(
+                active_model,
+                fixed_batch,
+                fixed_rwkv,
+                fixed_screen,
+                phase=phase,
+                deterministic=False,
+                include_l2wrap=True,
+            )
+            return loss
+
+        loss, active_gradients = nnx.value_and_grad(active_loss)(model)
+        optimizer.update(model, active_gradients)
+        return nnx.state((model, optimizer)), loss
 
     # Ensure all setup, placement, and the VJP residual construction complete
     # before any measurement window opens.
@@ -227,8 +235,7 @@ def main(argv=None):
             ),
             "optimizer": _measure_optimizer(
                 optimizer_step,
-                params,
-                opt_state,
+                bundle_state,
                 gradients,
                 warmup=args.benchmark_warmup,
                 iterations=args.benchmark_iterations,
@@ -236,8 +243,7 @@ def main(argv=None):
         }
         timings["full_step"], last_loss = _measure_full_step(
             full_step,
-            params,
-            opt_state,
+            bundle_state,
             warmup=args.benchmark_warmup,
             iterations=args.benchmark_iterations,
         )
@@ -271,6 +277,11 @@ def main(argv=None):
             "dtype": config.dtype,
             "parameter_count": parameter_count,
         },
+        "execution": {
+            "remat_blocks": config.remat_blocks,
+            "sequence_chunk_size": config.sequence_chunk_size,
+            "head_chunk_size": config.head_chunk_size,
+        },
         "fixed_batch": {
             "path": str(args.fixed_batch.resolve()),
             "sha256": fixed_batch_sha256,
@@ -283,7 +294,7 @@ def main(argv=None):
         "phase_details": {
             "forward": "loss forward from fixed params and fixed recurrent state",
             "backward": "VJP pullback from one precomputed forward residual",
-            "optimizer": "Optax transform and parameter application from fixed gradients",
+            "optimizer": "NNX optimizer update from fixed gradients",
             "full_step": "value_and_grad plus optimizer with no intermediate host barrier",
         },
         "optimizer": {
