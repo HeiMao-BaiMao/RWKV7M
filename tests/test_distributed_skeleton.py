@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import rwkv7m.distributed.mesh as mesh_module
 
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 from rwkv7m.distributed import (
@@ -17,6 +18,7 @@ from rwkv7m.distributed import (
     put_to_devices,
     replicated_sharding,
 )
+from rwkv7m.distributed.mesh import _split_process_mesh_shape
 
 
 def write_distributed_binidx(tmp_path):
@@ -83,6 +85,62 @@ def test_make_mesh_delegates_device_ordering_to_jax(monkeypatch):
             (jax.sharding.AxisType.Auto, jax.sharding.AxisType.Auto),
         )
     ]
+
+
+def test_split_process_mesh_shape_prefers_inner_model_axis():
+    assert _split_process_mesh_shape(
+        (16,), local_device_count=4, process_count=4
+    ) == ((4,), (4,))
+    assert _split_process_mesh_shape(
+        (4, 4), local_device_count=4, process_count=4
+    ) == ((1, 4), (4, 1))
+
+    with pytest.raises(ValueError, match="process-local submesh"):
+        _split_process_mesh_shape((3, 2), local_device_count=4, process_count=2)
+
+
+def test_make_mesh_uses_process_granules_for_multi_host(monkeypatch):
+    calls = []
+    sentinel = object()
+
+    def fake_create_hybrid_device_mesh(
+        local_shape,
+        process_shape,
+        devices,
+        *,
+        process_is_granule,
+    ):
+        calls.append(
+            (local_shape, process_shape, devices, process_is_granule)
+        )
+        return "device-mesh"
+
+    def fake_mesh(device_mesh, axis_names, *, axis_types):
+        assert device_mesh == "device-mesh"
+        assert axis_names == ("data", "model")
+        assert axis_types == (
+            jax.sharding.AxisType.Auto,
+            jax.sharding.AxisType.Auto,
+        )
+        return sentinel
+
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    monkeypatch.setattr(
+        mesh_module.mesh_utils,
+        "create_hybrid_device_mesh",
+        fake_create_hybrid_device_mesh,
+    )
+    monkeypatch.setattr(jax.sharding, "Mesh", fake_mesh)
+    fake_devices = [object() for _ in range(16)]
+
+    result = make_mesh(
+        ("data", "model"),
+        axis_sizes=(4, 4),
+        devices=fake_devices,
+    )
+
+    assert result is sentinel
+    assert calls == [((1, 4), (4, 1), fake_devices, True)]
 
 
 def test_compute_batch_layout_validates_divisibility():

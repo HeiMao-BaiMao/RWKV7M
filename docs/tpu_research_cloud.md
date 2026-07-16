@@ -234,6 +234,71 @@ The temporary node `rwkv7m-bench-260714-9faf9aa` was deleted after the run. The
 delete operation completed successfully, and the target name was absent from
 all four zones in which allocation had been attempted.
 
+## Multi-Host TPU v5e-16 Scaling Attempt
+
+A larger-slice validation was attempted on 2026-07-16 from commit `7b67cb6`
+using a temporary `v5litepod-16` in `us-central1-a`. The slice exposed 16 TPU
+v5e chips through four worker VMs. The intended controlled run was the current
+`0.185b` read/write-screening path at context 128, global batch 16, and a
+`data=16` mesh, with one sample per device and six prefetched training steps:
+
+```bash
+JAX_COORDINATOR_ADDRESS=<worker-0-internal-ip>:12356 \
+JAX_NUM_PROCESSES=4 \
+JAX_PROCESS_ID=<0..3> \
+JAX_COMPILATION_CACHE_DIR=/home/rumia/jax_cache \
+  uv run rwkv7m-train-binidx-dp \
+  --data-file data/bench/synthetic \
+  --model-preset 0.185b \
+  --ctx-len 128 \
+  --global-batch-size 16 \
+  --steps 6 \
+  --phase read_write \
+  --mesh-axis-names data \
+  --mesh-axis-sizes 16 \
+  --prefetch-size 2 \
+  --disable-python-gc
+```
+
+No throughput value was produced. A preliminary worker-0-only launch was
+invalid because a pod-slice runtime must be initialized by all workers and is
+excluded from measurement. In the four-process launch, workers 1 and 2 failed
+while evaluating `mesh.local_mesh` with:
+
+```text
+ValueError: devices connected to a single host must form a contiguous subcube
+of the global device mesh
+```
+
+The other workers then exited through the expected JAX coordination-service
+shutdown path. A provisional retry using
+`create_device_mesh(contiguous_submeshes=True)` reproduced the same error.
+Therefore this attempt establishes a multi-host mesh-ordering defect, not a
+performance or scaling result. It must not be compared numerically with the
+four-device records above.
+
+The distributed mesh builder now splits each logical mesh into process-local
+and outer process shapes, then uses
+`create_hybrid_device_mesh(..., process_is_granule=True)`. This makes the
+process boundary explicit and preferentially keeps the trailing `model` axis
+on the faster process-local mesh. Local shape-policy and distributed trainer
+tests pass, but the correction was made after the billed slice was deleted and
+has not yet passed a real multi-host TPU gate.
+
+The v5e-16 slice was READY from approximately 13:39:38 JST until the delete
+request at 14:07:46 JST. At the
+[documented on-demand rate](https://cloud.google.com/tpu/pricing) of 1.20 USD
+per v5e chip-hour, the estimated READY-state cost is about 9.00 USD; including
+the delete-operation interval gives a conservative upper estimate of about
+9.50 USD. This is an estimate rather than an exported billing record.
+
+Fallback allocation requests did not start billable resources: `v5litepod-8`
+was rejected by the serving quota, while `v6e-8` and `v5p-8` were rejected by
+accelerator permissions. The v5e-16 delete operation completed successfully.
+Final TPU VM listings for `us-central1-a`, `us-east5-b`, `us-east1-d`, and
+`us-east5-a` were empty, and describing `rwkv7m-scale16-260716` returned
+`NOT_FOUND`.
+
 On TPU VMs, install from the checkout or package in the same way, then verify JAX sees TPU devices:
 
 ```powershell
@@ -247,6 +312,19 @@ Use RWKV-LM-V7 compatible `.bin/.idx` files and pass the prefix path without suf
 ```powershell
 uv run rwkv7m-make-binidx data/corpus.jsonl --output-prefix data/corpus --ctx-len 512
 ```
+
+For accelerator-only throughput runs, create the deterministic synthetic input
+used by the scaling procedure:
+
+```powershell
+uv run python scripts/prepare_synthetic_binidx.py `
+  --output-prefix data/bench/synthetic `
+  --tokens 4194304 `
+  --vocab-size 65536
+```
+
+This input measures execution throughput only and must not be used for model
+quality or convergence claims.
 
 ## Single-Host Smoke Run
 
@@ -317,7 +395,8 @@ divisibility, and carries RWKV heads and screening slots in model-sharded state.
 Implemented:
 
 - `jax.distributed.initialize()` environment-based setup.
-- topology-aware 1D and multi-axis JAX mesh construction with `jax.make_mesh()`.
+- topology-aware single-process JAX mesh construction with `jax.make_mesh()`,
+  plus process-granule hybrid mesh construction for multi-host inputs.
 - complete NNX RWKV core, screening, model, optimizer, runtime, distributed
   train/eval, and checkpoint lifecycle.
 - full-model Linen-to-NNX tensor-path conversion and forward/gradient parity.

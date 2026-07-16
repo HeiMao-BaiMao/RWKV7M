@@ -2,6 +2,7 @@ import os
 import math
 
 import jax
+from jax.experimental import mesh_utils
 
 
 def process_info():
@@ -45,6 +46,26 @@ def make_1d_mesh(axis_name="data", devices=None):
     return make_mesh((axis_name,), devices=devices)
 
 
+def _split_process_mesh_shape(axis_sizes, *, local_device_count, process_count):
+    """Split global axes into fast per-process and outer process meshes."""
+    local_shape = [1] * len(axis_sizes)
+    remaining = int(local_device_count)
+    for axis in range(len(axis_sizes) - 1, -1, -1):
+        factor = math.gcd(axis_sizes[axis], remaining)
+        local_shape[axis] = factor
+        remaining //= factor
+    if remaining != 1:
+        raise ValueError("mesh axes cannot form a complete process-local submesh")
+
+    process_shape = tuple(
+        axis_size // local_size
+        for axis_size, local_size in zip(axis_sizes, local_shape, strict=True)
+    )
+    if math.prod(process_shape) != process_count:
+        raise ValueError("mesh axes do not match the distributed process layout")
+    return tuple(local_shape), process_shape
+
+
 def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None, axis_types=None):
     if isinstance(axis_names, str):
         axis_names = (axis_names,)
@@ -80,5 +101,25 @@ def make_mesh(axis_names=("data",), *, axis_sizes=None, devices=None, axis_types
         axis_types = tuple(axis_types)
     if len(axis_types) != len(axis_names):
         raise ValueError("axis_types must have the same length as axis_names")
+    process_count = jax.process_count()
+    if process_count > 1:
+        if len(devices) % process_count:
+            raise ValueError("devices must be evenly distributed across processes")
+        local_shape, process_shape = _split_process_mesh_shape(
+            axis_sizes,
+            local_device_count=len(devices) // process_count,
+            process_count=process_count,
+        )
+        # Treat each process as an outer-network granule so its devices form a
+        # rectangular local submesh. This is required for process-local input
+        # assembly and is not guaranteed by physical TPU enumeration alone.
+        device_mesh = mesh_utils.create_hybrid_device_mesh(
+            local_shape,
+            process_shape,
+            devices,
+            process_is_granule=True,
+        )
+        return jax.sharding.Mesh(device_mesh, axis_names, axis_types=axis_types)
+
     kwargs = {"devices": devices, "axis_types": axis_types}
     return jax.make_mesh(axis_sizes, axis_names, **kwargs)
