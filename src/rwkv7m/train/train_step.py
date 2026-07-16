@@ -52,6 +52,26 @@ def _linen_train_step(train_state, batch, rwkv_state, screen_state, phase="read_
                 jnp.zeros(()),
             ),
         }
+        for key in (
+            "matched_route_mass",
+            "novel_route_mass",
+            "route_entropy",
+            "route_top1_concentration",
+            "admission_mean",
+            "admission_low_rate",
+            "admission_high_rate",
+            "novel_token_rate",
+            "rejected_write_rate",
+            "short_bank_write_mass",
+            "mid_bank_write_mass",
+            "long_bank_write_mass",
+            "eviction_age_mean",
+            "eviction_usage_mean",
+            "slot_utilization",
+            "dead_slot_rate",
+            "slot_cosine_redundancy",
+        ):
+            metrics[key] = stats.get(key, jnp.zeros(()))
         return loss, (metrics, new_rwkv_state, new_screen_state)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)

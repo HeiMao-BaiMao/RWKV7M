@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import time
 
 import jax
@@ -32,7 +33,24 @@ def parse_args(argv=None):
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--backend", default=None)
+    parser.add_argument(
+        "--write-mode",
+        choices=(
+            "disabled",
+            "legacy_unconditional",
+            "legacy_threshold",
+            "competitive_novel",
+        ),
+        default="legacy_threshold",
+    )
+    parser.add_argument("--read-tiles", type=int, default=1)
+    parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--disable-python-gc", action="store_true")
+    parser.add_argument(
+        "--interpret",
+        action="store_true",
+        help="run Pallas interpret mode for CPU development checks",
+    )
     parser.add_argument("--output", default=None)
     args = parser.parse_args(argv)
     for name in (
@@ -48,12 +66,26 @@ def parse_args(argv=None):
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.warmup < 0:
         parser.error("--warmup must be non-negative")
+    if args.read_tiles <= 0:
+        parser.error("--read-tiles must be positive")
+    if args.key_size % args.read_tiles != 0:
+        parser.error("--key-size must be divisible by --read-tiles")
+    if args.value_size % args.read_tiles != 0:
+        parser.error("--value-size must be divisible by --read-tiles")
+    if args.checkpoint_interval is not None and args.checkpoint_interval <= 0:
+        parser.error("--checkpoint-interval must be positive")
     return args
 
 
-def _config():
+def _config(args):
+    bank_ids = tuple(
+        min(2, (slot * 3) // args.slots) for slot in range(args.slots)
+    )
     return ScreeningRecurrenceConfig(
-        write_enabled=True,
+        write_enabled=args.write_mode in (
+            "legacy_threshold",
+            "competitive_novel",
+        ),
         use_value_unit_norm=True,
         use_leaky_warmup=False,
         leaky_alpha=0.0,
@@ -65,6 +97,10 @@ def _config():
         usage_ema_decay=0.99,
         tanh_norm_cap=1.0,
         eps=1e-6,
+        write_mode=args.write_mode,
+        bank_ids=bank_ids,
+        n_read_tiles=args.read_tiles,
+        checkpoint_interval=args.checkpoint_interval,
     )
 
 
@@ -79,11 +115,22 @@ def _inputs(args):
     state_prefix = (args.batch, args.slots)
     q_read = normal(q_shape, dtype=jnp.float32)
     q_write = normal(q_shape, dtype=jnp.float32)
-    q_read /= jnp.linalg.norm(q_read, axis=-1, keepdims=True) + 1e-6
+    q_read_tiled = q_read.reshape(
+        args.time,
+        args.batch,
+        args.read_tiles,
+        args.key_size // args.read_tiles,
+    )
+    q_read_tiled /= jnp.linalg.norm(
+        q_read_tiled, axis=-1, keepdims=True
+    ) + 1e-6
+    q_read = q_read_tiled.reshape(q_shape)
     q_write /= jnp.linalg.norm(q_write, axis=-1, keepdims=True) + 1e-6
     return (
         q_read,
         q_write,
+        jax.nn.sigmoid(normal((args.time, args.batch), dtype=jnp.float32)),
+        normal((args.time, args.batch, 3), dtype=jnp.float32),
         normal((args.time, *state_prefix, args.slot_size)),
         normal((args.time, *state_prefix, args.key_size)),
         normal((args.time, *state_prefix, args.value_size)),
@@ -95,13 +142,17 @@ def _inputs(args):
         jnp.zeros(state_prefix, dtype=jnp.float32),
         jnp.zeros(state_prefix, dtype=jnp.float32),
         jnp.linspace(0.005, 0.05, args.slots, dtype=jnp.float32),
-        jnp.asarray(0.0, dtype=jnp.float32),
+        (
+            jnp.asarray(0.0, dtype=jnp.float32)
+            if args.read_tiles == 1
+            else jnp.zeros((args.read_tiles,), dtype=jnp.float32)
+        ),
         jnp.asarray(0.0, dtype=jnp.float32),
     )
 
 
-def _loss(function, config, *inputs):
-    u, slots, ages, usage, _, _ = function(*inputs, config)
+def _loss(function, *inputs):
+    u, slots, ages, usage, _, _ = function(*inputs)
     return (
         jnp.sum(u.astype(jnp.float32) ** 2)
         + 0.01 * jnp.sum(slots**2)
@@ -142,24 +193,34 @@ def main(argv=None):
     if not backend.startswith("pallas_"):
         raise RuntimeError(f"expected a Pallas accelerator backend, got {backend}")
     inputs = _inputs(args)
-    config = _config()
+    config = _config(args)
     pallas_forward = jax.jit(
-        lambda *values: screening_recurrence(*values, config, backend)
+        lambda *values: screening_recurrence(
+            *values, config, backend, args.interpret
+        )
     )
     reference_forward = jax.jit(
         lambda *values: screening_recurrence_reference(*values, config)
     )
-    argnums = tuple(range(15))
+    argnums = tuple(range(17))
     pallas_train = jax.jit(
         jax.value_and_grad(
-            lambda *values: _loss(screening_recurrence, config, *values),
+            lambda *values: _loss(
+                lambda *inner: screening_recurrence(
+                    *inner, config, backend, args.interpret
+                ),
+                *values,
+            ),
             argnums=argnums,
         )
     )
     reference_train = jax.jit(
         jax.value_and_grad(
             lambda *values: _loss(
-                screening_recurrence_reference, config, *values
+                lambda *inner: screening_recurrence_reference(
+                    *inner, config
+                ),
+                *values,
             ),
             argnums=argnums,
         )
@@ -214,10 +275,14 @@ def main(argv=None):
             "value_size": args.value_size,
             "vector_dtype": "bfloat16",
             "state_dtype": "float32",
+            "write_mode": args.write_mode,
+            "read_tiles": args.read_tiles,
+            "checkpoint_interval": args.checkpoint_interval,
         },
         "measurement": {
             "warmup": args.warmup,
             "iterations": args.iterations,
+            "interpret": args.interpret,
             "synchronized_each_iteration": True,
             "python_gc_disabled": args.disable_python_gc,
         },
@@ -232,6 +297,8 @@ def main(argv=None):
             (
                 "q_read",
                 "q_write",
+                "admission",
+                "bank_logits",
                 "delta_slots",
                 "delta_read_keys",
                 "delta_values",
@@ -252,7 +319,9 @@ def main(argv=None):
     }
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output is not None:
-        with open(args.output, "w", encoding="utf-8") as handle:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as handle:
             handle.write(rendered + "\n")
     print(rendered)
 

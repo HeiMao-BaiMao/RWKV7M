@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import gc
+import hashlib
 import math
 import statistics
+
+import numpy as np
 
 
 COMPUTE_BENCHMARK_SCHEMA_VERSION = 2
@@ -59,6 +62,26 @@ def measurement_contract(*, warmup, iterations, disable_python_gc):
     }
 
 
+def fixed_batch_content_sha256(batch):
+    """Hash logical batch arrays independently of the NPZ container bytes."""
+
+    digest = hashlib.sha256()
+    for name in sorted(batch):
+        value = np.ascontiguousarray(np.asarray(batch[name]))
+        encoded_name = name.encode("utf-8")
+        encoded_dtype = value.dtype.str.encode("ascii")
+        digest.update(len(encoded_name).to_bytes(4, "little"))
+        digest.update(encoded_name)
+        digest.update(len(encoded_dtype).to_bytes(4, "little"))
+        digest.update(encoded_dtype)
+        digest.update(value.ndim.to_bytes(4, "little"))
+        for dimension in value.shape:
+            digest.update(int(dimension).to_bytes(8, "little", signed=False))
+        digest.update(value.nbytes.to_bytes(8, "little", signed=False))
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
+
+
 @contextmanager
 def gc_policy(disable_python_gc):
     was_enabled = gc.isenabled()
@@ -74,6 +97,7 @@ def gc_policy(disable_python_gc):
 
 __all__ = [
     "COMPUTE_BENCHMARK_SCHEMA_VERSION",
+    "fixed_batch_content_sha256",
     "gc_policy",
     "measurement_contract",
     "percentile",

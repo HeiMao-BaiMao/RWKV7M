@@ -104,6 +104,24 @@ shape, so `training_vocab_tile_size` defaults to `None`. The tiled path also
 stays out of explicitly sharded/vocabulary-parallel execution until that path
 has a dedicated single-collective contract.
 
+The GPU gate now measures the full-XLA and tiled paths at identical batch
+sizes and optimizer backends. The matrix runner uses fresh processes and
+complete steps so isolated head timings cannot select a slower production
+stack.
+
+## Optimizer boundary
+
+The portable and TPU default remains Optax. NVIDIA has an opt-in Pallas AdamW
+path that computes one global gradient norm, then fuses clipping, FP32 moment
+updates, bias correction, decoupled decay, and the RWKV `w0` 2x multiplier in
+one kernel per local parameter shard. This preserves the existing optimizer
+equations and checkpoint-visible FP32 moment policy without claiming that a
+per-leaf kernel is automatically faster than XLA fusion.
+
+`--optimizer-backend` accepts `optax`, `pallas_gpu_triton`, or
+`pallas_gpu_mosaic`. Pallas remains opt-in until real hardware passes update
+parity, optimizer-only latency, and complete-step throughput gates.
+
 ## Screening recurrence boundary
 
 State-level screening now separates sequence-wide dense projections from its
@@ -145,6 +163,62 @@ four-device model-sharding, and recurrence-performance gates on TPU v5e. The
 Triton path has also passed real L40S lowering, all-output/all-input-gradient
 parity, and the tracked recurrence-performance gate. Mosaic GPU screening
 validation remains pending on Hopper/Blackwell.
+
+### Screening v2 kernel contract
+
+The opt-in recurrence revision is specified in
+[State-Level Screening v2 engineering contract](state_level_screening_v2_design.md).
+It is implemented in the portable reference and in separate GPU/TPU Pallas
+kernel bodies. CPU interpret-mode forward and all-input-gradient parity pass.
+Current L40S and TPU v5e records apply to the legacy projected recurrence and
+must not be presented as real-hardware measurements of competitive routing,
+novel allocation, value-space gating, checkpointing, or multi-read.
+
+The backend boundary remains:
+
+```text
+XLA outside time loop:
+  read/write/admission/bank-route projections
+  factorized candidate projections
+  projected candidate read keys, values, and write keys
+
+Pallas inside time loop:
+  absolute read screening
+  confidence-preserving matched write routing
+  admission-controlled bank-aware sparse novel allocation
+  projected-state, age, usage, and scalar-metric updates
+```
+
+GPU and TPU continue to own separate forward, reconstruction, and reverse
+kernels. The write mode is a static kernel policy so legacy and v2 semantics do
+not branch dynamically per step.
+
+With checkpointing disabled, the accelerator forward stores slot, read-key,
+value, write-key, age, and usage carry at every token. Its tape-only memory is:
+
+```text
+4 * T * B * screened_layers * M
+  * (d_slot + 2*d_k + d_v + 2) bytes
+```
+
+This is about 10.06 MiB for the tracked 0.185B preset at batch 1 and 512 tokens,
+but about 1.75 GiB for the 7B preset at batch 1 and 4,096 tokens before sharding
+and other activations. The implemented interval path stores the four content
+states at `C = ceil(T / I) + 1` boundaries plus per-token age, usage, and update
+strength. Its tape-only memory is:
+
+```text
+4 * B * screened_layers * M
+  * (C * (d_slot + 2*d_k + d_v) + 3*T) bytes
+```
+
+At interval 16 this is about 0.74 MiB and 115.44 MiB for the same tracked
+0.185B and 7B cases. These are theoretical tape sizes; real-device peak memory
+and recomputation cost remain to be measured.
+
+Group-wise slot rates remain deferred. The projected slot, read-key, value, and
+write-key states must receive one consistent update strength unless a new
+projection-compatible grouped-state contract is proven chunk-invariant.
 
 ## Performance gate
 
@@ -212,6 +286,20 @@ not accepted as proof of the limiting resource.
     corresponding parity tests and achieved 16.71x forward and 15.76x
     forward-plus-backward speedup over the projected reference recurrence.
     Mosaic GPU validation remains pending.
+11. **Implemented, hardware gate pending:** a fused GPU Pallas AdamW update,
+    full-XLA/tiled-head x Optax/Pallas x batch-size matrix, logical fixed-batch
+    fingerprint, strict model-shape comparator, and post-warmup Nsight capture
+    range are integrated. CPU interpret parity passes; L40S and Mosaic
+    complete-step and profiler records are still required before dispatch
+    defaults change.
+12. **Implemented, hardware gate pending:** Screening v2 write-mode migration
+    and metrics, value-space gate, factorized candidate, confidence-preserving
+    matched routing, continuous admission with sparse bank-aware novel
+    allocation, interval training-tape checkpointing, and fixed-total-dimension
+    multi-read tiles are integrated. Portable/NNX tests and CPU Pallas
+    interpret-mode GPU/TPU forward and gradient parity pass. Real L40S, Mosaic,
+    and TPU lowering, peak-memory, and complete-step performance records remain
+    required.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:

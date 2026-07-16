@@ -16,7 +16,13 @@ import jax.numpy as jnp
 
 from rwkv7m.kernels.screening_backend import resolve_screening_backend
 
-from .screening import tanh_norm, trim_square, unit_norm
+from .screening import (
+    competitive_write_routing,
+    normalize_write_mode,
+    tanh_norm,
+    trim_square,
+    unit_norm,
+)
 
 
 READ_MEAN = 0
@@ -27,7 +33,21 @@ U_NORM = 4
 WRITE_MEAN = 5
 WRITE_EFFECTIVE_MEAN = 6
 USAGE_MEAN = 7
-SCREENING_STEP_STAT_COUNT = 8
+MATCHED_ROUTE_MASS = 8
+NOVEL_ROUTE_MASS = 9
+ROUTE_ENTROPY = 10
+ROUTE_TOP1 = 11
+ADMISSION_MEAN = 12
+NOVEL_RATE = 13
+REJECTED_RATE = 14
+BANK_SHORT_WRITE_MASS = 15
+BANK_MID_WRITE_MASS = 16
+BANK_LONG_WRITE_MASS = 17
+EVICTION_AGE_MEAN = 18
+EVICTION_USAGE_MEAN = 19
+ADMISSION_LOW_RATE = 20
+ADMISSION_HIGH_RATE = 21
+SCREENING_STEP_STAT_COUNT = 22
 
 _SUPPORTED_VECTOR_DTYPES = (
     jnp.dtype(jnp.bfloat16),
@@ -51,11 +71,31 @@ class ScreeningRecurrenceConfig:
     usage_ema_decay: float
     tanh_norm_cap: float
     eps: float
+    write_mode: str | None = None
+    bank_ids: tuple[int, ...] = ()
+    route_power: float = 1.0
+    novelty_threshold: float = 0.1
+    allocation_temperature: float = 1.0
+    bank_route_temperature: float = 1.0
+    allocation_age_weight: float = 1.0
+    allocation_usage_weight: float = 1.0
+    hard_admission: bool = False
+    admission_threshold: float = 0.5
+    n_read_tiles: int = 1
+    checkpoint_interval: int | None = None
+
+
+def _resolved_write_mode(config: ScreeningRecurrenceConfig) -> str:
+    if config.write_mode is not None:
+        return normalize_write_mode(config.write_mode)
+    return "legacy_threshold" if config.write_enabled else "legacy_unconditional"
 
 
 def _validate_screening_recurrence_inputs(
     q_read,
     q_write,
+    admission,
+    bank_logits,
     delta_slots,
     delta_read_keys,
     delta_values,
@@ -69,7 +109,17 @@ def _validate_screening_recurrence_inputs(
     mu,
     tau_read,
     tau_write,
+    *,
+    config: ScreeningRecurrenceConfig,
 ):
+    _resolved_write_mode(config)
+    if config.n_read_tiles <= 0:
+        raise ValueError("n_read_tiles must be positive")
+    if (
+        config.checkpoint_interval is not None
+        and config.checkpoint_interval <= 0
+    ):
+        raise ValueError("checkpoint_interval must be positive when set")
     if q_read.ndim != 3:
         raise ValueError("q_read must have shape [time, batch, key]")
     time, batch, key_size = q_read.shape
@@ -83,6 +133,14 @@ def _validate_screening_recurrence_inputs(
         )
     if q_read.dtype != jnp.float32 or q_write.dtype != jnp.float32:
         raise TypeError("normalized screening queries must be float32")
+    if admission.shape != (time, batch) or admission.dtype != jnp.float32:
+        raise TypeError(
+            f"admission must be float32 with shape {(time, batch)}"
+        )
+    if bank_logits.shape != (time, batch, 3) or bank_logits.dtype != jnp.float32:
+        raise TypeError(
+            f"bank_logits must be float32 with shape {(time, batch, 3)}"
+        )
     if initial_slots.ndim != 3:
         raise ValueError(
             "initial_slots must have shape [batch, slots, slot_size]"
@@ -125,6 +183,14 @@ def _validate_screening_recurrence_inputs(
     value_size = initial_values.shape[-1]
     if value_size <= 0:
         raise ValueError("screening value dimension must be positive")
+    if key_size % config.n_read_tiles != 0:
+        raise ValueError("screening key size must divide evenly into read tiles")
+    if value_size % config.n_read_tiles != 0:
+        raise ValueError("screening value size must divide evenly into read tiles")
+    if config.bank_ids and len(config.bank_ids) != n_slots:
+        raise ValueError("screening recurrence bank_ids must match n_slots")
+    if any(bank_id not in (0, 1, 2) for bank_id in config.bank_ids):
+        raise ValueError("screening recurrence bank_ids must contain only 0, 1, or 2")
     expected_value_delta = (time, batch, n_slots, value_size)
     if delta_values.shape != expected_value_delta:
         raise ValueError(
@@ -155,14 +221,23 @@ def _validate_screening_recurrence_inputs(
             )
     if mu.shape != (n_slots,) or mu.dtype != jnp.float32:
         raise TypeError(f"mu must be float32 with shape {(n_slots,)}")
-    for name, value in (("tau_read", tau_read), ("tau_write", tau_write)):
-        if value.shape != () or value.dtype != jnp.float32:
-            raise TypeError(f"{name} must be a float32 scalar")
+    expected_tau_read_shape = () if config.n_read_tiles == 1 else (
+        config.n_read_tiles,
+    )
+    if tau_read.shape != expected_tau_read_shape or tau_read.dtype != jnp.float32:
+        raise TypeError(
+            "tau_read must be float32 with shape "
+            f"{expected_tau_read_shape}"
+        )
+    if tau_write.shape != () or tau_write.dtype != jnp.float32:
+        raise TypeError("tau_write must be a float32 scalar")
 
 
 def _screening_recurrence_reference_impl(
     q_read,
     q_write,
+    admission,
+    bank_logits,
     delta_slots,
     delta_read_keys,
     delta_values,
@@ -184,27 +259,43 @@ def _screening_recurrence_reference_impl(
         (
             q_read_t,
             q_write_t,
+            admission_t,
+            bank_logits_t,
             delta_slots_t,
             delta_read_keys_t,
             delta_values_t,
             delta_write_keys_t,
         ) = inputs
 
-        read_keys_normalized = unit_norm(
-            read_keys.astype(jnp.float32), eps=config.eps
+        batch, n_slots, key_size = read_keys.shape
+        read_tiles = config.n_read_tiles
+        key_tile_size = key_size // read_tiles
+        value_size = values.shape[-1]
+        value_tile_size = value_size // read_tiles
+        read_keys_tiled = read_keys.astype(jnp.float32).reshape(
+            batch, n_slots, read_tiles, key_tile_size
         )
-        values_normalized = values.astype(jnp.float32)
+        q_read_tiled = q_read_t.reshape(batch, read_tiles, key_tile_size)
+        read_keys_normalized = unit_norm(read_keys_tiled, eps=config.eps)
+        q_read_normalized = q_read_tiled
+        values_tiled = values.astype(jnp.float32).reshape(
+            batch, n_slots, read_tiles, value_tile_size
+        )
+        values_normalized = values_tiled
         if config.use_value_unit_norm:
             values_normalized = unit_norm(
                 values_normalized, eps=config.eps
             )
         read_similarity = jnp.einsum(
-            "bk,bmk->bm", q_read_t, read_keys_normalized
+            "brk,bmrk->brm", q_read_normalized, read_keys_normalized
         )
+        tau_read_tiled = jnp.reshape(tau_read, (read_tiles, 1))
         if config.use_leaky_warmup:
-            hard = trim_square(read_similarity, tau_read, eps=config.eps)
+            hard = trim_square(
+                read_similarity, tau_read_tiled, eps=config.eps
+            )
             soft = jax.nn.sigmoid(
-                config.leaky_gamma * (read_similarity - tau_read)
+                config.leaky_gamma * (read_similarity - tau_read_tiled)
             )
             read_relevance = (
                 (1.0 - config.leaky_alpha) * hard
@@ -212,18 +303,30 @@ def _screening_recurrence_reference_impl(
             )
         else:
             read_relevance = trim_square(
-                read_similarity, tau_read, eps=config.eps
+                read_similarity, tau_read_tiled, eps=config.eps
             )
         if config.use_age_mask:
             age_scores = (
                 (config.age_ref - ages) / (config.age_sigma + config.eps)
             )
-            read_relevance *= jax.nn.sigmoid(age_scores)
+            read_relevance *= jax.nn.sigmoid(age_scores)[:, None, :]
 
-        z = jnp.einsum("bm,bmv->bv", read_relevance, values_normalized)
-        u = tanh_norm(z, cap=config.tanh_norm_cap, eps=config.eps)
+        z_tiled = jnp.einsum(
+            "brm,bmrv->brv", read_relevance, values_normalized
+        )
+        u_tiled = tanh_norm(
+            z_tiled, cap=config.tanh_norm_cap, eps=config.eps
+        )
+        z = z_tiled.reshape(batch, value_size)
+        u = u_tiled.reshape(batch, value_size)
+        read_activity = jnp.max(read_relevance, axis=1)
 
-        if config.write_enabled:
+        write_mode = _resolved_write_mode(config)
+        matched_route = jnp.zeros_like(read_activity)
+        novel_route = jnp.zeros_like(read_activity)
+        effective_admission = jnp.zeros_like(admission_t)
+        is_novel = jnp.zeros_like(admission_t, dtype=jnp.bool_)
+        if write_mode in ("legacy_threshold", "competitive_novel"):
             write_keys_normalized = unit_norm(
                 write_keys.astype(jnp.float32), eps=config.eps
             )
@@ -233,6 +336,10 @@ def _screening_recurrence_reference_impl(
             write_relevance = trim_square(
                 write_similarity, tau_write, eps=config.eps
             )
+        else:
+            write_relevance = jnp.zeros_like(read_activity)
+
+        if write_mode == "legacy_threshold":
             effective_write_relevance = jnp.maximum(
                 write_relevance, config.write_rel_floor
             )
@@ -240,10 +347,49 @@ def _screening_recurrence_reference_impl(
             next_ages = jnp.where(
                 write_relevance > 1e-3, 0.0, ages + 1.0
             )
+            matched_route = effective_write_relevance
+        elif write_mode == "competitive_novel":
+            (
+                effective_write_relevance,
+                raw_matched_route,
+                novel_route,
+                _,
+                is_novel,
+                effective_admission,
+                _,
+            ) = competitive_write_routing(
+                write_relevance,
+                ages,
+                usage,
+                admission_t,
+                bank_logits_t,
+                config.bank_ids or (0,) * n_slots,
+                route_power=config.route_power,
+                novelty_threshold=config.novelty_threshold,
+                allocation_temperature=config.allocation_temperature,
+                bank_route_temperature=config.bank_route_temperature,
+                allocation_age_weight=config.allocation_age_weight,
+                allocation_usage_weight=config.allocation_usage_weight,
+                hard_admission=config.hard_admission,
+                admission_threshold=config.admission_threshold,
+                eps=config.eps,
+            )
+            matched_route = jnp.where(
+                is_novel[:, None], 0.0, raw_matched_route
+            )
+            strength = mu[None, :] * effective_write_relevance
+            next_ages = jnp.where(
+                effective_write_relevance > config.eps,
+                0.0,
+                ages + 1.0,
+            )
+        elif write_mode == "disabled":
+            effective_write_relevance = jnp.zeros_like(read_activity)
+            strength = jnp.zeros_like(read_activity)
+            next_ages = ages + 1.0
         else:
-            write_relevance = jnp.zeros_like(read_relevance)
             effective_write_relevance = write_relevance
-            strength = jnp.broadcast_to(mu[None, :], read_relevance.shape)
+            strength = jnp.broadcast_to(mu[None, :], read_activity.shape)
             next_ages = ages
 
         strength_vector = strength[:, :, None]
@@ -262,23 +408,69 @@ def _screening_recurrence_reference_impl(
         update = next_slots - slots
         update_squared = jnp.sum(update * update, axis=-1)
 
-        activity = jnp.maximum(
-            read_relevance,
-            write_relevance if config.write_enabled else read_relevance,
-        )
+        if write_mode == "legacy_threshold":
+            activity = jnp.maximum(read_activity, write_relevance)
+        else:
+            activity = read_activity
         next_usage = config.usage_ema_decay * usage + (
             1.0 - config.usage_ema_decay
         ) * activity
+        route_mass = jnp.sum(effective_write_relevance, axis=-1)
+        route_distribution = effective_write_relevance / (
+            route_mass[:, None] + config.eps
+        )
+        route_entropy = -jnp.sum(
+            route_distribution * jnp.log(route_distribution + config.eps),
+            axis=-1,
+        )
+        route_top1 = jnp.max(route_distribution, axis=-1)
+        bank_ids = jnp.asarray(
+            config.bank_ids or (0,) * n_slots,
+            dtype=jnp.int32,
+        )
+        bank_write_mass = tuple(
+            jnp.sum(
+                effective_write_relevance
+                * (bank_ids == bank_id)[None, :],
+                axis=-1,
+            )
+            for bank_id in range(3)
+        )
+        novel_mass = jnp.sum(novel_route, axis=-1)
+        eviction_age = jnp.sum(novel_route * ages, axis=-1) / (
+            novel_mass + config.eps
+        )
+        eviction_usage = jnp.sum(novel_route * usage, axis=-1) / (
+            novel_mass + config.eps
+        )
         step_statistics = jnp.stack(
             (
-                jnp.mean(read_relevance, axis=-1),
-                jnp.max(read_relevance, axis=-1),
-                jnp.sum(read_relevance > 1e-3, axis=-1).astype(jnp.float32),
+                jnp.mean(read_relevance, axis=(-2, -1)),
+                jnp.max(read_relevance, axis=(-2, -1)),
+                jnp.sum(read_activity > 1e-3, axis=-1).astype(jnp.float32),
                 jnp.linalg.norm(z, axis=-1),
                 jnp.linalg.norm(u, axis=-1),
                 jnp.mean(write_relevance, axis=-1),
                 jnp.mean(effective_write_relevance, axis=-1),
                 jnp.mean(next_usage, axis=-1),
+                jnp.sum(matched_route, axis=-1),
+                novel_mass,
+                route_entropy,
+                route_top1,
+                effective_admission,
+                is_novel.astype(jnp.float32),
+                (route_mass <= config.eps).astype(jnp.float32),
+                *bank_write_mass,
+                eviction_age,
+                eviction_usage,
+                (
+                    (effective_admission < 0.05)
+                    & (write_mode == "competitive_novel")
+                ).astype(jnp.float32),
+                (
+                    (effective_admission > 0.95)
+                    & (write_mode == "competitive_novel")
+                ).astype(jnp.float32),
             ),
             axis=-1,
         )
@@ -303,6 +495,8 @@ def _screening_recurrence_reference_impl(
     inputs = (
         q_read,
         q_write,
+        admission,
+        bank_logits,
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -325,6 +519,8 @@ def _screening_recurrence_reference_impl(
 def screening_recurrence_reference(
     q_read,
     q_write,
+    admission,
+    bank_logits,
     delta_slots,
     delta_read_keys,
     delta_values,
@@ -345,6 +541,8 @@ def screening_recurrence_reference(
     inputs = (
         q_read,
         q_write,
+        admission,
+        bank_logits,
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -359,7 +557,7 @@ def screening_recurrence_reference(
         tau_read,
         tau_write,
     )
-    _validate_screening_recurrence_inputs(*inputs)
+    _validate_screening_recurrence_inputs(*inputs, config=config)
     return _screening_recurrence_reference_impl(*inputs, config=config)
 
 
@@ -467,10 +665,12 @@ def _screening_backward_dispatch(
     )
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(15, 16, 17))
+@partial(jax.custom_vjp, nondiff_argnums=(17, 18, 19))
 def screening_recurrence(
     q_read,
     q_write,
+    admission,
+    bank_logits,
     delta_slots,
     delta_read_keys,
     delta_values,
@@ -498,6 +698,8 @@ def screening_recurrence(
     inputs = (
         q_read,
         q_write,
+        admission,
+        bank_logits,
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -512,7 +714,7 @@ def screening_recurrence(
         tau_read,
         tau_write,
     )
-    _validate_screening_recurrence_inputs(*inputs)
+    _validate_screening_recurrence_inputs(*inputs, config=config)
     return _screening_forward_dispatch(
         *inputs,
         config=config,
@@ -525,6 +727,8 @@ def screening_recurrence(
 def _screening_recurrence_fwd(
     q_read,
     q_write,
+    admission,
+    bank_logits,
     delta_slots,
     delta_read_keys,
     delta_values,
@@ -545,6 +749,8 @@ def _screening_recurrence_fwd(
     inputs = (
         q_read,
         q_write,
+        admission,
+        bank_logits,
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -559,7 +765,7 @@ def _screening_recurrence_fwd(
         tau_read,
         tau_write,
     )
-    _validate_screening_recurrence_inputs(*inputs)
+    _validate_screening_recurrence_inputs(*inputs, config=config)
     outputs, aux = _screening_forward_dispatch(
         *inputs,
         config=config,
@@ -597,6 +803,8 @@ screening_recurrence.defvjp(
 def screening_recurrence_sharded(
     q_read,
     q_write,
+    admission,
+    bank_logits,
     delta_slots,
     delta_read_keys,
     delta_values,
@@ -627,6 +835,7 @@ def screening_recurrence_sharded(
     """
 
     time_data = jax.sharding.PartitionSpec(None, data_axis, None)
+    time_batch = jax.sharding.PartitionSpec(None, data_axis)
     time_data_model = jax.sharding.PartitionSpec(
         None, data_axis, None, model_axis
     )
@@ -640,8 +849,8 @@ def screening_recurrence_sharded(
     replicated_scalar = jax.sharding.PartitionSpec()
 
     def mapped(*local_inputs):
-        local_delta_slots = local_inputs[2]
-        local_initial_slots = local_inputs[6]
+        local_delta_slots = local_inputs[4]
+        local_initial_slots = local_inputs[8]
         full_delta_slots = jax.lax.all_gather(
             local_delta_slots, model_axis, axis=3, tiled=True
         )
@@ -649,11 +858,11 @@ def screening_recurrence_sharded(
             local_initial_slots, model_axis, axis=2, tiled=True
         )
         recurrence_inputs = (
-            *local_inputs[:2],
+            *local_inputs[:4],
             full_delta_slots,
-            *local_inputs[3:6],
+            *local_inputs[5:8],
             full_initial_slots,
-            *local_inputs[7:],
+            *local_inputs[9:],
         )
         outputs = screening_recurrence(
             *recurrence_inputs,
@@ -686,6 +895,8 @@ def screening_recurrence_sharded(
     input_specs = (
         time_data,
         time_data,
+        time_batch,
+        time_data,
         time_data_model,
         time_data_replicated,
         time_data_replicated,
@@ -697,7 +908,7 @@ def screening_recurrence_sharded(
         data_scalars,
         data_scalars,
         replicated_vector,
-        replicated_scalar,
+        replicated_scalar if config.n_read_tiles == 1 else replicated_vector,
         replicated_scalar,
     )
     mapped_recurrence = jax.shard_map(
@@ -717,6 +928,8 @@ def screening_recurrence_sharded(
     inputs = (
         q_read,
         q_write,
+        admission,
+        bank_logits,
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -740,8 +953,22 @@ def screening_recurrence_sharded(
 
 __all__ = [
     "ACTIVE_SLOTS",
+    "ADMISSION_HIGH_RATE",
+    "ADMISSION_LOW_RATE",
+    "ADMISSION_MEAN",
+    "BANK_LONG_WRITE_MASS",
+    "BANK_MID_WRITE_MASS",
+    "BANK_SHORT_WRITE_MASS",
+    "EVICTION_AGE_MEAN",
+    "EVICTION_USAGE_MEAN",
+    "MATCHED_ROUTE_MASS",
+    "NOVEL_RATE",
+    "NOVEL_ROUTE_MASS",
     "READ_MAX",
     "READ_MEAN",
+    "REJECTED_RATE",
+    "ROUTE_ENTROPY",
+    "ROUTE_TOP1",
     "SCREENING_STEP_STAT_COUNT",
     "ScreeningRecurrenceConfig",
     "U_NORM",

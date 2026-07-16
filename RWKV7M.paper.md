@@ -1,9 +1,12 @@
 # RWKV 系 Recurrent LLM における State-Level Screening
-## Slot-Based Absolute Relevance Read/Write: Optimized Research Draft
+## Confidence-Preserving Competitive Write and Sparse Novel Allocation
 
-**版**: optimized-draft-v3  
-**対象**: RWKV-7 系、または固定サイズ recurrent state を持つ efficient sequence model  
-**実装対応**: 本リポジトリの `rwkv7m` JAX/Flax reference implementation  
+**版**: design-locked-draft-v4
+
+**対象**: RWKV-7 系、または固定サイズ recurrent state を持つ efficient sequence model
+
+**実装対応**: 本リポジトリの JAX/Flax NNX、portable reference、GPU/TPU Pallas paths。v4機構はopt-in実装済み、実GPU/TPU性能検証は未実施。
+
 **主張の強さ**: 本稿は研究仮説であり、性能改善や memory hygiene は実験で検証されるべきである。
 
 ---
@@ -12,11 +15,11 @@
 
 本稿は、RWKV 系 recurrent language model の compressed state に、Multiscreen 的な absolute relevance screening を移植する設計を提案する。
 
-標準 softmax attention は候補集合上で相対重みを作るため、全候補が無関係でも総和 1 の重みが必ず割り当てられる。これに対して state-level screening は、固定個数の state slot を独立に評価し、閾値を超えた slot だけを read / write する。
+標準 softmax attention は候補集合上で相対重みを作るため、全候補が無関係でも総和 1 の重みが必ず割り当てられる。これに対して state-level screening は、固定個数の state slot を独立に評価し、readでは閾値を超えたslotだけを絶対relevanceで集約する。writeでは絶対eligibilityを保持したままeligible slotを競合させ、既存slotと一致しない情報だけを、continuous admissionと疎なbank-aware victim routingを通して割り当てる。
 
 中心仮説は次である。
 
-> RWKV 系の固定サイズ recurrent state を slot 化し、absolute relevance によって read / write を制御すれば、token-to-token attention を復活させずに、長文 recall、無関係 state 読み出し抑制、長期 memory contamination 低減を改善できる可能性がある。
+> RWKV coreを主経路として維持したまま固定容量slot memoryを追加し、absolute read relevance、confidence-preserving competitive write、admission-controlled sparse replacementを組み合わせれば、token-to-token attentionを復活させずに長文recallとmemory hygieneを改善できる可能性がある。
 
 この仮説は、PPL だけでなく associative recall、long-context retrieval、long-form consistency、slot-level causal intervention によって検証される必要がある。
 
@@ -98,41 +101,112 @@ u = TanhNorm(z)
 
 全 slot が無関係なら `z` と `u` は 0 近傍になりうる。これは softmax attention との差分である。
 
-### 3.5 Residual Fusion
+### 3.5 Value-Space Gate and Residual Fusion
 
 ```text
-gate = sigmoid(W_g LN(x_t) + b_g)
-read_out = W_o u
-h_t = h_base_t + lambda_screen * gate * read_out
+g_v = sigmoid(W_g LN(x_t) + b_g) in R^{d_v}
+read_out = W_o (u * g_v)
+h_t = h_base_t + lambda_screen * read_out
 ```
 
-`lambda_screen` は小さく初期化し、backbone を初期学習で破壊しないようにする。
+gateを`d_model`空間ではなく`d_v`空間で適用し、`d_model -> d_model` gateを`d_model -> d_v`へ縮小する。既存checkpointとablationのため、旧model-space gateをlegacy modeとして残す。gate activationは`sigmoid`を既定とし、符号付きbranchを調べる場合だけ`tanh(silu(.))`を独立ablationにする。
+
+`lambda_screen`は小さく初期化し、backboneを初期学習で破壊しないようにする。multi-read時の確定案はtile数だけで正規化する。
+
+```text
+effective_lambda = softplus(lambda_raw) / sqrt(n_read_tiles)
+```
+
+screened layer数による追加除算は既定に含めず、別の深さ方向ablationとする。
 
 ---
 
 ## 4. Write Screening
 
-read と write は分離する。
+read と write は分離する。read は slot ごとの absolute relevance を最後まで維持する。一方 write は、既存情報との一致度を absolute eligibility として判定した後、書き込み対象となった slot だけを競合させる。
+
+### 4.1 Factorized Slot Candidate
+
+旧 candidate projection は `[LN(x_t); h_base_t; e_m]` から slot ごとの候補を直接生成するため、parameter 数が大きい。次期設計では rank `r` の latent 空間で三要素を合成する。
+
+```text
+x_latent = W_x LN(x_t)
+h_latent = W_h h_base_t
+slot_latent_m = W_e e_m
+delta_s_m = tanh(W_out silu(x_latent + h_latent + slot_latent_m))
+```
+
+候補 rank は `32 / 64 / 128` を比較する。parameter 数と主要 FLOPs が旧 projection より減らない形状では factorization を採用しない。旧 projection は checkpoint 互換と ablation のため残す。
+
+### 4.2 Confidence-Preserving Competitive Routing
+
+write query と slot write key から absolute eligibility を計算する。
 
 ```text
 q_w = W_q_w LN([x_t; h_base_t])
 k_w_m = W_k_w s_m
-rel_w_m = TrimSquare(<unit(q_w), unit(k_w_m)>, tau_w)
+e_m = TrimSquare(<unit(q_w), unit(k_w_m)>, tau_w)
 ```
 
-候補更新:
+eligible slot 間の相対 route は power normalization で求めるが、総 write 強度は absolute confidence `c=max_m(e_m)` で抑える。
 
 ```text
-delta_s_m = tanh(W_delta [LN(x_t); h_base_t; e_m])
+denom = where(sum_j e_j^gamma > 0, sum_j e_j^gamma, 1)
+p_m = e_m^gamma / denom
+r_matched_m = c * p_m
 ```
 
-write update:
+これにより、弱い eligibility を正規化だけで総量 1 の強い write へ増幅することを避ける。全 slot が threshold 以下なら `e_m=0`、`c=0` となり、既存 slot への matched write は発生しない。read relevance にはこの正規化を適用しない。
+
+### 4.3 Admission-Controlled Sparse Novel Allocation
+
+`c` が novelty threshold 未満の token は、既存 slot と一致しない新規候補とみなす。ただし novelty だけでは保存価値を意味しないため、学習可能な continuous admission を通す。
 
 ```text
-s_m <- s_m + mu_bank(m) * rel_w_m * (delta_s_m - s_m)
+is_novel = c < novelty_threshold
+admission = sigmoid(admission_logit(x_t, h_base_t))
 ```
 
-`read_screening_only` phase では write relevance を使わず、slow updater のみを使う。`read_write` phase では `cfg.use_write_screening=True` のときだけ write branch が有効になる。
+初期実装は bank と slot を階層的に選ぶ。3-way bank projection は token ごとの short / mid / long route を作り、各 bank 内では age と usage から victim score を作る。age は bank 内で正規化する。
+
+```text
+bank_soft = softmax(bank_logit / bank_temperature)
+bank_hard = one_hot(argmax(bank_logit))
+bank_st = bank_soft + stop_gradient(bank_hard - bank_soft)
+
+slot_logit_m =
+    age_weight * normalized_age_m
+    - usage_weight * usage_ema_m
+
+slot_soft_b = masked_softmax(slot_logit / temperature, bank=b)
+slot_hard_b = one_hot(argmax(slot_logit within bank b))
+slot_st_b = slot_soft_b + stop_gradient(slot_hard_b - slot_soft_b)
+
+victim_st_m = sum_b bank_st_b * slot_st_b,m
+r_novel_m = is_novel * admission * victim_st_m
+```
+
+forward は一つの bank の top-1 victim へ疎に書き、backward は bank と slot の両 soft route を通して勾配を流す。top-k と quota は独立 ablation とする。評価・推論では、必要に応じて admission threshold を加えた完全 hard mode を選べる。学習時に admission を hard 判定だけで切らない。
+
+### 4.4 Final Update and Accounting
+
+```text
+r_m = where(is_novel, r_novel_m, r_matched_m)
+s_m <- s_m + mu_bank(m) * r_m * (delta_s_m - s_m)
+```
+
+slot content、age reset、write metrics は raw eligibility ではなく、実際に適用された `r_m` から更新する。age は write されなければ進み、適用 write があるときだけ reset する。allocation に使う usage EMA は absolute read activity から更新し、write eligibility の高さを「利用された」と数えない。multi-readではtile数による増幅を避けるため、slotごとのtile最大read relevanceをusage signalにする。したがって write を reject された token は slot content を変えず、age を reset せず、write count にも入らないが、実際に slot を読んだ場合は read usage へ反映される。
+
+互換性と段階的評価のため、write mode を次のように分離する。
+
+```text
+disabled
+legacy_unconditional
+legacy_threshold
+competitive_novel
+```
+
+`legacy_unconditional` は現行 `read_screening_only` の slow updater、`legacy_threshold` は現行 `write_rel_floor` を含む read/write 更新を再現する。既存 config / checkpoint を読み込んだ場合は legacy mode へ明示的に写像し、暗黙に次期 routing へ変更しない。
 
 ---
 
@@ -156,13 +230,54 @@ mu_long_max  = 0.005
 
 仮説は、long bank を低速更新にすることで一時情報による長期記憶汚染を減らせる、というものである。
 
+novel allocation は Section 4.3 の階層 route で bank-aware にする。bank ごとの write 数、eviction age、usage 分布を必須 metric とし、bank collapse が観測された場合に限って quota または balance regularizer を比較する。
+
+### 5.1 Projected-State Invariant and Deferred Group Update
+
+現在の accelerator recurrence は、slot 本体に加えて read key、value、write key の projected state を保持し、同一の scalar update strength で更新する。これにより、各 projected state が slot projection と整合する。
+
+slot channel だけに group-wise `mu` を導入すると、projected state の更新と一致しなくなり、sequence chunk 境界によって結果が変わる可能性がある。したがって group-wise update は、projected state を再計算するか、projection と可換な group contract を定義するまで保留する。
+
+### 5.2 Training Tape Checkpointing
+
+checkpointを無効にしたaccelerator backwardはtokenごとに6個のFP32 carryを保存する。screened layer、batch、tokenあたりのtape容量は次になる。
+
+```text
+4 * M * (d_slot + 2*d_k + d_v + 2) bytes
+```
+
+実装済みの`checkpoint_interval = 8 / 16 / 32` pathは、slot、read key、value、write keyの4個のcontent carryを区間境界にだけ保存し、age、usage、applied update strengthの3個のscalar carryをtokenごとに保存する。`C = ceil(T / I) + 1`を境界数とすると追加tape容量は次になる。
+
+```text
+4 * B * screened_layers * M
+  * (C * (d_slot + 2*d_k + d_v) + 3*T) bytes
+```
+
+backwardはcandidateとscalar tapeから区間内contentを逆算し、境界checkpointで累積誤差を打ち切る。更新係数は1未満に制約する。interval 16では、tracked 0.185B presetのbatch 1、512 tokenが約0.74 MiB、7B presetのbatch 1、4,096 token、4 screened layerが約115.44 MiBとなる。これはtapeだけの理論値であり、実デバイスのpeak memory削減量や再計算コストを示すものではない。GPUとTPUは別々のcheckpoint forward/reverse kernel本文を持つ。
+
+### 5.3 Multi-Read Tile
+
+read subspace を増やす場合も総 dimension を固定する。
+
+```text
+d_k_tile = Dk_total / n_read_tiles
+d_v_tile = Dv_total / n_read_tiles
+```
+
+query/key/value は tile ごとの Dense を並べず、一回の batched projection から reshape する。各 tile は独立した threshold、unit normalization、Trim-and-Square、reject-all aggregation を持つ。tile 出力を concat した後、Section 3.5 の value-space gate と output projection を通す。write path は最初の実装では一系統のまま維持する。
+
 ---
 
 ## 6. Implementation Notes
 
-現在の reference implementation は次を満たす。
+### 6.1 Implemented Baseline
 
-- JAX/Flax Linen
+現在の実装は次を満たす。
+
+- JAX/Flax NNX training/runtime path
+- portable projected reference recurrence
+- backend-specific GPU/TPU Pallas screening forward/backward
+- Linen numerical and conversion reference
 - Optax train step
 - installable package: `rwkv7m`
 - RWKV-LM-V7 compatible `.bin/.idx` data reader and batch sampler
@@ -173,7 +288,21 @@ mu_long_max  = 0.005
 - write branch parameters initialized whenever `use_write_screening=True`
 - write screening warm-up via slot identity and a tiny update floor to avoid zero-slot dead starts
 
-現在の実装は研究用 reference path であり、production fused kernels や upstream RWKV-7 checkpoint compatibility は未実装である。
+accelerator path は dense projection を XLA へ出し、time recurrence を Pallas へ分離している。GPU Triton path は L40S、TPU path は v5e で projected recurrence の forward、gradient、tracked performance gate を通過している。ただし Hopper / Blackwell の Mosaic GPU、TPU pod 規模、multi-slice、production training の実証は未完了である。upstream RWKV-7 checkpoint compatibility も未証明である。
+
+### 6.2 Implemented Opt-In Screening v2
+
+本稿v4で追加した次の要素は、既存configのlegacy mappingを維持したopt-in機能として実装されている。
+
+1. write mode enum と route / admission / allocation metrics,
+2. value-space gate,
+3. factorized slot candidate,
+4. confidence-preserving competitive routing,
+5. continuous admission と straight-through sparse bank-aware allocation,
+6. Screening training-tape checkpointing,
+7. fixed-total-dimension multi-read tile と `1/sqrt(n_read_tiles)` scaling.
+
+各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。これは実GPU/TPU lowering、peak memory、throughputの証拠ではない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
 
 ---
 
@@ -186,12 +315,17 @@ mu_long_max  = 0.005
 1. RWKV-7 baseline
 2. parameter-matched RWKV-7
 3. FLOPs-matched RWKV-7
-4. RWKV-7 + read-screening-only state-level screening
-5. RWKV-7 + read/write state-level screening
-6. RWKV-7 + multi-timescale bank
-7. softmax-over-slots memory
-8. random slot read/write control
-9. Mamba / RetNet / DeltaNet 系近接規模モデル
+4. 現行 `legacy_unconditional` State-Level Screening
+5. 現行 `legacy_threshold` State-Level Screening
+6. v4 各改善の単独追加
+7. v4 全改善版
+8. parameter-matched FFN branch
+9. compute-matched FFN branch
+10. softmax-over-slots memory
+11. random slot read/write control
+12. Mamba / RetNet / DeltaNet 系近接規模モデル
+
+parameter 数だけでなく、学習 token 数と wall-clock の双方で比較する。accelerator kernel 単体の優位と model quality の改善を混同しない。
 
 ### 7.2 Ablations
 
@@ -200,10 +334,20 @@ mu_long_max  = 0.005
 - Trim-and-Square vs sigmoid gate
 - learnable tau vs fixed tau
 - TanhNorm on/off
-- read-only vs read/write
+- legacy unconditional / legacy threshold / competitive novel
 - shared read/write score vs separated score
+- model-space gate vs value-space gate
+- sigmoid gate vs `tanh(silu(.))`
+- factorized candidate rank `32 / 64 / 128` vs legacy candidate
+- confidence multiplier on/off
+- admission on/off and hard-inference threshold
+- victim top-1 vs top-k, temperature, straight-through estimator
+- fixed / biased / quota-based bank allocation
 - bank-specific update rate on/off
 - long bank update rate ablation
+- tape checkpoint interval `None / 8 / 16 / 32`
+- read tile count with fixed total key/value dimensions
+- `1/sqrt(n_read_tiles)` residual scaling on/off
 - slot count
 - screened layer count
 
@@ -234,24 +378,53 @@ Relevance visualization alone is not enough. Required interventions:
 - slot patching
 - read relevance shuffle
 - write suppression
+- admission suppression
+- novel allocation suppression
+- bank-preserving slot shuffle
 - long bank freeze
 - short bank freeze
+- full memory branch zeroing
+- memory reset at controlled token positions
 - logits/generation delta after intervention
+
+### 7.6 System and Slot Metrics
+
+quality 指標に加えて、次を記録する。
+
+- train tokens/s、step latency、peak accelerator memory
+- loss vs training tokens、loss vs wall-clock
+- route mass、route entropy、top-1 concentration
+- admission mean / saturation、novel-token rate
+- bank ごとの matched write、allocation、eviction 数
+- slot utilization、dead-slot rate、duplicate / cosine redundancy
+- eviction 時の age と usage
+- memory branch を無効化した counterfactual delta
+
+主結果は複数 seed で報告し、単一 run の route visualization を一般化しない。
 
 ---
 
 ## 8. Acceptance Criteria
 
-The design should be considered useful only if it shows:
+実装受け入れには、少なくとも次の invariant が必要である。
 
-1. retrieval improvement over matched baselines,
-2. long-context recall improvement beyond PPL,
-3. near-zero read-out in all-irrelevant conditions,
-4. less irrelevant memory read than softmax-over-slots,
-5. lower long-bank unnecessary update under write screening,
-6. causal contribution from at least some slots,
-7. stable training with TanhNorm,
-8. manageable dead-slot / slot-collapse behavior.
+1. `legacy_unconditional` が現行結果を許容誤差内で再現する,
+2. sequence chunk size を変えても同一 write mode の意味論が変わらない,
+3. 弱い eligibility が route normalization により強い write へ増幅されない,
+4. admission / routing で不採用となった token が slot content を更新せず、age reset や write count を発生させない,
+5. forward、gradient、checkpoint-resume parity が reference と accelerator path で成立する。
+
+研究上有用と判断するには、さらに次を満たす必要がある。
+
+1. matched baseline に対する retrieval improvement,
+2. PPL だけでは説明できない long-context recall improvement,
+3. all-irrelevant 条件で near-zero read-out,
+4. softmax-over-slots より少ない irrelevant memory read,
+5. long bank の不要な更新と重複 slot の減少,
+6. 少なくとも一部 slot の causal contribution,
+7. TanhNorm と sparse routing を含む stable training,
+8. manageable な dead-slot、route-collapse、bank-collapse behavior,
+9. parameter / compute 増加を含めても許容できる loss-vs-wall-clock と peak memory.
 
 ---
 
@@ -263,6 +436,12 @@ The design should be considered useful only if it shows:
 4. Naive slot computation does not automatically improve wall-clock latency.
 5. State-level screening may help observability without giving human-interpretable slots.
 6. Results from token-level Multiscreen do not directly transfer to RWKV state slots.
+7. Straight-through routing introduces biased gradients and may become temperature-sensitive.
+8. Admission can saturate to always-write or never-write without monitoring or regularization.
+9. Sparse victim selection can collapse onto one slot or one bank.
+10. Tape checkpointing lowers memory at the cost of backward recomputation and may regress short-context throughput.
+11. Multi-read can duplicate retrieval subspaces or amplify the residual branch despite fixed total dimensions.
+12. Group-wise update can violate projected-state consistency; it remains deferred rather than assumed safe.
 
 ---
 

@@ -15,9 +15,12 @@ from ..io import (
 )
 from ..model import MODEL_PRESET_NAMES, ModelConfig, ScreeningConfig, model_preset
 from .config import (
+    add_optimizer_backend_arg,
+    add_screening_v2_args,
     add_training_vocab_tiling_args,
     apply_execution_overrides,
     parse_args_with_config,
+    screening_v2_kwargs,
 )
 from .eval_binidx import evaluate_binidx, parse_args as parse_eval_args
 
@@ -57,6 +60,7 @@ def build_config(args):
             mid_half_life_tokens=args.mid_half_life_tokens,
             long_half_life_tokens=args.long_half_life_tokens,
             usage_ema_decay=args.usage_ema_decay,
+            **screening_v2_kwargs(args),
         )
     else:
         screening = ScreeningConfig()
@@ -154,6 +158,7 @@ def parse_args(argv=None):
     head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
     head_chunk_group.add_argument("--no-head-chunking", action="store_true")
     add_training_vocab_tiling_args(parser)
+    add_optimizer_backend_arg(parser)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)
@@ -183,6 +188,7 @@ def parse_args(argv=None):
     parser.add_argument("--mid-half-life-tokens", type=float, default=None)
     parser.add_argument("--long-half-life-tokens", type=float, default=None)
     parser.add_argument("--usage-ema-decay", type=float, default=0.99)
+    add_screening_v2_args(parser)
     parser.add_argument("--carry-state", action="store_true")
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--output-dir", default=None)

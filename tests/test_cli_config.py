@@ -70,3 +70,20 @@ def test_training_vocab_tiling_execution_overrides():
                 ]
             )
         )
+
+
+def test_optimizer_backend_execution_override():
+    config = build_train_config(
+        parse_train_args(
+            [
+                "--data-file",
+                "unused",
+                "--ctx-len",
+                "8",
+                "--no-screening",
+                "--optimizer-backend",
+                "pallas_gpu_triton",
+            ]
+        )
+    )
+    assert config.optimizer_backend == "pallas_gpu_triton"

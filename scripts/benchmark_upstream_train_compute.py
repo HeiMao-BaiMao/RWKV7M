@@ -22,6 +22,7 @@ import numpy as np
 
 from benchmark_common import (
     COMPUTE_BENCHMARK_SCHEMA_VERSION,
+    fixed_batch_content_sha256,
     gc_policy,
     measurement_contract,
     timing_summary,
@@ -93,7 +94,12 @@ def main(argv=None):
     with np.load(args.fixed_batch, allow_pickle=False) as archive:
         input_ids_np = np.asarray(archive["input_ids"], dtype=np.int64)
         target_ids_np = np.asarray(archive["target_ids"], dtype=np.int64)
-        if "mask" in archive and not np.all(archive["mask"] == 1):
+        mask_np = (
+            np.asarray(archive["mask"], dtype=np.float32)
+            if "mask" in archive
+            else None
+        )
+        if mask_np is not None and not np.all(mask_np == 1):
             raise SystemExit(
                 "official fused CE requires an all-ones fixed-batch mask"
             )
@@ -104,7 +110,16 @@ def main(argv=None):
     batch_size, ctx_len = input_ids_np.shape
     if ctx_len % 16:
         raise SystemExit("official x070 requires fixed-batch token length divisible by 16")
-    fixed_batch_sha256 = hashlib.sha256(args.fixed_batch.read_bytes()).hexdigest()
+    fixed_batch_file_sha256 = hashlib.sha256(
+        args.fixed_batch.read_bytes()
+    ).hexdigest()
+    fixed_batch_content_fingerprint = fixed_batch_content_sha256(
+        {
+            "input_ids": input_ids_np,
+            "target_ids": target_ids_np,
+            **({"mask": mask_np} if mask_np is not None else {}),
+        }
+    )
 
     os.environ.update(
         RWKV_MY_TESTING="x070",
@@ -265,11 +280,18 @@ def main(argv=None):
             "variant": "official_x070",
             "dtype": "bfloat16",
             "parameter_count": parameter_count,
+            "n_layers": args.n_layer,
+            "d_model": args.n_embd,
+            "d_ffn": actual_dim_ffn,
+            "n_heads": args.dim_att // args.head_size,
+            "head_size": args.head_size,
+            "vocab_size": args.vocab_size,
             "actual_dim_ffn": actual_dim_ffn,
         },
         "fixed_batch": {
             "path": str(args.fixed_batch.resolve()),
-            "sha256": fixed_batch_sha256,
+            "sha256": fixed_batch_file_sha256,
+            "content_sha256": fixed_batch_content_fingerprint,
         },
         "method": measurement_contract(
             warmup=args.benchmark_warmup,

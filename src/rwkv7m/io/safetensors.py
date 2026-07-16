@@ -35,6 +35,24 @@ def _standard_metadata(config: ModelConfig, tokenizer_metadata=None):
         "screening_n_slots": str(screening.n_slots),
         "screening_d_slot": str(screening.d_slot),
         "screening_layers": ",".join(str(layer) for layer in screening.screened_layers),
+        "screening_write_mode": (
+            screening.write_mode
+            if screening.write_mode is not None
+            else "legacy_phase_mapping"
+        ),
+        "screening_gate_space": screening.gate_space,
+        "screening_gate_activation": screening.gate_activation,
+        "screening_candidate_rank": (
+            "none"
+            if screening.candidate_rank is None
+            else str(screening.candidate_rank)
+        ),
+        "screening_read_tiles": str(screening.n_read_tiles),
+        "screening_checkpoint_interval": (
+            "none"
+            if screening.checkpoint_interval is None
+            else str(screening.checkpoint_interval)
+        ),
         CONFIG_METADATA_KEY: json.dumps(model_config_to_dict(config), sort_keys=True),
     }
     tokenizer_data = (

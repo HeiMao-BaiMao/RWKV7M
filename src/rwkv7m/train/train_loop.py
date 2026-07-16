@@ -27,6 +27,7 @@ def build_train_state(key, model, variables, config, total_steps=10000):
         "adam_beta1": getattr(config, "adam_beta1", 0.9),
         "adam_beta2": getattr(config, "adam_beta2", 0.999),
         "adam_eps": getattr(config, "adam_eps", 1e-8),
+        "optimizer_backend": getattr(config, "optimizer_backend", "optax"),
     }
     tx = create_optimizer(opt_config, total_steps=total_steps)
     state = TrainState.create(

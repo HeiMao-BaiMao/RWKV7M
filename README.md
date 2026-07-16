@@ -241,9 +241,22 @@ with an FP32 carry tape. Model sharding gathers the slot feature once at the
 recurrence boundary, averages replicated outputs for a single logical
 transpose contribution, and slices final slots back to their owners. These new
 screening paths have real-TPU forward, gradient, four-device model-sharding,
-optimizer-step, and recurrence-performance validation. GPU screening remains
-implemented but still requires real-accelerator validation on each target
-architecture.
+optimizer-step, and recurrence-performance validation. The Triton path also
+has real L40S forward, all-input-gradient, and recurrence-performance
+validation. Mosaic GPU still requires Hopper/Blackwell validation.
+
+The Screening v2 revision is implemented behind explicit opt-in settings in the
+[State-Level Screening v2 engineering contract](docs/state_level_screening_v2_design.md)
+and the updated [research paper](RWKV7M.paper.md). It adds value-space gating,
+a factorized candidate, confidence-preserving competitive writes, continuous
+admission with sparse bank-aware novel allocation, interval training-tape
+checkpointing, and fixed-total-dimension multi-read tiles. Existing configs
+continue to map to explicit legacy write modes; the tracked opt-in example is
+[`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
+Portable reference tests and CPU Pallas interpret-mode tests cover the v2
+forward and gradients for both backend-specific kernel bodies. The published
+L40S and TPU results still measure the legacy projected recurrence: real GPU
+and TPU lowering, memory, and throughput gates for v2 remain pending.
 
 Run the synchronized screening recurrence benchmark with:
 
@@ -271,6 +284,14 @@ compute-only workflow materializes one shared NPZ batch with
 and GC settings. WKV-only official CUDA measurements use
 `scripts/benchmark_upstream_wkv_compute.py`. The exact boundary and invalidation
 rules are documented in the L40S performance report.
+
+For one-GPU tuning, `scripts/benchmark_gpu_train_matrix.py` compares the
+full-XLA and tiled-Pallas heads, Optax and the opt-in fused Pallas AdamW path,
+and multiple per-device batch sizes under the same complete-step boundary.
+`scripts/profile_gpu_train_compute.py` opens a post-warmup CUDA Profiler API
+range for Nsight Systems or Nsight Compute. The commands, acceptance rules,
+and performance-counter limitations are documented in
+[Single-GPU training optimization gate](docs/gpu_optimization_gate.md).
 
 For controlled long-running throughput experiments, the distributed trainer
 also accepts `--disable-python-gc`. This opt-in flag disables only CPython's
@@ -718,7 +739,8 @@ Lower-level modules:
 
 - Flax NNX runtime/training implementation, with Linen retained as the numerical
   and upstream-conversion reference.
-- Full-sequence training path with `jax.lax.scan` inside recurrent components.
+- Full-sequence training path with portable `jax.lax.scan` references and
+  backend-specific persistent Pallas accelerator recurrences.
 - One shared small/large `ModelConfig` contract across the public runtime,
   trainer, distributed CLI, and scale planner.
 - BF16 parameter storage/compute with FP32 update, optimizer-state, and gradient
@@ -727,7 +749,8 @@ Lower-level modules:
 - Vocabulary-parallel logits, cross entropy, and L2Wrap on an explicit model axis.
 - RWKV-LM-V7 compatible `.bin/.idx` dataset reader and sampler.
 - Chunked inference state carry for the reference RWKV state (`time_mix_x`, `channel_mix_x`, WKV matrix state).
-- State-level screening with `read_screening_only` and `read_write` phases.
+- Legacy projected State-Level Screening with `read_screening_only` and
+  `read_write` phases, plus separate GPU/TPU Pallas recurrences.
 - Sequential carry-state binidx training and validation with lane-wrap state reset.
 - RWKV tokenizer API and JSONL-to-binidx conversion.
 - Wheel-packaged RWKV tokenizer vocabulary fallback.
@@ -751,8 +774,10 @@ Not yet included:
 
 - production accelerator profiling and shape-specific Pallas autotuning beyond
   the validated L40S shapes,
-- real-GPU screening parity/performance validation and a non-duplicated
-  model-axis screening recurrence,
+- Hopper/Blackwell Mosaic screening validation and a non-duplicated model-axis
+  screening recurrence,
+- the design-locked Screening v2 gate/candidate/routing/checkpointing/multi-read
+  stages,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,
@@ -769,4 +794,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 174 tests: 170 pass locally, with four real-accelerator or optional-runtime checks skipped on CPU.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-16, the current worktree suite completed with 195 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration, routing invariants, sequence-chunk parity, and CPU Pallas interpret-mode GPU/TPU checkpointed-gradient parity; it does not include real-device v2 performance validation.

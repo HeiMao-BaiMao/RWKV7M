@@ -81,14 +81,35 @@ def _linen_eval_step_data_parallel(train_state, batch, rwkv_state, screen_state,
         deterministic=True,
     )
     loss = cross_entropy_loss(logits, batch["target_ids"], batch.get("mask"))
-    return {
+    metrics = {
         "loss": loss,
         "rel_read_mean": stats.get("rel_read_mean", jnp.zeros(())),
         "active_slots_mean": stats.get("active_slots_mean", jnp.zeros(())),
         "u_norm_mean": stats.get("u_norm_mean", jnp.zeros(())),
         "rel_write_mean": stats.get("rel_write_mean", jnp.zeros(())),
         "rel_write_effective_mean": stats.get("rel_write_effective_mean", jnp.zeros(())),
-    }, new_rwkv_state, new_screen_state
+    }
+    for key in (
+        "matched_route_mass",
+        "novel_route_mass",
+        "route_entropy",
+        "route_top1_concentration",
+        "admission_mean",
+        "admission_low_rate",
+        "admission_high_rate",
+        "novel_token_rate",
+        "rejected_write_rate",
+        "short_bank_write_mass",
+        "mid_bank_write_mass",
+        "long_bank_write_mass",
+        "eviction_age_mean",
+        "eviction_usage_mean",
+        "slot_utilization",
+        "dead_slot_rate",
+        "slot_cosine_redundancy",
+    ):
+        metrics[key] = stats.get(key, jnp.zeros(()))
+    return metrics, new_rwkv_state, new_screen_state
 
 
 @nnx.jit(static_argnames=("phase",))

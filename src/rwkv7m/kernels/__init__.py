@@ -10,6 +10,11 @@ from .training_loss_backend import (
     available_training_loss_backends,
     resolve_training_loss_backend,
 )
+from .optimizer_backend import (
+    OptimizerBackend,
+    available_optimizer_backends,
+    resolve_optimizer_backend,
+)
 from .wkv_backend import (
     WKVBackend,
     available_wkv_backends,
@@ -23,14 +28,17 @@ from .wkv_ffi import (
 
 __all__ = [
     "ScreeningBackend",
+    "OptimizerBackend",
     "TrainingLossBackend",
     "WKVBackend",
     "WKVFFIBackend",
     "available_screening_backends",
+    "available_optimizer_backends",
     "available_training_loss_backends",
     "available_wkv_backends",
     "register_wkv_ffi_backend",
     "resolve_screening_backend",
+    "resolve_optimizer_backend",
     "resolve_training_loss_backend",
     "resolve_wkv_backend",
     "unregister_wkv_ffi_backend",

@@ -33,34 +33,41 @@ def _config():
         usage_ema_decay=0.99,
         tanh_norm_cap=1.0,
         eps=1e-6,
+        write_mode="competitive_novel",
+        bank_ids=(0, 0, 1, 2),
+        n_read_tiles=2,
+        checkpoint_interval=2,
     )
 
 
 def _inputs():
     time, batch, slots = 4, 1, 4
     key_size, slot_size, value_size = 8, 8, 8
-    keys = jax.random.split(jax.random.key(31), 15)
+    keys = jax.random.split(jax.random.key(31), 17)
 
     def normal(index, shape, scale=0.1, dtype=jnp.float32):
         return (jax.random.normal(keys[index], shape) * scale).astype(dtype)
 
-    q_read = unit_norm(normal(0, (time, batch, key_size)))
+    q_read_tiled = normal(0, (time, batch, 2, key_size // 2))
+    q_read = unit_norm(q_read_tiled).reshape(time, batch, key_size)
     q_write = unit_norm(normal(1, (time, batch, key_size)))
     return (
         q_read,
         q_write,
-        normal(2, (time, batch, slots, slot_size), dtype=jnp.bfloat16),
-        normal(3, (time, batch, slots, key_size), dtype=jnp.bfloat16),
-        normal(4, (time, batch, slots, value_size), dtype=jnp.bfloat16),
+        jax.nn.sigmoid(normal(2, (time, batch))),
+        normal(3, (time, batch, 3)),
+        normal(4, (time, batch, slots, slot_size), dtype=jnp.bfloat16),
         normal(5, (time, batch, slots, key_size), dtype=jnp.bfloat16),
-        normal(6, (batch, slots, slot_size)),
-        normal(7, (batch, slots, key_size), dtype=jnp.bfloat16),
-        normal(8, (batch, slots, value_size), dtype=jnp.bfloat16),
+        normal(6, (time, batch, slots, value_size), dtype=jnp.bfloat16),
+        normal(7, (time, batch, slots, key_size), dtype=jnp.bfloat16),
+        normal(8, (batch, slots, slot_size)),
         normal(9, (batch, slots, key_size), dtype=jnp.bfloat16),
+        normal(10, (batch, slots, value_size), dtype=jnp.bfloat16),
+        normal(11, (batch, slots, key_size), dtype=jnp.bfloat16),
         jnp.arange(slots, dtype=jnp.float32)[None, :],
         jnp.linspace(0.0, 0.3, slots, dtype=jnp.float32)[None, :],
         jnp.linspace(0.05, 0.2, slots, dtype=jnp.float32),
-        jnp.asarray(-0.4, dtype=jnp.float32),
+        jnp.asarray([-0.4, -0.3], dtype=jnp.float32),
         jnp.asarray(-0.35, dtype=jnp.float32),
     )
 
@@ -103,7 +110,7 @@ def test_real_accelerator_screening_forward_and_backward_match_reference():
     ):
         assert jnp.allclose(actual, expected, rtol=rtol, atol=atol)
 
-    argnums = tuple(range(15))
+    argnums = tuple(range(17))
     expected_gradients = jax.jit(
         jax.grad(
             lambda *values: _loss(

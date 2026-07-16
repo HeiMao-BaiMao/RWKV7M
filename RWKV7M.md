@@ -8,6 +8,8 @@ memory. The former Linen implementation is retained as a numerical and
 upstream-conversion reference rather than the training source of truth.
 
 The implementation follows the research design in `RWKV7M.paper.md`, but this document is the concrete engineering contract for the current repository.
+The approved, not-yet-implemented Screening revision is specified separately in
+`docs/state_level_screening_v2_design.md`.
 
 ## 2. Current Status
 
@@ -51,19 +53,27 @@ Implemented:
 18. BF16/FP32 dtype policies, vocabulary-parallel loss and L2Wrap, block
     rematerialization, exact sequence chunking, and microbatch accumulation in
     the NNX training path.
+19. Persistent backend-specific Pallas WKV and projected-Screening forward and
+    backward kernels, with portable reference fallbacks and explicit dispatch.
+20. Real L40S and TPU v5e correctness/performance gates for the tracked
+    projected Screening recurrence shape.
 
 Important limitation:
 
 The current code is a unified JAX/Flax NNX small-to-7B training path with
-real-TPU functional coverage for a small model, not a TPU-validated
-production-scale 7B trainer. It is suitable
-for correctness testing, small experiments, portable artifact validation, and
-distributed smoke tests. It does not yet provide production fused RWKV kernels,
-pretrained RWKV checkpoint conversion, XProf-tuned TPU sharding, full RWKV7M
-train/runtime-state checkpoint validation on TPU pods, 7B or multi-host TPU
-evidence, or a PyTorch/non-JAX runtime. The external recurrent state carry is
-implemented for this research model, but it should not be treated as
-compatibility with upstream RWKV-7 production checkpoints.
+backend-specific Pallas kernels and real-TPU functional coverage for a small
+model, not a TPU-validated production-scale 7B trainer. It is suitable for
+correctness testing, small experiments, portable artifact validation, and
+distributed smoke tests. It does not yet provide XProf-tuned pod-scale
+sharding, full RWKV7M train/runtime-state checkpoint validation on TPU pods, 7B
+or multi-host/multi-slice TPU evidence, Hopper/Blackwell Mosaic validation,
+pretrained RWKV checkpoint conversion, or a PyTorch/non-JAX runtime. The
+external recurrent state carry is implemented for this research model, but it
+should not be treated as compatibility with upstream RWKV-7 production
+checkpoints. Screening v2 is implemented as an opt-in configuration and has
+portable-reference plus CPU Pallas interpret-mode parity coverage, but its
+real-accelerator lowering, memory, and throughput gates have not run. Current
+published accelerator results describe the legacy projected recurrence only.
 
 ## 3. Package Layout
 
@@ -100,16 +110,29 @@ src/rwkv7m/
     config.py
     flax_checkpoint.py
     safetensors.py
+  kernels/
+    wkv_backend.py
+    wkv_pallas_gpu.py
+    wkv_pallas_tpu.py
+    screening_backend.py
+    screening_pallas_gpu.py
+    screening_pallas_tpu.py
+    training_loss_backend.py
+    optimizer_backend.py
   model/
+    nnx_model.py
+    presets.py
     rwkv_core.py
     screened_rwkv.py
     screening.py
+    screening_recurrence.py
     state.py
   infer/
     generate.py
   tokenizer/
     rwkv_tokenizer.py
   train/
+    nnx_train.py
     train_loop.py
     train_state.py
     train_step.py
@@ -218,6 +241,12 @@ write_enabled = phase == "read_write" and cfg.use_write_screening
 
 This prevents accidental write behavior from strings such as `"inference"`.
 
+The current phase names predate the Screening v2 write-mode split. In the
+current implementation, `read_screening_only` still runs the unconditional slow
+slot updater; it does not freeze slots. The v2 migration maps it to
+`legacy_unconditional`. `read_write` with `use_write_screening=True` maps to
+`legacy_threshold`. Old configs and checkpoints must preserve those semantics.
+
 ## 7. RWKV Reference State
 
 Per layer:
@@ -254,6 +283,17 @@ ModelScreenState(layers=tuple(...))
 
 Only screened layers have screening states.
 
+The public runtime state stores slots, ages, and usage. Inside the projected
+accelerator recurrence, initial slots and every candidate are also projected
+into read keys, values, and write keys. The recurrent carry is therefore:
+
+```text
+slots, read_keys, values, write_keys, ages, usage_ema
+```
+
+All projected content states currently use the same scalar update strength.
+That consistency is a required invariant across sequence chunks.
+
 ## 9. Screening Math
 
 Unit norm:
@@ -283,6 +323,10 @@ u = tanh_norm(z)
 
 This is intentionally not softmax attention. If all slots are irrelevant, read-out can remain near zero.
 
+This prohibition applies to reads. Screening v2 may conditionally normalize
+eligible *write* routes, but it must multiply the distribution by absolute
+write confidence so weak eligibility is not promoted to unit write mass.
+
 ## 10. Slot Update
 
 `read_screening_only`:
@@ -301,6 +345,46 @@ This is intentionally not softmax attention. If all slots are irrelevant, read-o
 To keep from-scratch `read_write` training alive, write keys use `slots + slot_embed`, and update strength uses `max(rel_write, write_rel_floor)`. The default `write_rel_floor` is intentionally tiny and acts as a warm-up path when slots are initially zero.
 
 Initialization creates write branch parameters whenever `cfg.use_write_screening=True`, even if variables are initialized through `read_screening_only`. This allows later `read_write` apply calls without missing parameters.
+
+### 10.1 Implemented Opt-In Screening v2 Contract
+
+The implementation provides four explicit write modes:
+
+```text
+disabled
+legacy_unconditional
+legacy_threshold
+competitive_novel
+```
+
+これらの明示modeは`read_write` phaseで使用する。歴史的な
+`read_screening_only`は旧slow updaterを維持し、既存phaseの意味を変更しない。
+`read_write`内では`disabled`だけがslot更新を完全に停止する。
+
+`competitive_novel` first computes absolute Trim-and-Square eligibility. For a
+matched write, eligible slots compete but the normalized route is multiplied by
+`max(eligibility)`. For a novel write, a continuous sigmoid admission controls
+the amount, while a bank-aware top-1 victim is sparse in the forward pass and
+uses a soft straight-through route in the backward pass. Slot updates, age
+reset, and write counts follow the applied route. Usage EMA instead follows
+absolute read activity so frequently read slots are protected from eviction.
+
+The opt-in revision moves the gate from model space to value space, factorizes
+the slot candidate through a configurable low-rank latent, adds interval
+checkpointing for the six-value FP32 training tape, and finally adds multi-read
+tiles with fixed total dimensions and `1 / sqrt(n_read_tiles)` residual
+scaling. Group-wise slot updates are deferred because changing slot channels
+without matching projected read-key/value/write-key updates would break chunk
+invariance.
+
+The complete formulas, compatibility mapping, configuration surface, memory
+equation, metrics, implementation status, and acceptance gates are in
+[`docs/state_level_screening_v2_design.md`](docs/state_level_screening_v2_design.md).
+The tracked small-model configuration is
+[`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
+CPU interpret mode verifies both GPU and TPU Pallas kernel equations, including
+checkpointed backward gradients. It does not prove real-device lowering or
+speed; the existing L40S and TPU reports predate v2.
 
 ## 11. Training
 
@@ -450,40 +534,55 @@ Run:
 uv run pytest -q
 ```
 
-As of this document update, the full suite passes locally: 91 tests.
+As of 2026-07-16, the current worktree suite completed with 195 passing tests
+and five accelerator/optional-runtime skips. This count includes GPU optimizer
+and benchmark-harness coverage plus Screening v2 legacy migration, routing
+invariants, sequence-chunk parity, and CPU Pallas interpret-mode GPU/TPU
+checkpointed-gradient parity. It does not include real-device v2 performance
+validation.
 
 ## 14. Design Rules
 
 Do not:
 
-1. apply softmax over slots in the screening module,
-2. normalize relevance by slot sum,
+1. apply softmax or slot-sum normalization to read relevance,
+2. normalize write eligibility without restoring absolute write confidence,
 3. hard-overwrite slots,
 4. use in-place slot mutation,
 5. silently accept unknown phase names,
-6. initialize write parameters only in write phase.
+6. initialize write parameters only in write phase,
+7. use a hard-only admission decision during training,
+8. introduce group-wise slot rates without a matching projected-state contract,
+9. report CPU interpret-mode Screening v2 parity as real GPU/TPU validation or
+   measured speedup.
 
 Prefer:
 
-1. `read_screening_only` as the default phase,
-2. `read_write` only when write screening is explicitly enabled,
+1. explicit legacy write modes during migration,
+2. `competitive_novel` only when explicitly configured,
 3. `float32` for norm/similarity/relevance,
-4. small configs for correctness tests,
-5. full `uv run pytest -q` before commits.
+4. applied-route accounting for writes and absolute-read accounting for usage,
+5. small configs for correctness tests,
+6. full `uv run pytest -q` before commits.
 
 ## 15. Roadmap
 
 Next engineering steps:
 
-1. Validate full RWKV7M Orbax train-state and runtime-state checkpoint
+1. Validate Screening v2 on real GPU and TPU hardware: lowering, full output
+   and all-input-gradient parity, peak-memory reduction from interval
+   checkpointing, recurrence latency, and complete train-step throughput.
+2. Validate full RWKV7M Orbax train-state and runtime-state checkpoint
    save/resume on real TPU pods, including sharded optimizer, parameter,
    recurrent, and screening states. The independent small NNX lifecycle probe
    is already validated.
-2. Use XProf to tune the explicit sharding contracts and the three all-to-all
-   collectives observed in the four-device TPU v5e smoke test.
-3. Validate the 7B configuration and multi-host execution, then tune TPU pod
+3. Use XProf to tune the explicit sharding contracts and the measured
+   post-SPMD collectives, including the projected Screening boundary.
+4. Validate the 7B configuration and multi-host execution, then tune TPU pod
    throughput and document failure recovery drills.
-4. Implement task-specific long-context evaluation harnesses beyond stateful binidx validation.
-5. Add causal intervention hooks for slot ablation/patching, read shuffle, write suppression, and frozen-slot controls.
-6. Implement upstream RWKV-7 checkpoint mapping only after conversion tests prove compatibility.
-7. Add fused/custom kernels or kernel-backed WKV recurrence if JAX/XLA output is insufficient.
+5. Validate Mosaic GPU kernels and the opt-in Pallas optimizer on actual
+   Hopper/Blackwell hardware before changing defaults.
+6. Implement task-specific long-context evaluation harnesses beyond stateful binidx validation.
+7. Add causal intervention hooks for slot ablation/patching, read shuffle,
+   admission/allocation suppression, memory reset, and frozen-slot controls.
+8. Implement upstream RWKV-7 checkpoint mapping only after conversion tests prove compatibility.

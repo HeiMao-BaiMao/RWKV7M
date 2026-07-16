@@ -18,17 +18,21 @@ import numpy as np
 
 from benchmark_common import (
     COMPUTE_BENCHMARK_SCHEMA_VERSION,
+    fixed_batch_content_sha256,
     gc_policy,
     measurement_contract,
     timing_summary,
 )
+from cuda_profiler_range import cuda_profiler_range
 from rwkv7m.api import create_train_runtime
 from rwkv7m.cli.config import (
+    add_optimizer_backend_arg,
     add_training_vocab_tiling_args,
     apply_execution_overrides,
 )
 from rwkv7m.io import load_model_config
 from rwkv7m.kernels import (
+    resolve_optimizer_backend,
     resolve_screening_backend,
     resolve_training_loss_backend,
     resolve_wkv_backend,
@@ -54,6 +58,18 @@ def parse_args(argv=None):
     parser.add_argument("--benchmark-warmup", type=int, default=5)
     parser.add_argument("--benchmark-iterations", type=int, default=50)
     parser.add_argument("--disable-python-gc", action="store_true")
+    parser.add_argument(
+        "--profile-mode",
+        choices=("none", "xprof", "cuda_profiler_api"),
+        default="none",
+    )
+    parser.add_argument(
+        "--profile-target",
+        choices=("forward", "backward", "optimizer", "full_step"),
+        default="full_step",
+    )
+    parser.add_argument("--profile-iterations", type=int, default=3)
+    parser.add_argument("--profile-output", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     remat = parser.add_mutually_exclusive_group()
     remat.add_argument("--remat-blocks", dest="remat_blocks", action="store_true")
@@ -66,11 +82,16 @@ def parse_args(argv=None):
     head.add_argument("--head-chunk-size", type=int, default=None)
     head.add_argument("--no-head-chunking", action="store_true")
     add_training_vocab_tiling_args(parser)
+    add_optimizer_backend_arg(parser)
     args = parser.parse_args(argv)
     if args.ctx_len <= 0 or args.batch_size <= 0:
         parser.error("--ctx-len and --batch-size must be positive")
     if args.benchmark_warmup < 0 or args.benchmark_iterations <= 0:
         parser.error("benchmark warmup must be non-negative and iterations positive")
+    if args.profile_iterations <= 0:
+        parser.error("--profile-iterations must be positive")
+    if args.profile_mode == "xprof" and args.profile_output is None:
+        parser.error("--profile-output is required for --profile-mode=xprof")
     return args
 
 
@@ -137,6 +158,37 @@ def _measure_optimizer(
     return timing_summary(samples)
 
 
+def _run_profile_iterations(
+    *,
+    target,
+    iterations,
+    forward,
+    params,
+    pullback,
+    loss_cotangent,
+    optimizer_step,
+    bundle_state,
+    gradients,
+    full_step,
+):
+    active_state = bundle_state
+    for iteration in range(iterations):
+        with jax.profiler.TraceAnnotation(
+            f"rwkv7m_{target}", iteration=iteration
+        ):
+            if target == "forward":
+                result = forward(params)
+            elif target == "backward":
+                result = pullback(loss_cotangent)
+            elif target == "optimizer":
+                active_state = optimizer_step(active_state, gradients)
+                result = active_state
+            else:
+                active_state, loss = full_step(active_state)
+                result = (active_state, loss)
+            jax.block_until_ready(result)
+
+
 def main(argv=None):
     args = parse_args(argv)
     config = (
@@ -163,7 +215,10 @@ def main(argv=None):
         raise SystemExit("fixed batch shape does not match --batch-size/--ctx-len")
     if fixed_batch["input_ids"].min() < 0 or fixed_batch["input_ids"].max() >= config.vocab_size:
         raise SystemExit("fixed batch contains token ids outside the model vocabulary")
-    fixed_batch_sha256 = hashlib.sha256(args.fixed_batch.read_bytes()).hexdigest()
+    fixed_batch_file_sha256 = hashlib.sha256(
+        args.fixed_batch.read_bytes()
+    ).hexdigest()
+    fixed_batch_content_fingerprint = fixed_batch_content_sha256(fixed_batch)
     fixed_batch = jax.device_put(fixed_batch)
     runtime, train_state = create_train_runtime(
         jax.random.key(args.seed),
@@ -257,6 +312,52 @@ def main(argv=None):
             iterations=args.benchmark_iterations,
         )
 
+    profile = {
+        "mode": args.profile_mode,
+        "target": args.profile_target,
+        "iterations": args.profile_iterations,
+    }
+    if args.profile_mode == "xprof":
+        args.profile_output.mkdir(parents=True, exist_ok=True)
+        options = jax.profiler.ProfileOptions()
+        options.python_tracer_level = 0
+        options.host_tracer_level = 1
+        jax.profiler.start_trace(
+            str(args.profile_output),
+            create_perfetto_trace=True,
+            profiler_options=options,
+        )
+        try:
+            _run_profile_iterations(
+                target=args.profile_target,
+                iterations=args.profile_iterations,
+                forward=forward,
+                params=params,
+                pullback=pullback,
+                loss_cotangent=loss_cotangent,
+                optimizer_step=optimizer_step,
+                bundle_state=bundle_state,
+                gradients=gradients,
+                full_step=full_step,
+            )
+        finally:
+            jax.profiler.stop_trace()
+        profile["output"] = str(args.profile_output.resolve())
+    elif args.profile_mode == "cuda_profiler_api":
+        with cuda_profiler_range():
+            _run_profile_iterations(
+                target=args.profile_target,
+                iterations=args.profile_iterations,
+                forward=forward,
+                params=params,
+                pullback=pullback,
+                loss_cotangent=loss_cotangent,
+                optimizer_step=optimizer_step,
+                bundle_state=bundle_state,
+                gradients=gradients,
+                full_step=full_step,
+            )
+
     tokens = args.batch_size * args.ctx_len
     timings["full_step"]["tokens_per_second_median"] = (
         tokens * 1000.0 / timings["full_step"]["median_ms"]
@@ -285,6 +386,12 @@ def main(argv=None):
             "variant": args.variant,
             "dtype": config.dtype,
             "parameter_count": parameter_count,
+            "n_layers": config.n_layers,
+            "d_model": config.d_model,
+            "d_ffn": config.d_ffn,
+            "n_heads": config.n_heads,
+            "head_size": config.head_size,
+            "vocab_size": config.vocab_size,
         },
         "execution": {
             "remat_blocks": config.remat_blocks,
@@ -298,16 +405,21 @@ def main(argv=None):
                 if config.training_vocab_tile_size is not None
                 else "full_logits_xla"
             ),
+            "optimizer_backend": resolve_optimizer_backend(
+                config.optimizer_backend
+            ),
         },
         "fixed_batch": {
             "path": str(args.fixed_batch.resolve()),
-            "sha256": fixed_batch_sha256,
+            "sha256": fixed_batch_file_sha256,
+            "content_sha256": fixed_batch_content_fingerprint,
         },
         "method": measurement_contract(
             warmup=args.benchmark_warmup,
             iterations=args.benchmark_iterations,
             disable_python_gc=args.disable_python_gc,
         ),
+        "profile": profile,
         "phase_details": {
             "forward": "loss forward from fixed params and fixed recurrent state",
             "backward": "VJP pullback from one precomputed forward residual",
@@ -315,7 +427,9 @@ def main(argv=None):
             "full_step": "value_and_grad plus optimizer with no intermediate host barrier",
         },
         "optimizer": {
-            "implementation": "Optax transform from rwkv7m training config",
+            "implementation": resolve_optimizer_backend(
+                config.optimizer_backend
+            ),
             "lr_init": config.lr_init,
             "weight_decay": config.weight_decay,
             "grad_clip": config.max_grad_norm,

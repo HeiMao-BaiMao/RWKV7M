@@ -33,6 +33,9 @@ class ModelConfig:
     param_update_dtype: str = "float32"
     optimizer_state_dtype: str = "float32"
     gradient_accum_dtype: str = "float32"
+    # Pallas fusion is opt-in until each production GPU clears a complete-step
+    # performance gate. TPU and portable paths retain Optax.
+    optimizer_backend: str = "optax"
     # The global orthogonal LM-head initializer is retained for reference
     # parity on small models. Large sharded models should use
     # ``variance_scaled`` to avoid a global QR decomposition during init.
@@ -105,6 +108,12 @@ class ModelConfig:
             raise ValueError(
                 "lm_head_init must be 'orthogonal' or 'variance_scaled'"
             )
+        if self.optimizer_backend not in (
+            "optax",
+            "pallas_gpu_mosaic",
+            "pallas_gpu_triton",
+        ):
+            raise ValueError("unsupported optimizer_backend")
         self.screening.screened_layers = tuple(self.screening.screened_layers)
         self.screening.bank_ids = tuple(self.screening.bank_ids)
         if not self.use_screening or not self.screening.screened_layers:

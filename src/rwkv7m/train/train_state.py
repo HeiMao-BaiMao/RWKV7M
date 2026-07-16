@@ -6,6 +6,9 @@ from flax import nnx
 from dataclasses import dataclass
 from flax.training import train_state as flax_train_state
 
+from ..kernels import resolve_optimizer_backend
+from ..kernels.optimizer_pallas_gpu import fused_adamw_optimizer
+
 
 class TrainState(flax_train_state.TrainState):
     pass
@@ -88,6 +91,23 @@ def create_optimizer(config, total_steps=10000):
     optimizer_state_dtype = jnp.dtype(
         config.get("optimizer_state_dtype", "float32")
     )
+    optimizer_backend = resolve_optimizer_backend(
+        config.get("optimizer_backend")
+    )
+    if optimizer_backend != "optax":
+        lowering = optimizer_backend.removeprefix("pallas_gpu_")
+        return fused_adamw_optimizer(
+            learning_rate=lr_schedule,
+            max_grad_norm=config.get("max_grad_norm", 1.0),
+            weight_decay=config.get("weight_decay", 0.001),
+            beta1=config.get("adam_beta1", 0.9),
+            beta2=config.get("adam_beta2", 0.999),
+            epsilon=config.get("adam_eps", 1e-8),
+            moment_dtype=optimizer_state_dtype,
+            decay_mask_fn=decay_mask_fn,
+            w0_mask_fn=rwkv_w0_mask_fn,
+            lowering=lowering,
+        )
     adamw = optax.adamw(
         learning_rate=lr_schedule,
         weight_decay=config.get("weight_decay", 0.001),

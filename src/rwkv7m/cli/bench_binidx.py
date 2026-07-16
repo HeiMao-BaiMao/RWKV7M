@@ -1,5 +1,6 @@
 import argparse
 import copy
+from dataclasses import replace
 import time
 
 import jax
@@ -14,9 +15,11 @@ from ..model import (
     model_preset,
 )
 from .config import (
+    add_screening_v2_args,
     add_training_vocab_tiling_args,
     apply_execution_overrides,
     parse_args_with_config,
+    screening_v2_kwargs,
 )
 
 
@@ -44,7 +47,17 @@ def build_config(args, variant):
             )
         config.use_screening = use_screening
         if use_screening:
-            config.screening.use_write_screening = variant == "read_write"
+            config.screening.use_write_screening = variant in (
+                "read_write",
+                "screening_v2",
+            )
+            if variant == "screening_v2":
+                v2_overrides = screening_v2_kwargs(args)
+                v2_overrides["write_mode"] = "competitive_novel"
+                config.screening = replace(
+                    config.screening,
+                    **v2_overrides,
+                )
         return apply_execution_overrides(config, args)
     screening = ScreeningConfig()
     if use_screening:
@@ -59,7 +72,15 @@ def build_config(args, variant):
             n_slots=args.n_slots,
             screened_layers=screened_layers,
             bank_ids=default_bank_ids(args.n_slots),
-            use_write_screening=variant == "read_write",
+            use_write_screening=variant in ("read_write", "screening_v2"),
+            **(
+                {
+                    **screening_v2_kwargs(args),
+                    "write_mode": "competitive_novel",
+                }
+                if variant == "screening_v2"
+                else {}
+            ),
         )
     config = ModelConfig(
         d_model=args.d_model,
@@ -80,7 +101,11 @@ def build_config(args, variant):
 
 
 def run_variant(args, variant):
-    phase = "read_write" if variant == "read_write" else "read_screening_only"
+    phase = (
+        "read_write"
+        if variant in ("read_write", "screening_v2")
+        else "read_screening_only"
+    )
     cfg = build_config(args, variant)
     dataset = create_binidx_dataset(
         args.data_file,
@@ -137,7 +162,11 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--magic-prime", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--variants", nargs="+", default=["baseline", "screening", "read_write"])
+    parser.add_argument(
+        "--variants",
+        nargs="+",
+        default=["baseline", "screening", "read_write"],
+    )
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     remat_group = parser.add_mutually_exclusive_group()
     remat_group.add_argument(
@@ -158,6 +187,7 @@ def parse_args(argv=None):
     head_chunk_group.add_argument("--head-chunk-size", type=int, default=None)
     head_chunk_group.add_argument("--no-head-chunking", action="store_true")
     add_training_vocab_tiling_args(parser)
+    add_screening_v2_args(parser)
     parser.add_argument("--vocab-size", type=int, default=65536)
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--d-ffn", type=int, default=128)
@@ -177,7 +207,12 @@ def main(argv=None):
     args = parse_args(argv)
     results = []
     for variant in args.variants:
-        if variant not in {"baseline", "screening", "read_write"}:
+        if variant not in {
+            "baseline",
+            "screening",
+            "read_write",
+            "screening_v2",
+        }:
             raise ValueError(f"unknown variant: {variant}")
         results.append(run_variant(args, variant))
 

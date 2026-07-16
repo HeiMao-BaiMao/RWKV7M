@@ -31,6 +31,7 @@ def _optimizer_config(config):
         "optimizer_state_dtype": getattr(
             config, "optimizer_state_dtype", "float32"
         ),
+        "optimizer_backend": getattr(config, "optimizer_backend", "optax"),
     }
 
 
@@ -352,6 +353,23 @@ def nnx_model_loss(
         "rel_write_effective_mean",
         "slot_update_norm_mean",
         "slot_usage_ema_mean",
+        "matched_route_mass",
+        "novel_route_mass",
+        "route_entropy",
+        "route_top1_concentration",
+        "admission_mean",
+        "admission_low_rate",
+        "admission_high_rate",
+        "novel_token_rate",
+        "rejected_write_rate",
+        "short_bank_write_mass",
+        "mid_bank_write_mass",
+        "long_bank_write_mass",
+        "eviction_age_mean",
+        "eviction_usage_mean",
+        "slot_utilization",
+        "dead_slot_rate",
+        "slot_cosine_redundancy",
     ):
         metrics.setdefault(key, jnp.zeros(()))
     return total_loss, (metrics, current_rwkv, current_screen)

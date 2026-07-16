@@ -6,6 +6,14 @@ from dataclasses import dataclass
 
 _PHASE_ALIASES = {"read_only": "read_screening_only"}
 _VALID_PHASES = {"read_screening_only", "read_write"}
+_VALID_WRITE_MODES = {
+    "disabled",
+    "legacy_unconditional",
+    "legacy_threshold",
+    "competitive_novel",
+}
+_VALID_GATE_SPACES = {"model", "value"}
+_VALID_GATE_ACTIVATIONS = {"sigmoid", "tanh_silu"}
 
 
 def normalize_phase(phase: str) -> str:
@@ -16,6 +24,43 @@ def normalize_phase(phase: str) -> str:
             "or compatibility alias 'read_only'."
         )
     return phase
+
+
+def normalize_write_mode(write_mode: str) -> str:
+    if write_mode not in _VALID_WRITE_MODES:
+        raise ValueError(
+            f"Unknown write mode {write_mode!r}. Expected one of "
+            f"{sorted(_VALID_WRITE_MODES)}."
+        )
+    return write_mode
+
+
+def resolve_write_mode(config, phase: str) -> str:
+    """Resolve old phase/config pairs without changing their semantics."""
+
+    phase = normalize_phase(phase)
+    if phase != "read_write":
+        return "legacy_unconditional"
+    if config.write_mode is not None:
+        return normalize_write_mode(config.write_mode)
+    if config.use_write_screening:
+        return "legacy_threshold"
+    return "legacy_unconditional"
+
+
+def write_mode_uses_write_projection(config) -> bool:
+    return config.use_write_screening or config.write_mode in {
+        "legacy_threshold",
+        "competitive_novel",
+    }
+
+
+def apply_screening_gate(logits, activation: str):
+    if activation == "sigmoid":
+        return jax.nn.sigmoid(logits)
+    if activation == "tanh_silu":
+        return jnp.tanh(jax.nn.silu(logits))
+    raise ValueError(f"unsupported screening gate activation: {activation!r}")
 
 
 def unit_norm(x, axis=-1, eps=1e-6):
@@ -88,6 +133,159 @@ def compute_slot_delta(x, h, slot_embed, kernel, bias):
     )
 
 
+def compute_factorized_slot_delta(
+    x,
+    h,
+    slot_embed,
+    x_kernel,
+    h_kernel,
+    slot_kernel,
+    out_kernel,
+    out_bias,
+):
+    """Compute a low-rank slot candidate without per-slot Dense calls."""
+
+    x_latent = jnp.einsum("...c,cr->...r", x, x_kernel)
+    h_latent = jnp.einsum("...c,cr->...r", h, h_kernel)
+    slot_latent = jnp.einsum("ms,sr->mr", slot_embed, slot_kernel)
+    latent = jax.nn.silu(
+        x_latent[..., None, :] + h_latent[..., None, :] + slot_latent
+    )
+    return jnp.tanh(
+        jnp.einsum("...mr,rs->...ms", latent, out_kernel) + out_bias
+    )
+
+
+def _masked_softmax(logits, mask, *, axis=-1, eps=1e-6):
+    mask = jnp.broadcast_to(mask, logits.shape)
+    masked = jnp.where(mask, logits, jnp.asarray(-1e30, logits.dtype))
+    maximum = jnp.max(masked, axis=axis, keepdims=True)
+    exponent = jnp.where(mask, jnp.exp(masked - maximum), 0.0)
+    return exponent / (jnp.sum(exponent, axis=axis, keepdims=True) + eps)
+
+
+def competitive_write_routing(
+    eligibility,
+    ages,
+    usage,
+    admission,
+    bank_logits,
+    bank_ids,
+    *,
+    route_power,
+    novelty_threshold,
+    allocation_temperature,
+    bank_route_temperature,
+    allocation_age_weight,
+    allocation_usage_weight,
+    hard_admission,
+    admission_threshold,
+    eps,
+):
+    """Return confidence-preserving matched and sparse novel routes.
+
+    The leading dimensions are arbitrary; the final eligibility/state axis is
+    the slot axis and the final bank-logit axis has size three.
+    """
+
+    eligibility = eligibility.astype(jnp.float32)
+    ages = ages.astype(jnp.float32)
+    usage = usage.astype(jnp.float32)
+    admission = admission.astype(jnp.float32)
+    bank_logits = bank_logits.astype(jnp.float32)
+    bank_ids = jnp.asarray(bank_ids, dtype=jnp.int32)
+    slot_count = eligibility.shape[-1]
+
+    powered = jnp.power(eligibility, route_power)
+    powered_sum = jnp.sum(powered, axis=-1, keepdims=True)
+    matched_distribution = powered / jnp.where(
+        powered_sum > 0.0, powered_sum, 1.0
+    )
+    confidence = jnp.max(eligibility, axis=-1)
+    matched_route = confidence[..., None] * matched_distribution
+    is_novel = confidence < novelty_threshold
+
+    if hard_admission:
+        admission = (admission >= admission_threshold).astype(jnp.float32)
+
+    bank_index = jnp.arange(3, dtype=jnp.float32)
+    available_banks = jnp.stack(
+        [jnp.any(bank_ids == bank_id) for bank_id in range(3)]
+    )
+    bank_scores = (
+        bank_logits / bank_route_temperature - 1e-6 * bank_index
+    )
+    bank_soft = _masked_softmax(
+        bank_scores,
+        available_banks,
+        eps=eps,
+    )
+    bank_max = jnp.max(
+        jnp.where(available_banks, bank_scores, -1e30),
+        axis=-1,
+        keepdims=True,
+    )
+    bank_hard = (
+        (bank_scores == bank_max) & available_banks
+    ).astype(jnp.float32)
+    bank_route = bank_soft + jax.lax.stop_gradient(bank_hard - bank_soft)
+
+    slot_index = jnp.arange(slot_count, dtype=jnp.float32)
+    victim_route = jnp.zeros_like(eligibility, dtype=jnp.float32)
+    for bank_id in range(3):
+        mask = bank_ids == bank_id
+        mask_broadcast = jnp.broadcast_to(mask, eligibility.shape)
+        age_min = jnp.min(
+            jnp.where(mask_broadcast, ages, 1e30),
+            axis=-1,
+            keepdims=True,
+        )
+        age_max = jnp.max(
+            jnp.where(mask_broadcast, ages, -1e30),
+            axis=-1,
+            keepdims=True,
+        )
+        normalized_age = (ages - age_min) / (age_max - age_min + eps)
+        slot_scores = (
+            allocation_age_weight * normalized_age
+            - allocation_usage_weight * usage
+        )
+        slot_scores = (
+            slot_scores / allocation_temperature - 1e-6 * slot_index
+        )
+        slot_soft = _masked_softmax(
+            slot_scores,
+            mask_broadcast,
+            eps=eps,
+        )
+        slot_max = jnp.max(
+            jnp.where(mask_broadcast, slot_scores, -1e30),
+            axis=-1,
+            keepdims=True,
+        )
+        slot_hard = (
+            (slot_scores == slot_max) & mask_broadcast
+        ).astype(jnp.float32)
+        slot_route = slot_soft + jax.lax.stop_gradient(
+            slot_hard - slot_soft
+        )
+        victim_route += bank_route[..., bank_id, None] * slot_route
+
+    novel_route = is_novel[..., None] * admission[..., None] * victim_route
+    write_route = jnp.where(
+        is_novel[..., None], novel_route, matched_route
+    )
+    return (
+        write_route,
+        matched_route,
+        novel_route,
+        confidence,
+        is_novel,
+        admission,
+        victim_route,
+    )
+
+
 @dataclass
 class ScreeningConfig:
     d_model: int = 512
@@ -105,6 +303,8 @@ class ScreeningConfig:
     use_age_mask: bool = False
     use_bank_bias: bool = False
     use_write_screening: bool = False
+    # ``None`` preserves the legacy phase/use_write_screening mapping.
+    write_mode: str | None = None
     write_rel_floor: float = 1e-3
     use_leaky_warmup: bool = False
     leaky_alpha: float = 0.0
@@ -118,6 +318,20 @@ class ScreeningConfig:
     usage_ema_decay: float = 0.99
     age_ref: float = 32.0
     age_sigma: float = 8.0
+    gate_space: str = "model"
+    gate_activation: str = "sigmoid"
+    candidate_rank: int | None = None
+    route_power: float = 1.0
+    novelty_threshold: float = 0.1
+    admission_init: float = 0.1
+    allocation_temperature: float = 1.0
+    bank_route_temperature: float = 1.0
+    allocation_top_k: int = 1
+    allocation_age_weight: float = 1.0
+    allocation_usage_weight: float = 1.0
+    admission_threshold: float | None = None
+    checkpoint_interval: int | None = None
+    n_read_tiles: int = 1
 
     def __post_init__(self):
         self.screened_layers = tuple(self.screened_layers)
@@ -129,6 +343,66 @@ class ScreeningConfig:
             raise ValueError("bank_ids values must be only 0, 1, or 2")
         if self.write_rel_floor < 0.0:
             raise ValueError("write_rel_floor must be non-negative")
+        for name, value in (
+            ("mu_short_max", self.mu_short_max),
+            ("mu_mid_max", self.mu_mid_max),
+            ("mu_long_max", self.mu_long_max),
+        ):
+            if not 0.0 <= value < 1.0:
+                raise ValueError(f"{name} must be in [0, 1)")
+        if self.write_mode is not None:
+            normalize_write_mode(self.write_mode)
+        if self.gate_space not in _VALID_GATE_SPACES:
+            raise ValueError(
+                f"gate_space must be one of {sorted(_VALID_GATE_SPACES)}"
+            )
+        if self.gate_activation not in _VALID_GATE_ACTIVATIONS:
+            raise ValueError(
+                "gate_activation must be one of "
+                f"{sorted(_VALID_GATE_ACTIVATIONS)}"
+            )
+        if self.candidate_rank is not None:
+            if self.candidate_rank <= 0:
+                raise ValueError("candidate_rank must be positive when set")
+            legacy_params = (2 * self.d_model + self.d_slot) * self.d_slot
+            legacy_params += self.d_slot
+            factorized_params = self.candidate_rank * (
+                2 * self.d_model + 2 * self.d_slot
+            ) + self.d_slot
+            if factorized_params >= legacy_params:
+                raise ValueError(
+                    "candidate_rank must reduce candidate projection parameters "
+                    f"for this shape ({factorized_params} >= {legacy_params})"
+                )
+        if self.route_power <= 0.0:
+            raise ValueError("route_power must be positive")
+        if not 0.0 <= self.novelty_threshold <= 1.0:
+            raise ValueError("novelty_threshold must be in [0, 1]")
+        if not 0.0 < self.admission_init < 1.0:
+            raise ValueError("admission_init must be in (0, 1)")
+        if self.allocation_temperature <= 0.0:
+            raise ValueError("allocation_temperature must be positive")
+        if self.bank_route_temperature <= 0.0:
+            raise ValueError("bank_route_temperature must be positive")
+        if self.allocation_top_k != 1:
+            raise ValueError("only allocation_top_k=1 is currently implemented")
+        if self.allocation_age_weight < 0.0:
+            raise ValueError("allocation_age_weight must be non-negative")
+        if self.allocation_usage_weight < 0.0:
+            raise ValueError("allocation_usage_weight must be non-negative")
+        if (
+            self.admission_threshold is not None
+            and not 0.0 <= self.admission_threshold <= 1.0
+        ):
+            raise ValueError("admission_threshold must be in [0, 1] when set")
+        if self.checkpoint_interval is not None and self.checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be positive when set")
+        if self.n_read_tiles <= 0:
+            raise ValueError("n_read_tiles must be positive")
+        if self.d_k % self.n_read_tiles != 0:
+            raise ValueError("d_k must be divisible by n_read_tiles")
+        if self.d_v % self.n_read_tiles != 0:
+            raise ValueError("d_v must be divisible by n_read_tiles")
         half_lives = (
             self.short_half_life_tokens,
             self.mid_half_life_tokens,
@@ -151,12 +425,39 @@ class StateLevelScreening(nn.Module):
         self.k_proj_r = nn.Dense(cfg.d_k, use_bias=False, name="k_proj_r")
         self.v_proj = nn.Dense(cfg.d_v, use_bias=False, name="v_proj")
         self.out_proj = nn.Dense(cfg.d_model, use_bias=False, name="out_proj")
-        self.gate_proj = nn.Dense(cfg.d_model, name="gate_proj")
-        self.delta_proj = nn.Dense(cfg.d_slot, name="delta_proj")
+        gate_size = cfg.d_model if cfg.gate_space == "model" else cfg.d_v
+        self.gate_proj = nn.Dense(gate_size, name="gate_proj")
+        if cfg.candidate_rank is None:
+            self.delta_proj = nn.Dense(cfg.d_slot, name="delta_proj")
+        else:
+            self.delta_context_proj = nn.Dense(
+                cfg.candidate_rank,
+                use_bias=False,
+                name="delta_context_proj",
+            )
+            self.delta_slot_proj = nn.Dense(
+                cfg.candidate_rank,
+                use_bias=False,
+                name="delta_slot_proj",
+            )
+            self.delta_out_proj = nn.Dense(
+                cfg.d_slot,
+                name="delta_out_proj",
+            )
         self.screen_ln = nn.LayerNorm(dtype=jnp.float32, name="screen_ln")
-        if cfg.use_write_screening:
+        if write_mode_uses_write_projection(cfg):
             self.q_proj_w = nn.Dense(cfg.d_k, use_bias=False, name="q_proj_w")
             self.k_proj_w = nn.Dense(cfg.d_k, use_bias=False, name="k_proj_w")
+        if cfg.write_mode == "competitive_novel":
+            admission_bias = jnp.log(
+                cfg.admission_init / (1.0 - cfg.admission_init)
+            )
+            self.admission_proj = nn.Dense(
+                1,
+                bias_init=nn.initializers.constant(admission_bias),
+                name="admission_proj",
+            )
+            self.bank_route_proj = nn.Dense(3, name="bank_route_proj")
 
     def _init_params(self, cfg, x_seq, h_base_seq, state, phase):
         """During init, call all submodules once to create their params."""
@@ -170,17 +471,32 @@ class StateLevelScreening(nn.Module):
         _ = self.v_proj(slots)
         _ = self.gate_proj(x_ln)
         _ = self.out_proj(jnp.zeros((x_ln.shape[0], cfg.d_v)))
-        delta_in = jnp.concatenate([x_ln, h_t, slots[:, 0, :]], axis=-1)
-        _ = self.delta_proj(delta_in)
-        _ = self.param("tau_r_raw", lambda rng, shape: theta_from_tau(cfg.tau_init), ())
+        if cfg.candidate_rank is None:
+            delta_in = jnp.concatenate([x_ln, h_t, slots[:, 0, :]], axis=-1)
+            _ = self.delta_proj(delta_in)
+        else:
+            route_context = jnp.concatenate([x_ln, h_t], axis=-1)
+            context_latent = self.delta_context_proj(route_context)
+            slot_latent = self.delta_slot_proj(slots[:, 0, :])
+            _ = self.delta_out_proj(jax.nn.silu(context_latent + slot_latent))
+        tau_r_shape = () if cfg.n_read_tiles == 1 else (cfg.n_read_tiles,)
+        _ = self.param(
+            "tau_r_raw",
+            lambda rng, shape: jnp.full(shape, theta_from_tau(cfg.tau_init)),
+            tau_r_shape,
+        )
         _ = self.param("lambda_raw", nn.initializers.constant(jnp.log(jnp.exp(cfg.lambda_screen_init) - 1)), ())
         _ = self.param("slot_embed", nn.initializers.normal(0.02), (cfg.n_slots, cfg.d_slot))
         _ = self.param("mu_by_bank_raw", nn.initializers.constant(0.0), (3,))
-        if cfg.use_write_screening:
+        if write_mode_uses_write_projection(cfg):
             q_w_in = jnp.concatenate([x_ln, h_t.astype(jnp.float32)], axis=-1)
             _ = self.q_proj_w(q_w_in)
             _ = self.k_proj_w(slots)
             _ = self.param("tau_w_raw", lambda rng, shape: theta_from_tau(cfg.tau_init), ())
+        if cfg.write_mode == "competitive_novel":
+            route_input = jnp.concatenate([x_ln, h_t], axis=-1)
+            _ = self.admission_proj(route_input)
+            _ = self.bank_route_proj(route_input)
         return h_base_seq, state, {}
 
     @nn.compact
@@ -203,155 +519,251 @@ class StateLevelScreening(nn.Module):
         if self.is_initializing():
             return self._init_params(cfg, x_seq, h_base_seq, state, phase)
 
-        slots = state.slots.astype(jnp.float32)
-        ages = state.ages
-        usage_ema = state.usage_ema.astype(jnp.float32)
-
-        # --- Pre-compute projections and params for all time steps ---
-        x_ln_seq = self.screen_ln(x_seq.astype(jnp.float32))  # [B, T, C]
-
-        # Read query for all time steps
-        q_r_seq = self.q_proj_r(x_ln_seq)  # [B, T, d_k]
-        q_r_seq = unit_norm(q_r_seq, eps=cfg.eps)
-
-        # Extract projection weights
-        p = self.variables["params"]
-        k_w = p["k_proj_r"]["kernel"]     # [d_s, d_k]
-        v_w = p["v_proj"]["kernel"]       # [d_s, d_v]
-        gate_w = p["gate_proj"]["kernel"]  # [C, C]
-        gate_b = p["gate_proj"]["bias"]    # [C]
-        out_w = p["out_proj"]["kernel"]   # [d_v, C]
-        delta_w = p["delta_proj"]["kernel"]  # [2*C + d_s, d_slot]
-        delta_b = p["delta_proj"]["bias"]    # [d_slot]
-
-        # Scalar params
-        tau_r_raw = p["tau_r_raw"]
-        tau_r = bounded_tau(tau_r_raw)
-        lambda_raw = p["lambda_raw"]
-        lambda_screen = jax.nn.softplus(lambda_raw)
-
-        slot_embed = p["slot_embed"]  # [M, d_s]
-        mu = self._compute_mu(p, cfg)
-
-        # Pre-compute write query if needed
-        write_enabled = phase == "read_write" and cfg.use_write_screening
-        if write_enabled:
-            q_w_w = p["q_proj_w"]["kernel"]  # [2*C, d_k]
-            k_w_w = p["k_proj_w"]["kernel"]  # [d_s, d_k]
-            tau_w_raw = p["tau_w_raw"]
-            tau_w = bounded_tau(tau_w_raw)
-            q_w_in = jnp.concatenate([x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1)
-            q_w_seq = jnp.einsum("btc,ck->btk", q_w_in, q_w_w)
-            q_w_seq = unit_norm(q_w_seq, eps=cfg.eps)
-        else:
-            q_w_seq = None
-            tau_w = jnp.zeros(())
-
-        def step(carry, t):
-            """Pure function - no Flax modules called here."""
-            slots_t, ages_t, usage_t = carry
-
-            # Read branch
-            k_r = jnp.einsum("bms,sk->bmk", slots_t, k_w)
-            v = jnp.einsum("bms,sv->bmv", slots_t, v_w)
-            k_r = unit_norm(k_r, eps=cfg.eps)
-            if cfg.use_value_unit_norm:
-                v = unit_norm(v, eps=cfg.eps)
-
-            sim_r = jnp.einsum("bk,bmk->bm", q_r_seq[:, t, :], k_r)
-
-            if cfg.use_leaky_warmup:
-                hard = trim_square(sim_r, tau_r)
-                soft = jax.nn.sigmoid(cfg.leaky_gamma * (sim_r - tau_r))
-                rel_r = (1.0 - cfg.leaky_alpha) * hard + cfg.leaky_alpha * soft
-            else:
-                rel_r = trim_square(sim_r, tau_r, eps=cfg.eps)
-
-            if cfg.use_age_mask:
-                age_scores = (cfg.age_ref - ages_t) / (cfg.age_sigma + cfg.eps)
-                rel_r = rel_r * jax.nn.sigmoid(age_scores)
-
-            z = jnp.einsum("bm,bmv->bv", rel_r, v)
-            u = tanh_norm(z, cap=cfg.tanh_norm_cap, eps=cfg.eps)
-
-            gate = jax.nn.sigmoid(jnp.einsum("bc,cg->bg", x_ln_seq[:, t, :], gate_w) + gate_b)
-            read_out = jnp.einsum("bv,vc->bc", u, out_w)
-            h_t = h_base_seq[:, t, :] + lambda_screen * gate * read_out.astype(h_base_seq.dtype)
-
-            # Slot update. Compute the split projection inside the time scan so
-            # no [B, T, M, d_slot] delta activation is retained.
-            delta_s_t = compute_slot_delta(
-                x_ln_seq[:, t, :],
-                h_base_seq[:, t, :].astype(jnp.float32),
-                slot_embed,
-                delta_w,
-                delta_b,
-            )
-            if not write_enabled:
-                update_strength = mu[None, :, None]
-                new_slots = slots_t + update_strength * (delta_s_t - slots_t)
-                new_ages = ages_t
-                rel_w = jnp.zeros_like(rel_r)
-                rel_w_effective = jnp.ones_like(rel_r)
-            else:
-                slots_for_write_key = slots_t + slot_embed[None, :, :]
-                k_w_t = jnp.einsum("bms,sk->bmk", slots_for_write_key, k_w_w)
-                k_w_t = unit_norm(k_w_t, eps=cfg.eps)
-                sim_w = jnp.einsum("bk,bmk->bm", q_w_seq[:, t, :], k_w_t)
-                rel_w = trim_square(sim_w, tau_w, eps=cfg.eps)
-                rel_w_effective = jnp.maximum(rel_w, cfg.write_rel_floor)
-                update_strength = mu[None, :, None] * rel_w_effective[:, :, None]
-                new_slots = slots_t + update_strength * (delta_s_t - slots_t)
-                new_ages = jnp.where(rel_w > 1e-3, 0.0, ages_t + 1.0)
-
-            update_delta = new_slots - slots_t
-            activity = jnp.maximum(rel_r, rel_w if write_enabled else rel_r)
-            new_usage = (
-                cfg.usage_ema_decay * usage_t
-                + (1.0 - cfg.usage_ema_decay) * activity
-            )
-
-            # Stats
-            eta_active = 1e-3
-            stats_t = {
-                "rel_read_mean": jnp.mean(rel_r),
-                "rel_read_max": jnp.max(rel_r),
-                "active_slots_mean": jnp.mean(jnp.sum(rel_r > eta_active, axis=-1)),
-                "z_norm_mean": jnp.mean(jnp.linalg.norm(z, axis=-1)),
-                "u_norm_mean": jnp.mean(jnp.linalg.norm(u, axis=-1)),
-                "tau_r": tau_r,
-                "lambda_screen": lambda_screen,
-                "rel_write_mean": jnp.mean(rel_w),
-                "rel_write_effective_mean": jnp.mean(
-                    jnp.maximum(rel_w, cfg.write_rel_floor)
-                ) if write_enabled else jnp.mean(rel_w),
-                "slot_update_norm_mean": jnp.mean(
-                    jnp.linalg.norm(update_delta, axis=-1)
-                ),
-                "slot_usage_ema_mean": jnp.mean(new_usage),
-                "tau_w": tau_w,
-            }
-
-            return (new_slots, new_ages, new_usage), (h_t, stats_t)
-
-        # lax.scan over time
-        (final_slots, final_ages, final_usage), (h_seq, stats_seq) = jax.lax.scan(
-            step,
-            (slots, ages, usage_ema),
-            jnp.arange(T),
+        from .screening_recurrence import (
+            ACTIVE_SLOTS,
+            ADMISSION_HIGH_RATE,
+            ADMISSION_LOW_RATE,
+            ADMISSION_MEAN,
+            BANK_LONG_WRITE_MASS,
+            BANK_MID_WRITE_MASS,
+            BANK_SHORT_WRITE_MASS,
+            EVICTION_AGE_MEAN,
+            EVICTION_USAGE_MEAN,
+            MATCHED_ROUTE_MASS,
+            NOVEL_RATE,
+            NOVEL_ROUTE_MASS,
+            READ_MAX,
+            READ_MEAN,
+            REJECTED_RATE,
+            ROUTE_ENTROPY,
+            ROUTE_TOP1,
+            U_NORM,
+            USAGE_MEAN,
+            WRITE_EFFECTIVE_MEAN,
+            WRITE_MEAN,
+            Z_NORM,
+            ScreeningRecurrenceConfig,
+            screening_recurrence_reference,
         )
 
-        h = jnp.swapaxes(h_seq, 0, 1)
+        slots = state.slots.astype(jnp.float32)
+        ages = state.ages.astype(jnp.float32)
+        usage_ema = state.usage_ema.astype(jnp.float32)
+        write_mode = resolve_write_mode(cfg, phase)
+        p = self.variables["params"]
+        x_ln_seq = self.screen_ln(x_seq.astype(jnp.float32))
+        q_r_raw = self.q_proj_r(x_ln_seq).astype(jnp.float32)
+        q_r_tiled = q_r_raw.reshape(
+            *q_r_raw.shape[:-1],
+            cfg.n_read_tiles,
+            cfg.d_k // cfg.n_read_tiles,
+        )
+        q_r_seq = unit_norm(q_r_tiled, eps=cfg.eps).reshape(q_r_raw.shape)
+        gate_seq = apply_screening_gate(
+            self.gate_proj(x_ln_seq).astype(jnp.float32),
+            cfg.gate_activation,
+        )
+        slot_embed = p["slot_embed"]
+        if cfg.candidate_rank is None:
+            delta_s_seq = compute_slot_delta(
+                x_ln_seq,
+                h_base_seq.astype(jnp.float32),
+                slot_embed,
+                p["delta_proj"]["kernel"],
+                p["delta_proj"]["bias"],
+            )
+        else:
+            route_context = jnp.concatenate(
+                [x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1
+            )
+            context_latent = self.delta_context_proj(route_context)
+            slot_latent = self.delta_slot_proj(slot_embed)
+            delta_s_seq = jnp.tanh(
+                self.delta_out_proj(
+                    jax.nn.silu(
+                        context_latent[..., None, :]
+                        + slot_latent[None, None, :, :]
+                    )
+                )
+            )
 
+        initial_read_keys = self.k_proj_r(slots)
+        initial_values = self.v_proj(slots)
+        delta_read_keys = self.k_proj_r(delta_s_seq)
+        delta_values = self.v_proj(delta_s_seq)
+        tau_r = bounded_tau(p["tau_r_raw"]).astype(jnp.float32)
+        tau_w = jnp.zeros((), dtype=jnp.float32)
+        uses_write_score = write_mode in (
+            "legacy_threshold",
+            "competitive_novel",
+        )
+        if uses_write_score:
+            route_input = jnp.concatenate(
+                [x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1
+            )
+            q_w_seq = unit_norm(
+                self.q_proj_w(route_input).astype(jnp.float32), eps=cfg.eps
+            )
+            tau_w = bounded_tau(p["tau_w_raw"]).astype(jnp.float32)
+            initial_write_keys = self.k_proj_w(
+                slots + slot_embed[None, :, :]
+            )
+            delta_write_keys = self.k_proj_w(
+                delta_s_seq + slot_embed[None, None, :, :]
+            )
+        else:
+            q_w_seq = jnp.zeros_like(q_r_seq)
+            initial_write_keys = jnp.zeros_like(initial_read_keys)
+            delta_write_keys = jnp.zeros_like(delta_read_keys)
+
+        if write_mode == "competitive_novel":
+            admission_seq = jax.nn.sigmoid(
+                self.admission_proj(route_input).astype(jnp.float32)[..., 0]
+            )
+            bank_logits_seq = self.bank_route_proj(route_input).astype(
+                jnp.float32
+            )
+        else:
+            admission_seq = jnp.zeros(q_r_seq.shape[:2], dtype=jnp.float32)
+            bank_logits_seq = jnp.zeros(
+                (*q_r_seq.shape[:2], 3), dtype=jnp.float32
+            )
+
+        recurrence_config = ScreeningRecurrenceConfig(
+            write_enabled=uses_write_score,
+            use_value_unit_norm=cfg.use_value_unit_norm,
+            use_leaky_warmup=cfg.use_leaky_warmup,
+            leaky_alpha=cfg.leaky_alpha,
+            leaky_gamma=cfg.leaky_gamma,
+            use_age_mask=cfg.use_age_mask,
+            age_ref=cfg.age_ref,
+            age_sigma=cfg.age_sigma,
+            write_rel_floor=cfg.write_rel_floor,
+            usage_ema_decay=cfg.usage_ema_decay,
+            tanh_norm_cap=cfg.tanh_norm_cap,
+            eps=cfg.eps,
+            write_mode=write_mode,
+            bank_ids=cfg.bank_ids,
+            route_power=cfg.route_power,
+            novelty_threshold=cfg.novelty_threshold,
+            allocation_temperature=cfg.allocation_temperature,
+            bank_route_temperature=cfg.bank_route_temperature,
+            allocation_age_weight=cfg.allocation_age_weight,
+            allocation_usage_weight=cfg.allocation_usage_weight,
+            hard_admission=(
+                deterministic and cfg.admission_threshold is not None
+            ),
+            admission_threshold=(
+                cfg.admission_threshold
+                if cfg.admission_threshold is not None
+                else 0.5
+            ),
+            n_read_tiles=cfg.n_read_tiles,
+            checkpoint_interval=cfg.checkpoint_interval,
+        )
+        time_inputs = tuple(
+            jnp.swapaxes(value, 0, 1)
+            for value in (
+                q_r_seq,
+                q_w_seq,
+                admission_seq,
+                bank_logits_seq,
+                delta_s_seq,
+                delta_read_keys,
+                delta_values,
+                delta_write_keys,
+            )
+        )
+        (
+            u_time,
+            final_slots,
+            final_ages,
+            final_usage,
+            step_statistics,
+            update_squared,
+        ) = screening_recurrence_reference(
+            *time_inputs,
+            slots,
+            initial_read_keys,
+            initial_values,
+            initial_write_keys,
+            ages,
+            usage_ema,
+            self._compute_mu(p, cfg).astype(jnp.float32),
+            tau_r,
+            tau_w,
+            recurrence_config,
+        )
+
+        u_seq = jnp.swapaxes(u_time, 0, 1)
+        lambda_screen = jax.nn.softplus(p["lambda_raw"]).astype(jnp.float32)
+        effective_lambda = lambda_screen / jnp.sqrt(
+            jnp.asarray(cfg.n_read_tiles, dtype=jnp.float32)
+        )
+        if cfg.gate_space == "value":
+            memory_branch = self.out_proj(
+                u_seq * gate_seq.astype(u_seq.dtype)
+            ).astype(h_base_seq.dtype)
+        else:
+            memory_branch = (
+                gate_seq * self.out_proj(u_seq).astype(jnp.float32)
+            ).astype(h_base_seq.dtype)
+        h = (h_base_seq + effective_lambda * memory_branch).astype(
+            h_base_seq.dtype
+        )
+
+        slot_norm = unit_norm(final_slots, eps=cfg.eps)
+        slot_similarity = jnp.einsum("bms,bns->bmn", slot_norm, slot_norm)
+        off_diagonal = 1.0 - jnp.eye(cfg.n_slots, dtype=jnp.float32)
+        redundancy_denominator = max(cfg.n_slots * (cfg.n_slots - 1), 1)
+        stat_map = {
+            "rel_read_mean": READ_MEAN,
+            "rel_read_max": READ_MAX,
+            "active_slots_mean": ACTIVE_SLOTS,
+            "z_norm_mean": Z_NORM,
+            "u_norm_mean": U_NORM,
+            "rel_write_mean": WRITE_MEAN,
+            "rel_write_effective_mean": WRITE_EFFECTIVE_MEAN,
+            "slot_usage_ema_mean": USAGE_MEAN,
+            "matched_route_mass": MATCHED_ROUTE_MASS,
+            "novel_route_mass": NOVEL_ROUTE_MASS,
+            "route_entropy": ROUTE_ENTROPY,
+            "route_top1_concentration": ROUTE_TOP1,
+            "admission_mean": ADMISSION_MEAN,
+            "admission_low_rate": ADMISSION_LOW_RATE,
+            "admission_high_rate": ADMISSION_HIGH_RATE,
+            "novel_token_rate": NOVEL_RATE,
+            "rejected_write_rate": REJECTED_RATE,
+            "short_bank_write_mass": BANK_SHORT_WRITE_MASS,
+            "mid_bank_write_mass": BANK_MID_WRITE_MASS,
+            "long_bank_write_mass": BANK_LONG_WRITE_MASS,
+            "eviction_age_mean": EVICTION_AGE_MEAN,
+            "eviction_usage_mean": EVICTION_USAGE_MEAN,
+        }
+        agg_stats = {
+            key: jnp.mean(step_statistics[..., index])
+            for key, index in stat_map.items()
+        }
+        agg_stats.update(
+            {
+                "tau_r": jnp.mean(tau_r),
+                "tau_r_min": jnp.min(tau_r),
+                "tau_r_max": jnp.max(tau_r),
+                "lambda_screen": effective_lambda,
+                "tau_w": tau_w,
+                "slot_update_norm_mean": jnp.mean(jnp.sqrt(update_squared)),
+                "slot_utilization": jnp.mean(final_usage > 1e-3),
+                "dead_slot_rate": jnp.mean(final_usage <= 1e-3),
+                "slot_cosine_redundancy": jnp.sum(
+                    jnp.abs(slot_similarity) * off_diagonal[None, :, :]
+                ) / (final_slots.shape[0] * redundancy_denominator),
+            }
+        )
         new_state = LayerScreenState(
             slots=final_slots.astype(state.slots.dtype),
             ages=final_ages,
             usage_ema=final_usage.astype(state.usage_ema.dtype),
         )
-
-        # Aggregate stats over time (scan stacks dict values into arrays)
-        agg_stats = {k: jnp.mean(v) for k, v in stats_seq.items()}
-
         return h, new_state, agg_stats
 
     def _compute_mu(self, p, cfg):

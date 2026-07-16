@@ -1,4 +1,4 @@
-"""Validate two schema-v2 compute records before calculating ratios."""
+"""Validate two compute records before calculating ratios."""
 
 from __future__ import annotations
 
@@ -42,9 +42,23 @@ def main(argv=None):
 
     kind = local["benchmark_kind"]
     if kind == "train_compute_only":
-        for field in ("batch", "tokens", "dtype"):
+        for field in (
+            "batch",
+            "tokens",
+            "dtype",
+            "n_layers",
+            "d_model",
+            "d_ffn",
+            "n_heads",
+            "head_size",
+            "vocab_size",
+        ):
             _require_equal(local, official, ("shape", field))
-        _require_equal(local, official, ("fixed_batch", "sha256"))
+        _require_equal(
+            local,
+            official,
+            ("fixed_batch", "content_sha256"),
+        )
         phase_map = {
             "forward": ("forward", "forward"),
             "backward": ("backward", "backward"),
@@ -90,7 +104,7 @@ def main(argv=None):
             "method": ["warmup", "iterations", "python_gc_disabled"],
             "device": "first visible device kind",
             "input": (
-                "fixed batch SHA-256"
+                "fixed batch logical-content SHA-256"
                 if kind == "train_compute_only"
                 else "pre-BF16 tensor SHA-256 and zero initial state"
             ),

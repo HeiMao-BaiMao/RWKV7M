@@ -25,17 +25,34 @@ from .rwkv_core import _get_ffn_dim, _time_shift, symmetric_uniform_init
 from .screened_rwkv import ModelConfig, _get_model_dtype
 from .screening import (
     ScreeningConfig,
+    apply_screening_gate,
     bounded_tau,
     compute_slot_delta,
     normalize_phase,
+    resolve_write_mode,
     theta_from_tau,
     unit_norm,
     update_rate_from_half_life,
+    write_mode_uses_write_projection,
 )
 from .screening_recurrence import (
     ACTIVE_SLOTS,
+    ADMISSION_HIGH_RATE,
+    ADMISSION_LOW_RATE,
+    ADMISSION_MEAN,
+    BANK_LONG_WRITE_MASS,
+    BANK_MID_WRITE_MASS,
+    BANK_SHORT_WRITE_MASS,
+    EVICTION_AGE_MEAN,
+    EVICTION_USAGE_MEAN,
+    MATCHED_ROUTE_MASS,
+    NOVEL_RATE,
+    NOVEL_ROUTE_MASS,
     READ_MAX,
     READ_MEAN,
+    REJECTED_RATE,
+    ROUTE_ENTROPY,
+    ROUTE_TOP1,
     U_NORM,
     USAGE_MEAN,
     WRITE_EFFECTIVE_MEAN,
@@ -966,28 +983,66 @@ class NNXStateLevelScreening(nnx.Module):
             dtype=compute_dtype,
             param_dtype=param_dtype,
         )
+        gate_size = C if config.gate_space == "model" else config.d_v
         self.gate_proj = _linear(
             C,
-            C,
+            gate_size,
             kernel_axes=row,
             rngs=rngs,
             sharding=sharding,
             dtype=compute_dtype,
             param_dtype=param_dtype,
         )
-        # Keep the portable concatenated kernel shape, but shard its d_slot
-        # output. Sharding the concatenated input would make x/h/slot slices
-        # cross device boundaries and introduce avoidable reshard collectives.
-        self.delta_proj = _linear(
-            2 * C + config.d_slot,
-            config.d_slot,
-            kernel_axes=column,
-            bias_axes=vector,
-            rngs=rngs,
-            sharding=sharding,
-            dtype=compute_dtype,
-            param_dtype=param_dtype,
-        )
+        if config.candidate_rank is None:
+            # Keep the portable concatenated kernel shape, but shard its d_slot
+            # output. Sharding the concatenated input would make x/h/slot
+            # slices cross device boundaries and add avoidable collectives.
+            self.delta_proj = _linear(
+                2 * C + config.d_slot,
+                config.d_slot,
+                kernel_axes=column,
+                bias_axes=vector,
+                rngs=rngs,
+                sharding=sharding,
+                dtype=compute_dtype,
+                param_dtype=param_dtype,
+            )
+            self.delta_context_proj = nnx.data(None)
+            self.delta_slot_proj = nnx.data(None)
+            self.delta_out_proj = nnx.data(None)
+        else:
+            rank = config.candidate_rank
+            self.delta_proj = nnx.data(None)
+            self.delta_context_proj = _linear(
+                2 * C,
+                rank,
+                use_bias=False,
+                kernel_axes=row,
+                rngs=rngs,
+                sharding=sharding,
+                dtype=compute_dtype,
+                param_dtype=param_dtype,
+            )
+            self.delta_slot_proj = _linear(
+                config.d_slot,
+                rank,
+                use_bias=False,
+                kernel_axes=row,
+                rngs=rngs,
+                sharding=sharding,
+                dtype=compute_dtype,
+                param_dtype=param_dtype,
+            )
+            self.delta_out_proj = _linear(
+                rank,
+                config.d_slot,
+                kernel_axes=column,
+                bias_axes=vector,
+                rngs=rngs,
+                sharding=sharding,
+                dtype=compute_dtype,
+                param_dtype=param_dtype,
+            )
         self.screen_ln = _layer_norm(
             C,
             dtype=jnp.float32,
@@ -995,12 +1050,21 @@ class NNXStateLevelScreening(nnx.Module):
             sharding=sharding,
             param_dtype=param_dtype,
         )
-        self.tau_r_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding, dtype=param_dtype)
+        tau_r_shape = () if config.n_read_tiles == 1 else (config.n_read_tiles,)
+        self.tau_r_raw = _param(
+            rngs,
+            lambda k, s, d=jnp.float32: jnp.full(
+                s, theta_from_tau(config.tau_init), dtype=d
+            ),
+            tau_r_shape,
+            sharding=sharding,
+            dtype=param_dtype,
+        )
         lambda_init = math.log(math.expm1(config.lambda_screen_init))
         self.lambda_raw = _param(rngs, initializers.constant(lambda_init), (), sharding=sharding, dtype=param_dtype)
         self.slot_embed = _param(rngs, initializers.normal(0.02), (config.n_slots, config.d_slot), axes=slot, sharding=sharding, dtype=param_dtype)
         self.mu_by_bank_raw = _param(rngs, initializers.zeros_init(), (3,), sharding=sharding, dtype=param_dtype)
-        if config.use_write_screening:
+        if write_mode_uses_write_projection(config):
             self.q_proj_w = _linear(
                 2 * C,
                 config.d_k,
@@ -1026,6 +1090,33 @@ class NNXStateLevelScreening(nnx.Module):
             self.q_proj_w = nnx.data(None)
             self.k_proj_w = nnx.data(None)
             self.tau_w_raw = nnx.data(None)
+        if config.write_mode == "competitive_novel":
+            route_input_size = 2 * C
+            admission_bias = math.log(
+                config.admission_init / (1.0 - config.admission_init)
+            )
+            self.admission_proj = _linear(
+                route_input_size,
+                1,
+                kernel_axes=row,
+                bias_init=initializers.constant(admission_bias),
+                rngs=rngs,
+                sharding=sharding,
+                dtype=compute_dtype,
+                param_dtype=param_dtype,
+            )
+            self.bank_route_proj = _linear(
+                route_input_size,
+                3,
+                kernel_axes=row,
+                rngs=rngs,
+                sharding=sharding,
+                dtype=compute_dtype,
+                param_dtype=param_dtype,
+            )
+        else:
+            self.admission_proj = nnx.data(None)
+            self.bank_route_proj = nnx.data(None)
 
     def _compute_mu(self):
         cfg = self.config
@@ -1055,9 +1146,9 @@ class NNXStateLevelScreening(nnx.Module):
         phase="read_screening_only",
         deterministic=True,
     ):
-        del deterministic
         cfg = self.config
         phase = normalize_phase(phase)
+        write_mode = resolve_write_mode(cfg, phase)
         slots = _constrain_slots(state.slots.astype(jnp.float32), self.sharding)
         ages = state.ages.astype(jnp.float32)
         usage_ema = state.usage_ema.astype(jnp.float32)
@@ -1066,21 +1157,37 @@ class NNXStateLevelScreening(nnx.Module):
             x_seq,
             output_dtype=self.compute_dtype,
         )
-        q_r_seq = unit_norm(
-            self.q_proj_r(x_ln_seq).astype(jnp.float32), eps=cfg.eps
+        q_r_raw = self.q_proj_r(x_ln_seq).astype(jnp.float32)
+        q_r_tiled = q_r_raw.reshape(
+            *q_r_raw.shape[:-1],
+            cfg.n_read_tiles,
+            cfg.d_k // cfg.n_read_tiles,
         )
-        gate_seq = jax.nn.sigmoid(
-            self.gate_proj(x_ln_seq).astype(jnp.float32)
+        q_r_seq = unit_norm(q_r_tiled, eps=cfg.eps).reshape(q_r_raw.shape)
+        gate_seq = apply_screening_gate(
+            self.gate_proj(x_ln_seq).astype(jnp.float32),
+            cfg.gate_activation,
         )
-        delta_s_seq = _compute_slot_delta(
-            x_ln_seq,
-            h_base_seq.astype(jnp.float32),
-            _value(self.slot_embed),
-            _value(self.delta_proj.kernel),
-            _value(self.delta_proj.bias),
-            self.sharding,
-            dtype=self.compute_dtype,
-        )
+        if cfg.candidate_rank is None:
+            delta_s_seq = _compute_slot_delta(
+                x_ln_seq,
+                h_base_seq.astype(jnp.float32),
+                _value(self.slot_embed),
+                _value(self.delta_proj.kernel),
+                _value(self.delta_proj.bias),
+                self.sharding,
+                dtype=self.compute_dtype,
+            )
+        else:
+            route_context = jnp.concatenate(
+                [x_ln_seq, h_base_seq.astype(self.compute_dtype)], axis=-1
+            )
+            context_latent = self.delta_context_proj(route_context)
+            slot_latent = self.delta_slot_proj(_value(self.slot_embed))
+            latent = jax.nn.silu(
+                context_latent[..., None, :] + slot_latent[None, None, :, :]
+            )
+            delta_s_seq = jnp.tanh(self.delta_out_proj(latent))
 
         initial_read_keys = self.k_proj_r(slots)
         initial_values = self.v_proj(slots)
@@ -1092,8 +1199,11 @@ class NNXStateLevelScreening(nnx.Module):
             jnp.float32
         )
         mu = self._compute_mu().astype(jnp.float32)
-        write_enabled = phase == "read_write" and cfg.use_write_screening
-        if write_enabled:
+        uses_write_score = write_mode in (
+            "legacy_threshold",
+            "competitive_novel",
+        )
+        if uses_write_score:
             q_w_in = jnp.concatenate(
                 [x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1
             )
@@ -1114,8 +1224,24 @@ class NNXStateLevelScreening(nnx.Module):
             initial_write_keys = jnp.zeros_like(initial_read_keys)
             delta_write_keys = jnp.zeros_like(delta_read_keys)
 
+        if write_mode == "competitive_novel":
+            route_input = jnp.concatenate(
+                [x_ln_seq, h_base_seq.astype(self.compute_dtype)], axis=-1
+            )
+            admission_seq = jax.nn.sigmoid(
+                self.admission_proj(route_input).astype(jnp.float32)[..., 0]
+            )
+            bank_logits_seq = self.bank_route_proj(route_input).astype(
+                jnp.float32
+            )
+        else:
+            admission_seq = jnp.zeros(q_r_seq.shape[:2], dtype=jnp.float32)
+            bank_logits_seq = jnp.zeros(
+                (*q_r_seq.shape[:2], 3), dtype=jnp.float32
+            )
+
         recurrence_config = ScreeningRecurrenceConfig(
-            write_enabled=write_enabled,
+            write_enabled=uses_write_score,
             use_value_unit_norm=cfg.use_value_unit_norm,
             use_leaky_warmup=cfg.use_leaky_warmup,
             leaky_alpha=cfg.leaky_alpha,
@@ -1127,8 +1253,26 @@ class NNXStateLevelScreening(nnx.Module):
             usage_ema_decay=cfg.usage_ema_decay,
             tanh_norm_cap=cfg.tanh_norm_cap,
             eps=cfg.eps,
+            write_mode=write_mode,
+            bank_ids=cfg.bank_ids,
+            route_power=cfg.route_power,
+            novelty_threshold=cfg.novelty_threshold,
+            allocation_temperature=cfg.allocation_temperature,
+            bank_route_temperature=cfg.bank_route_temperature,
+            allocation_age_weight=cfg.allocation_age_weight,
+            allocation_usage_weight=cfg.allocation_usage_weight,
+            hard_admission=(
+                deterministic and cfg.admission_threshold is not None
+            ),
+            admission_threshold=(
+                cfg.admission_threshold
+                if cfg.admission_threshold is not None
+                else 0.5
+            ),
+            n_read_tiles=cfg.n_read_tiles,
+            checkpoint_interval=cfg.checkpoint_interval,
         )
-        recurrence_inputs = tuple(
+        projected_inputs = tuple(
             jnp.swapaxes(value, 0, 1)
             for value in (
                 q_r_seq,
@@ -1138,6 +1282,13 @@ class NNXStateLevelScreening(nnx.Module):
                 delta_values,
                 delta_write_keys,
             )
+        )
+        recurrence_inputs = (
+            projected_inputs[0],
+            projected_inputs[1],
+            jnp.swapaxes(admission_seq, 0, 1),
+            jnp.swapaxes(bank_logits_seq, 0, 1),
+            *projected_inputs[2:],
         )
         state_inputs = (
             slots,
@@ -1175,13 +1326,42 @@ class NNXStateLevelScreening(nnx.Module):
         ) = recurrence_outputs
 
         u_seq = jnp.swapaxes(u_time, 0, 1)
-        read_out_seq = self.out_proj(u_seq)
+        effective_lambda = lambda_screen / math.sqrt(cfg.n_read_tiles)
+        if cfg.gate_space == "value":
+            read_out_seq = self.out_proj(
+                u_seq * gate_seq.astype(u_seq.dtype)
+            )
+            memory_branch = read_out_seq.astype(h_base_seq.dtype)
+        else:
+            read_out_seq = self.out_proj(u_seq)
+            memory_branch = (
+                gate_seq * read_out_seq.astype(jnp.float32)
+            ).astype(h_base_seq.dtype)
         h_seq = (
-            h_base_seq
-            + lambda_screen
-            * gate_seq
-            * read_out_seq.astype(h_base_seq.dtype)
+            h_base_seq + effective_lambda * memory_branch
         ).astype(h_base_seq.dtype)
+
+        final_slots_normalized = unit_norm(final_slots, eps=cfg.eps)
+        if self.sharding is not None and self.sharding.uses_explicit_axes:
+            slot_similarity = jax.lax.dot_general(
+                final_slots_normalized,
+                final_slots_normalized,
+                (((2,), (2,)), ((0,), (0,))),
+                out_sharding=self.sharding.named(
+                    self.sharding.data_axis,
+                    None,
+                    None,
+                ),
+            )
+        else:
+            slot_similarity = jnp.einsum(
+                "bms,bns->bmn",
+                final_slots_normalized,
+                final_slots_normalized,
+            )
+        slot_count = final_slots.shape[1]
+        off_diagonal = 1.0 - jnp.eye(slot_count, dtype=jnp.float32)
+        redundancy_denominator = max(slot_count * (slot_count - 1), 1)
 
         stats = {
             "rel_read_mean": jnp.mean(step_statistics[..., READ_MEAN]),
@@ -1193,8 +1373,10 @@ class NNXStateLevelScreening(nnx.Module):
             ),
             "z_norm_mean": jnp.mean(step_statistics[..., Z_NORM]),
             "u_norm_mean": jnp.mean(step_statistics[..., U_NORM]),
-            "tau_r": tau_r,
-            "lambda_screen": lambda_screen,
+            "tau_r": jnp.mean(tau_r),
+            "tau_r_min": jnp.min(tau_r),
+            "tau_r_max": jnp.max(tau_r),
+            "lambda_screen": effective_lambda,
             "rel_write_mean": jnp.mean(
                 step_statistics[..., WRITE_MEAN]
             ),
@@ -1206,6 +1388,53 @@ class NNXStateLevelScreening(nnx.Module):
                 step_statistics[..., USAGE_MEAN]
             ),
             "tau_w": tau_w,
+            "matched_route_mass": jnp.mean(
+                step_statistics[..., MATCHED_ROUTE_MASS]
+            ),
+            "novel_route_mass": jnp.mean(
+                step_statistics[..., NOVEL_ROUTE_MASS]
+            ),
+            "route_entropy": jnp.mean(
+                step_statistics[..., ROUTE_ENTROPY]
+            ),
+            "route_top1_concentration": jnp.mean(
+                step_statistics[..., ROUTE_TOP1]
+            ),
+            "admission_mean": jnp.mean(
+                step_statistics[..., ADMISSION_MEAN]
+            ),
+            "admission_low_rate": jnp.mean(
+                step_statistics[..., ADMISSION_LOW_RATE]
+            ),
+            "admission_high_rate": jnp.mean(
+                step_statistics[..., ADMISSION_HIGH_RATE]
+            ),
+            "novel_token_rate": jnp.mean(
+                step_statistics[..., NOVEL_RATE]
+            ),
+            "rejected_write_rate": jnp.mean(
+                step_statistics[..., REJECTED_RATE]
+            ),
+            "short_bank_write_mass": jnp.mean(
+                step_statistics[..., BANK_SHORT_WRITE_MASS]
+            ),
+            "mid_bank_write_mass": jnp.mean(
+                step_statistics[..., BANK_MID_WRITE_MASS]
+            ),
+            "long_bank_write_mass": jnp.mean(
+                step_statistics[..., BANK_LONG_WRITE_MASS]
+            ),
+            "eviction_age_mean": jnp.mean(
+                step_statistics[..., EVICTION_AGE_MEAN]
+            ),
+            "eviction_usage_mean": jnp.mean(
+                step_statistics[..., EVICTION_USAGE_MEAN]
+            ),
+            "slot_utilization": jnp.mean(final_usage > 1e-3),
+            "dead_slot_rate": jnp.mean(final_usage <= 1e-3),
+            "slot_cosine_redundancy": jnp.sum(
+                jnp.abs(slot_similarity) * off_diagonal[None, :, :]
+            ) / (final_slots.shape[0] * redundancy_denominator),
         }
         new_state = LayerScreenState(
             slots=_constrain_slots(final_slots, self.sharding).astype(

@@ -1,6 +1,8 @@
 import argparse
 import json
 
+from ..kernels import available_optimizer_backends
+
 
 def add_training_vocab_tiling_args(parser: argparse.ArgumentParser):
     """Add execution-only vocabulary-tiling controls to a CLI parser."""
@@ -20,6 +22,102 @@ def add_training_vocab_tiling_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="use the portable full-logits training loss",
     )
+
+
+def add_optimizer_backend_arg(parser: argparse.ArgumentParser):
+    """Add the opt-in fused-optimizer selector to a training CLI."""
+
+    parser.add_argument(
+        "--optimizer-backend",
+        choices=available_optimizer_backends(),
+        default=None,
+        help="optimizer implementation; Pallas GPU paths are opt-in",
+    )
+
+
+def add_screening_v2_args(parser: argparse.ArgumentParser):
+    """Add architecture controls for the opt-in Screening v2 path."""
+
+    parser.add_argument(
+        "--write-mode",
+        choices=(
+            "disabled",
+            "legacy_unconditional",
+            "legacy_threshold",
+            "competitive_novel",
+        ),
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-gate-space",
+        choices=("model", "value"),
+        default="model",
+    )
+    parser.add_argument(
+        "--screening-gate-activation",
+        choices=("sigmoid", "tanh_silu"),
+        default="sigmoid",
+    )
+    parser.add_argument("--screening-candidate-rank", type=int, default=None)
+    parser.add_argument("--screening-route-power", type=float, default=1.0)
+    parser.add_argument(
+        "--screening-novelty-threshold", type=float, default=0.1
+    )
+    parser.add_argument("--screening-admission-init", type=float, default=0.1)
+    parser.add_argument(
+        "--screening-allocation-temperature", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--screening-bank-route-temperature", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--screening-allocation-age-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--screening-allocation-usage-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--screening-admission-threshold", type=float, default=None
+    )
+    parser.add_argument(
+        "--screening-checkpoint-interval", type=int, default=None
+    )
+    parser.add_argument("--screening-read-tiles", type=int, default=1)
+
+
+def screening_v2_kwargs(args):
+    return {
+        "write_mode": getattr(args, "write_mode", None),
+        "gate_space": getattr(args, "screening_gate_space", "model"),
+        "gate_activation": getattr(
+            args, "screening_gate_activation", "sigmoid"
+        ),
+        "candidate_rank": getattr(args, "screening_candidate_rank", None),
+        "route_power": getattr(args, "screening_route_power", 1.0),
+        "novelty_threshold": getattr(
+            args, "screening_novelty_threshold", 0.1
+        ),
+        "admission_init": getattr(args, "screening_admission_init", 0.1),
+        "allocation_temperature": getattr(
+            args, "screening_allocation_temperature", 1.0
+        ),
+        "bank_route_temperature": getattr(
+            args, "screening_bank_route_temperature", 1.0
+        ),
+        "allocation_age_weight": getattr(
+            args, "screening_allocation_age_weight", 1.0
+        ),
+        "allocation_usage_weight": getattr(
+            args, "screening_allocation_usage_weight", 1.0
+        ),
+        "admission_threshold": getattr(
+            args, "screening_admission_threshold", None
+        ),
+        "checkpoint_interval": getattr(
+            args, "screening_checkpoint_interval", None
+        ),
+        "n_read_tiles": getattr(args, "screening_read_tiles", 1),
+    }
 
 
 def apply_execution_overrides(config, args):
@@ -72,6 +170,9 @@ def apply_execution_overrides(config, args):
                 "--training-vocab-tile-size when multiple tiles are required"
             )
         config.training_vocab_tile_size = int(vocab_tile_size)
+    optimizer_backend = getattr(args, "optimizer_backend", None)
+    if optimizer_backend is not None:
+        config.optimizer_backend = optimizer_backend
     return config
 
 
