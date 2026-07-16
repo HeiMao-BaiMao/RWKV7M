@@ -96,7 +96,17 @@ def _competitive_write_routing_tpu(
     confidence = eligibility[0]
     for slot in range(slot_count):
         value = eligibility[slot]
-        powered = jnp.power(value, route_power)
+        if route_power == 1.0:
+            powered = value
+        elif route_power == 2.0:
+            powered = value * value
+        else:
+            safe_value = jnp.where(value > 0.0, value, 1.0)
+            powered = jnp.where(
+                value > 0.0,
+                jnp.exp(route_power * jnp.log(safe_value)),
+                0.0,
+            )
         powered_values.append(powered)
         powered_sum += powered
         confidence = jnp.maximum(confidence, value)
