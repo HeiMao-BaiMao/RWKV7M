@@ -44,6 +44,7 @@ def parse_args(argv=None):
         default="legacy_threshold",
     )
     parser.add_argument("--read-tiles", type=int, default=1)
+    parser.add_argument("--route-power", type=float, default=1.0)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
     parser.add_argument("--disable-python-gc", action="store_true")
     parser.add_argument(
@@ -68,6 +69,8 @@ def parse_args(argv=None):
         parser.error("--warmup must be non-negative")
     if args.read_tiles <= 0:
         parser.error("--read-tiles must be positive")
+    if args.route_power <= 0.0:
+        parser.error("--route-power must be positive")
     if args.key_size % args.read_tiles != 0:
         parser.error("--key-size must be divisible by --read-tiles")
     if args.value_size % args.read_tiles != 0:
@@ -99,6 +102,7 @@ def _config(args):
         eps=1e-6,
         write_mode=args.write_mode,
         bank_ids=bank_ids,
+        route_power=args.route_power,
         n_read_tiles=args.read_tiles,
         checkpoint_interval=args.checkpoint_interval,
     )
@@ -277,6 +281,7 @@ def main(argv=None):
             "state_dtype": "float32",
             "write_mode": args.write_mode,
             "read_tiles": args.read_tiles,
+            "route_power": args.route_power,
             "checkpoint_interval": args.checkpoint_interval,
         },
         "measurement": {
