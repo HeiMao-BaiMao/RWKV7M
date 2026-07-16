@@ -168,10 +168,15 @@ def _screening_step(
         z_tiles.append(z_tile)
         u_tiles.append(u_tile)
         read_activity = jnp.maximum(read_activity, read_relevance_tile)
-        read_relevance_sum += jnp.sum(read_relevance_tile)
-        read_relevance_max = jnp.maximum(
-            read_relevance_max, jnp.max(read_relevance_tile)
-        )
+        # Reducing a short sliced vector can require an unsupported Mosaic
+        # layout-offset change. Slot count is static, so aggregate these two
+        # diagnostic scalars explicitly instead of introducing a reduction.
+        for slot in range(n_slots):
+            relevance_scalar = read_relevance_tile[slot]
+            read_relevance_sum += relevance_scalar
+            read_relevance_max = jnp.maximum(
+                read_relevance_max, relevance_scalar
+            )
     z = jnp.concatenate(tuple(z_tiles), axis=0)[None, :]
     u = jnp.concatenate(tuple(u_tiles), axis=0)[None, :]
 
