@@ -8,8 +8,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from rwkv7m.model.screening import competitive_write_routing
-
 
 _STEP_STAT_COUNT = 22
 
@@ -64,6 +62,159 @@ def _tanh_norm(value, cap, eps):
     return value * (cap * jnp.tanh(norm / cap) / norm)
 
 
+def _competitive_write_routing_tpu(
+    eligibility,
+    ages,
+    usage,
+    admission,
+    bank_logits,
+    bank_ids_static,
+    *,
+    route_power,
+    novelty_threshold,
+    allocation_temperature,
+    bank_route_temperature,
+    allocation_age_weight,
+    allocation_usage_weight,
+    hard_admission,
+    admission_threshold,
+    eps,
+):
+    """TPU-layout-safe scalar-unrolled competitive routing.
+
+    Slot and bank counts are compile-time constants. Keeping their reductions
+    scalar avoids relayouts of short vectors in Mosaic TPU while preserving the
+    portable routing equations and straight-through gradients.
+    """
+
+    slot_count = eligibility.shape[0]
+    if not bank_ids_static:
+        bank_ids_static = (0,) * slot_count
+
+    powered_values = []
+    powered_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    confidence = eligibility[0]
+    for slot in range(slot_count):
+        value = eligibility[slot]
+        powered = jnp.power(value, route_power)
+        powered_values.append(powered)
+        powered_sum += powered
+        confidence = jnp.maximum(confidence, value)
+    powered_denominator = jnp.where(powered_sum > 0.0, powered_sum, 1.0)
+    matched_values = tuple(
+        confidence * powered / powered_denominator
+        for powered in powered_values
+    )
+    is_novel = confidence < novelty_threshold
+
+    effective_admission = admission
+    if hard_admission:
+        effective_admission = (
+            admission >= admission_threshold
+        ).astype(jnp.float32)
+
+    bank_members = tuple(
+        tuple(
+            slot
+            for slot, slot_bank in enumerate(bank_ids_static)
+            if slot_bank == bank
+        )
+        for bank in range(3)
+    )
+    bank_scores = tuple(
+        bank_logits[bank] / bank_route_temperature - 1e-6 * bank
+        if bank_members[bank]
+        else jnp.asarray(-1e30, dtype=jnp.float32)
+        for bank in range(3)
+    )
+    bank_max = bank_scores[0]
+    for bank in range(1, 3):
+        bank_max = jnp.maximum(bank_max, bank_scores[bank])
+    bank_exp = tuple(
+        jnp.exp(bank_scores[bank] - bank_max)
+        if bank_members[bank]
+        else jnp.asarray(0.0, dtype=jnp.float32)
+        for bank in range(3)
+    )
+    bank_exp_sum = bank_exp[0] + bank_exp[1] + bank_exp[2]
+    bank_routes = tuple(
+        (
+            bank_exp[bank] / (bank_exp_sum + eps)
+            + jax.lax.stop_gradient(
+                (bank_scores[bank] == bank_max).astype(jnp.float32)
+                - bank_exp[bank] / (bank_exp_sum + eps)
+            )
+        )
+        if bank_members[bank]
+        else jnp.asarray(0.0, dtype=jnp.float32)
+        for bank in range(3)
+    )
+
+    victim_values = [jnp.asarray(0.0, dtype=jnp.float32)] * slot_count
+    for bank in range(3):
+        members = bank_members[bank]
+        if not members:
+            continue
+        age_min = ages[members[0]]
+        age_max = ages[members[0]]
+        for slot in members[1:]:
+            age_min = jnp.minimum(age_min, ages[slot])
+            age_max = jnp.maximum(age_max, ages[slot])
+        slot_scores = []
+        for slot in members:
+            normalized_age = (ages[slot] - age_min) / (
+                age_max - age_min + eps
+            )
+            slot_scores.append(
+                (
+                    allocation_age_weight * normalized_age
+                    - allocation_usage_weight * usage[slot]
+                )
+                / allocation_temperature
+                - 1e-6 * slot
+            )
+        slot_max = slot_scores[0]
+        for score in slot_scores[1:]:
+            slot_max = jnp.maximum(slot_max, score)
+        slot_exp = tuple(jnp.exp(score - slot_max) for score in slot_scores)
+        slot_exp_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        for value in slot_exp:
+            slot_exp_sum += value
+        for member_index, slot in enumerate(members):
+            slot_soft = slot_exp[member_index] / (slot_exp_sum + eps)
+            slot_hard = (
+                slot_scores[member_index] == slot_max
+            ).astype(jnp.float32)
+            slot_route = slot_soft + jax.lax.stop_gradient(
+                slot_hard - slot_soft
+            )
+            victim_values[slot] = bank_routes[bank] * slot_route
+
+    novel_values = tuple(
+        is_novel.astype(jnp.float32)
+        * effective_admission
+        * victim_values[slot]
+        for slot in range(slot_count)
+    )
+    write_values = tuple(
+        jnp.where(is_novel, novel_values[slot], matched_values[slot])
+        for slot in range(slot_count)
+    )
+    write_route = jnp.stack(write_values)
+    matched_route = jnp.stack(matched_values)
+    novel_route = jnp.stack(novel_values)
+    victim_route = jnp.stack(tuple(victim_values))
+    return (
+        write_route,
+        matched_route,
+        novel_route,
+        confidence,
+        is_novel,
+        effective_admission,
+        victim_route,
+    )
+
+
 def _screening_step(
     carry,
     q_read,
@@ -79,6 +230,7 @@ def _screening_step(
     tau_write,
     bank_ids,
     *,
+    bank_ids_static: tuple[int, ...],
     write_enabled: bool,
     write_mode: str | None,
     route_power: float,
@@ -216,13 +368,13 @@ def _screening_step(
             is_novel,
             effective_admission,
             _,
-        ) = competitive_write_routing(
+        ) = _competitive_write_routing_tpu(
             write_relevance,
             ages_1d,
             usage_1d,
             admission_scalar,
             bank_logits_1d,
-            bank_ids,
+            bank_ids_static,
             route_power=route_power,
             novelty_threshold=novelty_threshold,
             allocation_temperature=allocation_temperature,
@@ -1218,6 +1370,7 @@ def _screening_tpu_specs(
 def _screening_step_config(config, time: int):
     return {
         "time": time,
+        "bank_ids_static": config.bank_ids,
         "write_enabled": config.write_enabled,
         "write_mode": config.write_mode,
         "route_power": config.route_power,
