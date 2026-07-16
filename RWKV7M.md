@@ -383,8 +383,10 @@ equation, metrics, implementation status, and acceptance gates are in
 The tracked small-model configuration is
 [`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
 CPU interpret mode verifies both GPU and TPU Pallas kernel equations, including
-checkpointed backward gradients. It does not prove real-device lowering or
-speed; the existing L40S and TPU reports predate v2.
+checkpointed backward gradients. TPU v5e-4 additionally passes real-device v2
+lowering, all-output/all-input-gradient parity, the tracked recurrence
+benchmark, and a four-device model-axis optimizer step. The existing L40S
+report predates v2, and real GPU v2 remains unverified.
 
 ## 11. Training
 
@@ -534,12 +536,12 @@ Run:
 uv run pytest -q
 ```
 
-As of 2026-07-16, the current worktree suite completed with 195 passing tests
+As of 2026-07-16, the current worktree suite completed with 196 passing tests
 and five accelerator/optional-runtime skips. This count includes GPU optimizer
 and benchmark-harness coverage plus Screening v2 legacy migration, routing
 invariants, sequence-chunk parity, and CPU Pallas interpret-mode GPU/TPU
-checkpointed-gradient parity. It does not include real-device v2 performance
-validation.
+checkpointed-gradient parity. Real TPU evidence is recorded separately and is
+not part of this local test count.
 
 ## 14. Design Rules
 
@@ -569,9 +571,9 @@ Prefer:
 
 Next engineering steps:
 
-1. Validate Screening v2 on real GPU and TPU hardware: lowering, full output
-   and all-input-gradient parity, peak-memory reduction from interval
-   checkpointing, recurrence latency, and complete train-step throughput.
+1. Validate Screening v2 on real NVIDIA GPUs. On TPU, measure checkpoint peak
+   memory and complete 0.185B train-step throughput; v5e-4 kernel parity,
+   recurrence latency, and four-device model-axis execution already pass.
 2. Validate full RWKV7M Orbax train-state and runtime-state checkpoint
    save/resume on real TPU pods, including sharded optimizer, parameter,
    recurrent, and screening states. The independent small NNX lifecycle probe

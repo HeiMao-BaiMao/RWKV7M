@@ -194,6 +194,67 @@ It executed finite forward output and one complete optimizer step with loss
 13 all-reduces, and 3 all-to-alls. The two all-gathers are the explicit slot
 feature gathers at the screening recurrence boundary.
 
+## Screening v2 real-hardware gate
+
+On 2026-07-16, commit `6fc9a48a1d2dbdc82561c7aaad81d46ff5f0d4d4`
+was validated on a temporary single-host `v5litepod-4` named
+`rwkv7m-screening-v2-260716` in `us-west4-a`. The software versions matched the
+earlier gate: Python 3.13.14, JAX/jaxlib 0.10.0, Flax 0.12.7, Optax 0.2.8, and
+libtpu 0.0.40. Transparent hugepages remained disabled.
+
+The real-accelerator regression test used `competitive_novel`, two read tiles,
+and interval-2 tape checkpointing. It passed all six public outputs and all 17
+input gradients against the portable reference:
+
+```bash
+uv run pytest -q tests/test_screening_pallas_accelerator.py
+```
+
+The tracked recurrence measurement then used `T=128, B=1, M=16`, slot size
+128, key/value size 64, route power 2, four fixed-total-dimension read tiles,
+and interval-16 checkpointing. Inputs were device resident; two warmups and
+five synchronized calls were excluded/included respectively; Python GC was
+disabled.
+
+| Screening v2 operation | Pallas TPU median | reference median | Speedup |
+| --- | ---: | ---: | ---: |
+| Forward | 0.572 ms | 3.874 ms | 6.77x |
+| Forward + backward | 4.856 ms | 12.380 ms | 2.55x |
+
+The scalar loss difference was zero. The maximum absolute output error was
+`3.81e-6`. The maximum gradient relative L2 error over all inputs was
+`2.33e-5`; the largest absolute gradient difference was `0.003662` for the age
+carry, whose relative L2 error was `1.32e-6`. These are recurrence-only
+measurements, not a complete-model throughput result.
+
+A separate four-device `data=1, model=4` small-model audit enabled value-space
+gating, rank-4 factorized candidates, competitive novel routing, route power 2,
+two read tiles, and interval-2 checkpointing. It completed finite forward,
+backward, and optimizer step 1 with loss `4.34657097`. Screening slots retained
+`P('data', None, 'model')`. The compiled forward contained 2 all-gathers,
+14 all-reduces, and 6 all-to-alls.
+
+The real TPU gate exposed two classes of issue hidden by CPU interpret mode:
+
+- Mosaic TPU rejected float iota, feature-to-tile shape casts, short-vector
+  relayouts/reductions, and `powf`; the TPU kernel now uses integer tie-break
+  indices, rank-two static slices, scalar-unrolled slot/bank routing and
+  statistics, and multiplication/log-exp route powers;
+- the factorized slot projection initially treated its slot axis as a leading
+  data axis under explicit sharding; its replicated output placement is now
+  explicit and has a local regression test.
+
+This establishes single-host v5e functional and recurrence-performance gates
+for Screening v2. It does not establish measured checkpoint peak-memory
+savings, complete 0.185B train-step throughput, multi-host scaling, GPU v2
+lowering, or model-quality benefit.
+
+The VM was READY at `2026-07-16T12:35:52Z`. The delete operation completed by
+approximately `13:18:23Z`; the zone listing was empty and describing the VM
+returned `NOT_FOUND`. The approximately 42.5-minute READY-to-delete interval is
+about 3.4 USD at the previously documented 1.20 USD per v5e chip-hour rate;
+this is an estimate, not an exported billing record.
+
 ## Complete-model compute-only check
 
 A fixed device-resident `1 x 128` batch was used with the `0.185b` preset on

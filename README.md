@@ -254,9 +254,12 @@ checkpointing, and fixed-total-dimension multi-read tiles. Existing configs
 continue to map to explicit legacy write modes; the tracked opt-in example is
 [`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
 Portable reference tests and CPU Pallas interpret-mode tests cover the v2
-forward and gradients for both backend-specific kernel bodies. The published
-L40S and TPU results still measure the legacy projected recurrence: real GPU
-and TPU lowering, memory, and throughput gates for v2 remain pending.
+forward and gradients for both backend-specific kernel bodies. A real TPU v5e-4
+gate now covers v2 lowering, all six outputs, all 17 input gradients, the
+tracked 0.185B recurrence shape, and a four-device model-axis optimizer step.
+The published L40S result still measures the legacy recurrence. Real GPU v2,
+measured checkpoint peak memory, and complete 0.185B train-step gates remain
+pending.
 
 Run the synchronized screening recurrence benchmark with:
 
@@ -794,4 +797,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-16, the current worktree suite completed with 195 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration, routing invariants, sequence-chunk parity, and CPU Pallas interpret-mode GPU/TPU checkpointed-gradient parity; it does not include real-device v2 performance validation.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-16, the current worktree suite completed with 196 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration, routing invariants, sequence-chunk parity, explicit factorized-candidate sharding, and CPU Pallas interpret-mode GPU/TPU checkpointed-gradient parity. Real TPU evidence is recorded separately and is not part of this local test count.

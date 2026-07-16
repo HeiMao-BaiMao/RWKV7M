@@ -292,14 +292,15 @@ not accepted as proof of the limiting resource.
     range are integrated. CPU interpret parity passes; L40S and Mosaic
     complete-step and profiler records are still required before dispatch
     defaults change.
-12. **Implemented, hardware gate pending:** Screening v2 write-mode migration
+12. **Implemented; TPU v5e-4 gate passed, GPU gate pending:** Screening v2 write-mode migration
     and metrics, value-space gate, factorized candidate, confidence-preserving
     matched routing, continuous admission with sparse bank-aware novel
     allocation, interval training-tape checkpointing, and fixed-total-dimension
     multi-read tiles are integrated. Portable/NNX tests and CPU Pallas
-    interpret-mode GPU/TPU forward and gradient parity pass. Real L40S, Mosaic,
-    and TPU lowering, peak-memory, and complete-step performance records remain
-    required.
+    interpret-mode GPU/TPU forward and gradient parity pass. TPU v5e-4 now also
+    passes real lowering, six-output/17-input-gradient parity, a tracked-shape
+    recurrence gate, and a four-device model-axis optimizer step. Real L40S and
+    Mosaic v2, measured peak memory, and complete-step records remain required.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:

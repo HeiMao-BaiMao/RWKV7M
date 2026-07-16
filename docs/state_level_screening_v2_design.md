@@ -1,6 +1,7 @@
 # State-Level Screening v2 engineering contract
 
-Status: opt-in implementation complete; real GPU/TPU hardware gates pending.
+Status: opt-in implementation complete; TPU v5e-4 gate passed; real GPU and
+larger-scale TPU gates pending.
 
 Here, "v2" names the second Screening architecture, while the accompanying
 paper is `design-locked-draft-v4`; the two version labels track different
@@ -329,8 +330,11 @@ Implemented:
 Portable and NNX tests cover legacy mapping, rejected-write accounting,
 confidence preservation, straight-through routing gradients, and sequence
 chunk parity. CPU Pallas interpret mode covers forward and all-input-gradient
-parity for the GPU and TPU checkpointed multi-read paths. Real-device lowering,
-peak memory, and performance remain unverified for v2.
+parity for the GPU and TPU checkpointed multi-read paths. TPU v5e-4 additionally
+passes real lowering, all-output/all-input-gradient parity, the tracked 0.185B
+recurrence shape with four read tiles and interval-16 checkpointing, and a
+four-device model-axis optimizer step. Real GPU lowering, measured peak memory,
+complete-model throughput, and multi-host scaling remain unverified for v2.
 
 Every stage must pass:
 

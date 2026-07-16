@@ -5,7 +5,7 @@
 
 **対象**: RWKV-7 系、または固定サイズ recurrent state を持つ efficient sequence model
 
-**実装対応**: 本リポジトリの JAX/Flax NNX、portable reference、GPU/TPU Pallas paths。v4機構はopt-in実装済み、実GPU/TPU性能検証は未実施。
+**実装対応**: 本リポジトリの JAX/Flax NNX、portable reference、GPU/TPU Pallas paths。v4機構はopt-in実装済み。TPU v5e-4実機検証済み、GPU v2実機検証は未実施。
 
 **主張の強さ**: 本稿は研究仮説であり、性能改善や memory hygiene は実験で検証されるべきである。
 
@@ -302,7 +302,7 @@ accelerator path は dense projection を XLA へ出し、time recurrence を Pa
 6. Screening training-tape checkpointing,
 7. fixed-total-dimension multi-read tile と `1/sqrt(n_read_tiles)` scaling.
 
-各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。これは実GPU/TPU lowering、peak memory、throughputの証拠ではない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
+各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。加えてTPU v5e-4では、実機lowering、6出力と17入力gradient parity、`T=128, B=1, M=16, d_slot=128, d_k=d_v=64`のrecurrence測定、4-device model-axis optimizer stepを確認した。Pallas medianはforward `0.572 ms`、forward+backward `4.856 ms`で、同一referenceの`3.874 ms`、`12.380 ms`に対してそれぞれ6.77倍、2.55倍であった。これはpeak memory、完全0.185B train step、model quality、GPU v2の証拠ではない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
 
 ---
 
