@@ -346,7 +346,12 @@ def _screening_step(
         write_similarity = jnp.sum(
             normalized_write_keys * q_write_1d[None, :], axis=-1
         )
-        write_relevance = _trim_square(write_similarity, tau_write, eps)
+        write_relevance = jnp.stack(
+            tuple(
+                _trim_square(write_similarity[slot], tau_write, eps)
+                for slot in range(n_slots)
+            )
+        )
     else:
         write_relevance = jnp.zeros_like(read_activity)
 
