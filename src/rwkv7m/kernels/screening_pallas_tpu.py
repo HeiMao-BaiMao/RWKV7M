@@ -422,42 +422,55 @@ def _screening_step(
     next_usage = usage_ema_decay * usage_1d + (
         1.0 - usage_ema_decay
     ) * activity
-    route_mass = jnp.sum(effective_write_relevance)
-    route_distribution = effective_write_relevance / (route_mass + eps)
-    route_entropy = -jnp.sum(
-        route_distribution * jnp.log(route_distribution + eps)
-    )
-    route_top1 = jnp.max(route_distribution)
-    resolved_bank_ids = jnp.asarray(
-        bank_ids, dtype=jnp.int32
-    )
-    bank_write_mass = tuple(
-        jnp.sum(
-            effective_write_relevance * (resolved_bank_ids == bank_id)
-        )
-        for bank_id in range(3)
-    )
-    novel_mass = jnp.sum(novel_route)
-    eviction_age = jnp.sum(novel_route * ages_1d) / (novel_mass + eps)
-    eviction_usage = jnp.sum(novel_route * usage_1d) / (novel_mass + eps)
+    route_mass = jnp.asarray(0.0, dtype=jnp.float32)
+    matched_mass = jnp.asarray(0.0, dtype=jnp.float32)
+    novel_mass = jnp.asarray(0.0, dtype=jnp.float32)
+    write_relevance_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    usage_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    active_count = jnp.asarray(0.0, dtype=jnp.float32)
+    eviction_age_numerator = jnp.asarray(0.0, dtype=jnp.float32)
+    eviction_usage_numerator = jnp.asarray(0.0, dtype=jnp.float32)
+    bank_write_mass = [jnp.asarray(0.0, dtype=jnp.float32)] * 3
+    resolved_bank_ids_static = bank_ids_static or (0,) * n_slots
+    for slot in range(n_slots):
+        route_value = effective_write_relevance[slot]
+        novel_value = novel_route[slot]
+        route_mass += route_value
+        matched_mass += matched_route[slot]
+        novel_mass += novel_value
+        write_relevance_sum += write_relevance[slot]
+        usage_sum += next_usage[slot]
+        active_count += (read_activity[slot] > 1e-3).astype(jnp.float32)
+        eviction_age_numerator += novel_value * ages_1d[slot]
+        eviction_usage_numerator += novel_value * usage_1d[slot]
+        bank = resolved_bank_ids_static[slot]
+        bank_write_mass[bank] += route_value
+    route_entropy = jnp.asarray(0.0, dtype=jnp.float32)
+    route_top1 = jnp.asarray(0.0, dtype=jnp.float32)
+    for slot in range(n_slots):
+        probability = effective_write_relevance[slot] / (route_mass + eps)
+        route_entropy -= probability * jnp.log(probability + eps)
+        route_top1 = jnp.maximum(route_top1, probability)
+    eviction_age = eviction_age_numerator / (novel_mass + eps)
+    eviction_usage = eviction_usage_numerator / (novel_mass + eps)
     is_competitive = resolved_mode == "competitive_novel"
     statistic_scalars = (
         read_relevance_sum / (n_read_tiles * n_slots),
         read_relevance_max,
-        jnp.sum(read_activity > 1e-3).astype(jnp.float32),
+        active_count,
         jnp.sqrt(jnp.sum(z * z)),
         jnp.sqrt(jnp.sum(u * u)),
-        jnp.mean(write_relevance),
-        jnp.mean(effective_write_relevance),
-        jnp.mean(next_usage),
-        jnp.sum(matched_route),
+        write_relevance_sum / n_slots,
+        route_mass / n_slots,
+        usage_sum / n_slots,
+        matched_mass,
         novel_mass,
         route_entropy,
         route_top1,
         effective_admission,
         is_novel.astype(jnp.float32),
         (route_mass <= eps).astype(jnp.float32),
-        *bank_write_mass,
+        *tuple(bank_write_mass),
         eviction_age,
         eviction_usage,
         ((effective_admission < 0.05) & is_competitive).astype(jnp.float32),
