@@ -507,7 +507,13 @@ uv run rwkv7m-train-binidx-dp `
   --prefetch-size 2
 ```
 
-This is the first local-testable layer for TPU Research Cloud work. It includes process-aware Flax checkpoints, Orbax train-state checkpoints for TPU-scale runs, carry-state runtime checkpoint/resume for distributed local runs, checkpoint rotation with best-eval protection, structured JSONL/CSV metrics, run summaries, periodic validation, device prefetching, and an optional NNX Explicit data/model mesh path. Full RWKV7M sharded train/runtime-state checkpoint validation on real TPU pods is still pending.
+This stack includes mesh-data-shard-aware input streams, Orbax train-state
+checkpoints with a separate shared checkpoint root, carry-state runtime
+checkpoint/resume for distributed local runs, checkpoint rotation with
+best-eval protection, structured JSONL/CSV metrics, run summaries, periodic
+validation, device prefetching, and an NNX Explicit data/model mesh path. The
+four-process v5e-16 compute path is validated; shared-GCS save/restore remains
+a required TPU-pod gate.
 
 Audit distributed run artifacts locally:
 
@@ -515,7 +521,10 @@ Audit distributed run artifacts locally:
 uv run rwkv7m-audit-dp-run out/minipile-dp --require-complete --min-train-records 10
 ```
 
-TPU setup and run notes are in [docs/tpu_research_cloud.md](docs/tpu_research_cloud.md).
+TPU setup and run notes are in
+[docs/tpu_research_cloud.md](docs/tpu_research_cloud.md). The multi-process,
+multi-slice, replica-safe input, and shared-checkpoint contracts are in
+[docs/trc_scaling_design.md](docs/trc_scaling_design.md).
 
 ### Model-size presets and the NNX scale path
 
@@ -666,8 +675,10 @@ The independent NNX lifecycle probe also completed Orbax create and restore in
 separate processes on the same TPU slice, advancing the optimizer from step 1
 to step 2 after restore. This validates the small framework lifecycle probe,
 not the full RWKV7M distributed train-state or recurrent/screening runtime-state
-checkpoint path. A 7B run, multi-host execution, XProf tuning of the three
-all-to-alls, production throughput, and failure recovery remain pending.
+checkpoint path. A later four-process v5e-16 gate completed exact-array checks
+for four data/model meshes and a read/write-screening optimizer step with
+`model=16`. A 7B run, multi-slice execution, shared-GCS recovery, XProf tuning,
+production throughput, and failure recovery remain pending.
 
 ## Public API
 
@@ -726,7 +737,11 @@ Lower-level modules:
 - Single-process reference training checkpoint save/load.
 - Binidx validation loss/perplexity CLI.
 - Local-testable distributed mesh/sharding helpers for TPU work.
-- Data-parallel distributed binidx training CLI with process-aware Flax checkpointing, Orbax train-state checkpointing, carry-state runtime checkpoint/resume, checkpoint rotation with best-eval protection, structured JSONL/CSV logs, run summaries, validation hooks, run artifact audit CLI, device prefetching, and an optional NNX Explicit data/model mesh path.
+- Distributed binidx training CLI with mesh-data-shard-aware sampling,
+  shared-storage Orbax checkpoint roots, carry-state runtime checkpoint/resume,
+  checkpoint rotation with best-eval protection, structured JSONL/CSV logs,
+  run summaries, validation hooks, run artifact audit CLI, device prefetching,
+  and an NNX Explicit data/model mesh path.
 - Persistent TPU and NVIDIA Pallas WKV forward/backward kernels with FP32
   interval checkpoints, a Pallas-first dispatcher, and CPU interpret-mode
   forward/gradient parity tests.
@@ -744,7 +759,8 @@ Not yet included:
 - full RWKV7M train-state and recurrent/screening runtime-state Orbax
   checkpoint save/resume validation on real TPU pods,
 - production-scale distributed TPU trainer validation on real TPU pods,
-- 7B and multi-host TPU execution, XProf collective tuning, and failure recovery drills,
+- 7B and multi-slice TPU execution, shared-GCS recovery, XProf collective
+  tuning, and failure recovery drills,
 - task-specific long-context evaluation harnesses beyond stateful binidx validation.
 
 ## Tests
@@ -753,4 +769,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 161 tests, with four real-accelerator or optional-runtime checks skipped on CPU.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. The current full suite is 174 tests: 170 pass locally, with four real-accelerator or optional-runtime checks skipped on CPU.

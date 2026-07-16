@@ -11,6 +11,7 @@
   "param_axis_name": "model",
   "checkpoint_backend": "orbax",
   "output_dir": "out/rwkv7m-7b-tpu",
+  "checkpoint_dir": "gs://YOUR_BUCKET/rwkv7m-7b-tpu",
   "save_every": 100,
   "keep_last_checkpoints": 3,
   "eval_every": 100,

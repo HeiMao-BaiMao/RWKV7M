@@ -8,6 +8,8 @@ from .checkpoint import (
     CHECKPOINT_JSON,
     ORBAX_RUNTIME_STATE_DIR,
     ORBAX_TRAIN_STATE_DIR,
+    _as_checkpoint_path,
+    _canonical_checkpoint_path,
     list_checkpoint_dirs,
 )
 
@@ -47,13 +49,13 @@ def _issue(issues, severity, code, message, path=None):
 
 
 def _load_json(path, issues, *, code, required=True):
-    path = Path(path)
+    path = _as_checkpoint_path(path)
     if not path.exists():
         if required:
             _issue(issues, "error", code, f"missing JSON file: {path}", path)
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError as exc:
         _issue(issues, "error", code, f"invalid JSON: {exc}", path)
@@ -61,13 +63,13 @@ def _load_json(path, issues, *, code, required=True):
 
 
 def _load_jsonl(path, issues, *, required=True):
-    path = Path(path)
+    path = _as_checkpoint_path(path)
     if not path.exists():
         if required:
             _issue(issues, "error", "metrics_missing", f"missing metrics JSONL: {path}", path)
         return []
     records = []
-    with open(path, "r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -87,7 +89,7 @@ def _load_jsonl(path, issues, *, required=True):
 
 def _checkpoint_step(path):
     try:
-        return int(Path(path).name.removeprefix("ckpt-"))
+        return int(_as_checkpoint_path(path).name.removeprefix("ckpt-"))
     except ValueError:
         return None
 
@@ -102,10 +104,10 @@ def _int_or_none(value):
 def _resolve_recorded_path(output_dir, recorded):
     if recorded is None:
         return None
-    path = Path(recorded)
-    if path.is_absolute() or path.exists():
+    path = _as_checkpoint_path(recorded)
+    if "://" in str(path) or path.is_absolute() or path.exists():
         return path
-    output_dir = Path(output_dir)
+    output_dir = _as_checkpoint_path(output_dir)
     candidate = output_dir / path
     if candidate.exists():
         return candidate
@@ -272,8 +274,8 @@ def _check_checkpoint_artifacts(issues, checkpoint_dir, payload):
         )
 
 
-def _check_checkpoints(issues, output_dir, run_summary):
-    checkpoints = tuple(list_checkpoint_dirs(output_dir))
+def _check_checkpoints(issues, checkpoint_root, run_summary):
+    checkpoints = tuple(list_checkpoint_dirs(checkpoint_root))
     payloads = {}
     for checkpoint_dir in checkpoints:
         step_from_name = _checkpoint_step(checkpoint_dir)
@@ -285,7 +287,7 @@ def _check_checkpoints(issues, output_dir, run_summary):
         )
         if payload is None:
             continue
-        payloads[checkpoint_dir.resolve()] = payload
+        payloads[_canonical_checkpoint_path(checkpoint_dir)] = payload
         payload_step = _int_or_none(payload.get("step"))
         if payload_step is None:
             _issue(
@@ -334,7 +336,10 @@ def _check_checkpoints(issues, output_dir, run_summary):
         _check_checkpoint_artifacts(issues, checkpoint_dir, payload)
 
     if run_summary is not None:
-        latest_checkpoint = _resolve_recorded_path(output_dir, run_summary.get("latest_checkpoint"))
+        latest_checkpoint = _resolve_recorded_path(
+            checkpoint_root,
+            run_summary.get("latest_checkpoint"),
+        )
         if latest_checkpoint is not None:
             if not latest_checkpoint.exists():
                 _issue(
@@ -345,7 +350,9 @@ def _check_checkpoints(issues, output_dir, run_summary):
                     latest_checkpoint,
                 )
             else:
-                payload = payloads.get(latest_checkpoint.resolve())
+                payload = payloads.get(
+                    _canonical_checkpoint_path(latest_checkpoint)
+                )
                 current_step = run_summary.get("current_step")
                 payload_step = None if payload is None else _int_or_none(payload.get("step"))
                 current_step_int = _int_or_none(current_step)
@@ -360,7 +367,7 @@ def _check_checkpoints(issues, output_dir, run_summary):
     return checkpoints
 
 
-def _check_best_eval(issues, output_dir, run_summary, best_eval, *, require_best_checkpoint=False):
+def _check_best_eval(issues, checkpoint_root, run_summary, best_eval, *, require_best_checkpoint=False):
     summary_best = None if run_summary is None else run_summary.get("best_eval")
     active_best = best_eval if best_eval is not None else summary_best
 
@@ -388,7 +395,7 @@ def _check_best_eval(issues, output_dir, run_summary, best_eval, *, require_best
         if require_best_checkpoint:
             _issue(issues, "error", "best_checkpoint_missing", "best eval checkpoint is required but unset")
         return
-    checkpoint_path = _resolve_recorded_path(output_dir, checkpoint)
+    checkpoint_path = _resolve_recorded_path(checkpoint_root, checkpoint)
     if not checkpoint_path.exists():
         _issue(
             issues,
@@ -402,6 +409,7 @@ def _check_best_eval(issues, output_dir, run_summary, best_eval, *, require_best
 def audit_distributed_run(
     output_dir,
     *,
+    checkpoint_dir=None,
     require_complete=False,
     require_best_checkpoint=False,
     min_train_records=None,
@@ -448,10 +456,20 @@ def audit_distributed_run(
         run_summary,
         min_train_records=min_train_records,
     )
-    checkpoints = _check_checkpoints(issues, output_dir, run_summary)
+    configured_checkpoint_dir = checkpoint_dir
+    if configured_checkpoint_dir is None and run_config is not None:
+        configured_checkpoint_dir = run_config.get("args", {}).get(
+            "checkpoint_dir"
+        )
+    checkpoint_root = (
+        output_dir
+        if configured_checkpoint_dir is None
+        else _as_checkpoint_path(configured_checkpoint_dir)
+    )
+    checkpoints = _check_checkpoints(issues, checkpoint_root, run_summary)
     _check_best_eval(
         issues,
-        output_dir,
+        checkpoint_root,
         run_summary,
         best_eval,
         require_best_checkpoint=require_best_checkpoint,

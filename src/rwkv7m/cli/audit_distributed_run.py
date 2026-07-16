@@ -9,6 +9,11 @@ def parse_args(argv=None):
         description="Audit rwkv7m distributed training run artifacts."
     )
     parser.add_argument("output_dir")
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="override the checkpoint root recorded in run_config.json",
+    )
     parser.add_argument("--require-complete", action="store_true")
     parser.add_argument("--require-best-checkpoint", action="store_true")
     parser.add_argument("--min-train-records", type=int, default=None)
@@ -37,6 +42,7 @@ def main(argv=None):
     args = parse_args(argv)
     report = audit_distributed_run(
         args.output_dir,
+        checkpoint_dir=args.checkpoint_dir,
         require_complete=args.require_complete,
         require_best_checkpoint=args.require_best_checkpoint,
         min_train_records=args.min_train_records,

@@ -55,7 +55,13 @@ from .partitioning import (
     parameter_sharding,
     place_parameter_tree,
 )
-from .mesh import initialize_jax_distributed, make_1d_mesh, make_mesh, process_info
+from .mesh import (
+    initialize_jax_distributed,
+    make_1d_mesh,
+    make_mesh,
+    process_data_shard_indices,
+    process_info,
+)
 from .sharding import (
     axis_sharding,
     data_parallel_sharding,
@@ -127,6 +133,7 @@ __all__ = [
     "initialize_jax_distributed",
     "make_1d_mesh",
     "make_mesh",
+    "process_data_shard_indices",
     "process_info",
     "axis_sharding",
     "data_parallel_sharding",

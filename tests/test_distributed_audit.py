@@ -9,10 +9,14 @@ def write_json(path, payload):
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
-def write_good_run(output_dir):
+def write_good_run(output_dir, checkpoint_dir=None):
+    checkpoint_root = output_dir if checkpoint_dir is None else checkpoint_dir
     run_config = {
         "args": {
             "checkpoint_backend": "flax",
+            "checkpoint_dir": (
+                None if checkpoint_dir is None else str(checkpoint_dir)
+            ),
             "ctx_len": 4,
             "global_batch_size": 2,
             "log_jsonl": None,
@@ -30,13 +34,13 @@ def write_good_run(output_dir):
         "tokens_per_step": 8,
         "tokens_seen": 16,
         "checkpoint_backend": "flax",
-        "latest_checkpoint": str(output_dir / "ckpt-00000002"),
+        "latest_checkpoint": str(checkpoint_root / "ckpt-00000002"),
         "best_eval": {
             "step": 2,
             "metric": "loss",
             "mode": "min",
             "value": 1.5,
-            "checkpoint": str(output_dir / "ckpt-00000002"),
+            "checkpoint": str(checkpoint_root / "ckpt-00000002"),
             "metrics": {"loss": 1.5, "perplexity": 4.4816890703380645},
         },
     }
@@ -67,10 +71,10 @@ def write_good_run(output_dir):
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in metrics),
         encoding="utf-8",
     )
-    checkpoint_dir = output_dir / "ckpt-00000002"
-    write_json(checkpoint_dir / "checkpoint.json", checkpoint_payload)
-    (checkpoint_dir / "train_state.msgpack").write_bytes(b"state")
-    (checkpoint_dir / "model.safetensors").write_bytes(b"weights")
+    checkpoint_path = checkpoint_root / "ckpt-00000002"
+    write_json(checkpoint_path / "checkpoint.json", checkpoint_payload)
+    (checkpoint_path / "train_state.msgpack").write_bytes(b"state")
+    (checkpoint_path / "model.safetensors").write_bytes(b"weights")
 
 
 def test_audit_distributed_run_accepts_complete_run(tmp_path):
@@ -90,6 +94,23 @@ def test_audit_distributed_run_accepts_complete_run(tmp_path):
     assert summary["train_records"] == 2
     assert summary["eval_records"] == 1
     assert summary["current_step"] == 2
+
+
+def test_audit_distributed_run_uses_separate_checkpoint_root(tmp_path):
+    output_dir = tmp_path / "out"
+    checkpoint_dir = tmp_path / "shared-checkpoints"
+    write_good_run(output_dir, checkpoint_dir)
+
+    report = audit_distributed_run(
+        output_dir,
+        require_complete=True,
+        require_best_checkpoint=True,
+    )
+
+    assert report.ok
+    assert report.checkpoints == (
+        checkpoint_dir / "ckpt-00000002",
+    )
 
 
 def test_audit_distributed_run_reports_missing_best_checkpoint(tmp_path):

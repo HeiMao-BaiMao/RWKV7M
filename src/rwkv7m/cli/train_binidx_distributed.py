@@ -4,10 +4,12 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import math
+import os
 import time
 from pathlib import Path
 
 import jax
+import numpy as np
 
 from ..api import create_train_runtime
 from ..distributed import (
@@ -23,6 +25,7 @@ from ..distributed import (
     metrics_to_host_dict,
     parameter_partition_summary,
     place_train_objects,
+    process_data_shard_indices,
     restore_distributed_train_state,
     restore_distributed_runtime_state,
     rotate_checkpoints,
@@ -119,6 +122,14 @@ def parse_args(argv=None):
     parser.add_argument("--usage-ema-decay", type=float, default=0.99)
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help=(
+            "checkpoint root separate from local run artifacts; multi-process "
+            "runs must use shared storage such as gs:// or a shared mount"
+        ),
+    )
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--keep-last-checkpoints", type=int, default=0)
     parser.add_argument("--checkpoint-backend", choices=["flax", "orbax"], default="flax")
@@ -158,6 +169,10 @@ def _log_paths(args):
     return jsonl_path, csv_path
 
 
+def _checkpoint_root(args):
+    return args.checkpoint_dir or args.output_dir
+
+
 def _summary_path(args):
     if args.summary_json is not None:
         return args.summary_json
@@ -171,7 +186,7 @@ def _now_utc():
 
 
 def _jsonable(value):
-    if isinstance(value, Path):
+    if isinstance(value, os.PathLike):
         return str(value)
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
@@ -295,6 +310,30 @@ def _write_run_config(args, config, info, *, params=None, mesh=None):
         "devices": info.get("devices", []),
         "environment": runtime_version_manifest(),
     }
+    if mesh is not None:
+        mesh_devices = []
+        for logical_index, device in np.ndenumerate(mesh.devices):
+            record = {
+                "logical_index": list(logical_index),
+                "id": int(device.id),
+                "process_index": int(device.process_index),
+            }
+            for name in ("coords", "core_on_chip", "slice_index"):
+                if not hasattr(device, name):
+                    continue
+                value = getattr(device, name)
+                record[name] = (
+                    [int(item) for item in value]
+                    if isinstance(value, (list, tuple))
+                    else int(value)
+                )
+            mesh_devices.append(record)
+        payload["mesh"] = {
+            "axis_names": list(mesh.axis_names),
+            "shape": dict(mesh.shape),
+            "axis_types": [str(axis_type) for axis_type in mesh.axis_types],
+            "devices": mesh_devices,
+        }
     if args.param_axis_name is not None and params is not None and mesh is not None:
         payload["parameter_partition_summary"] = parameter_partition_summary(
             params,
@@ -320,7 +359,7 @@ def _save_checkpoint(args, dist, config, step, info, *, protected_paths=None, me
     if metadata:
         checkpoint_metadata.update(metadata)
     checkpoint_dir = save_data_parallel_checkpoint(
-        args.output_dir,
+        _checkpoint_root(args),
         step,
         dist,
         config,
@@ -338,7 +377,7 @@ def _save_checkpoint(args, dist, config, step, info, *, protected_paths=None, me
     if checkpoint_dir is not None:
         _print_once(info, f"saved checkpoint {checkpoint_dir}")
         removed = rotate_checkpoints(
-            args.output_dir,
+            _checkpoint_root(args),
             args.keep_last_checkpoints,
             info,
             protected_paths=protected_paths,
@@ -414,8 +453,42 @@ def _validate_model_parallel_shapes(config, mesh, axis_name):
         )
 
 
+def _validate_distributed_checkpoint_policy(args, info):
+    if args.output_dir is not None and "://" in args.output_dir:
+        raise ValueError(
+            "--output-dir must be a local filesystem path; use "
+            "--checkpoint-dir for shared object storage"
+        )
+    checkpoint_root = _checkpoint_root(args)
+    if (
+        checkpoint_root is not None
+        and "://" in checkpoint_root
+        and args.checkpoint_backend != "orbax"
+    ):
+        raise ValueError("object-storage checkpoints require Orbax")
+    if (
+        checkpoint_root is not None
+        and info["process_count"] > 1
+        and args.checkpoint_backend != "orbax"
+    ):
+        raise ValueError(
+            "multi-process checkpointing requires --checkpoint-backend orbax; "
+            "the Flax backend cannot serialize non-addressable global arrays"
+        )
+    if (
+        checkpoint_root is not None
+        and info["process_count"] > 1
+        and args.checkpoint_dir is None
+    ):
+        raise ValueError(
+            "multi-process checkpointing requires an explicit --checkpoint-dir "
+            "on storage shared by every worker"
+        )
+
+
 def run_distributed_training(args):
     info = initialize_jax_distributed()
+    _validate_distributed_checkpoint_policy(args, info)
     mesh_axis_names = tuple(args.mesh_axis_names)
     if "data" not in mesh_axis_names:
         raise ValueError("mesh_axis_names must include 'data'")
@@ -476,6 +549,12 @@ def run_distributed_training(args):
     if uses_explicit_model_parallel:
         _validate_model_parallel_shapes(config, mesh, args.param_axis_name)
 
+    data_shard_indices = process_data_shard_indices(
+        mesh,
+        axis_name="data",
+        process_index=info["process_index"],
+    )
+
     dataset = create_host_binidx_dataset(
         args.data_file,
         ctx_len=args.ctx_len,
@@ -485,7 +564,9 @@ def run_distributed_training(args):
         process_index=info["process_index"],
         process_count=info["process_count"],
         local_device_count=info["local_device_count"],
-        local_data_shard_count=int(mesh.local_mesh.shape["data"]),
+        local_data_shard_count=len(data_shard_indices),
+        data_axis_size=data_axis_size,
+        data_shard_indices=data_shard_indices,
         sampling_mode=args.sampling_mode,
     )
     eval_dataset = None
@@ -499,7 +580,9 @@ def run_distributed_training(args):
             process_index=info["process_index"],
             process_count=info["process_count"],
             local_device_count=info["local_device_count"],
-            local_data_shard_count=int(mesh.local_mesh.shape["data"]),
+            local_data_shard_count=len(data_shard_indices),
+            data_axis_size=data_axis_size,
+            data_shard_indices=data_shard_indices,
             sampling_mode=args.sampling_mode,
         )
     if args.param_axis_name == "data":
@@ -553,6 +636,7 @@ def run_distributed_training(args):
         param_axis_name=args.param_axis_name,
     )
     last_checkpoint = None
+    last_checkpoint_step = None
     log_jsonl, log_csv = _log_paths(args)
     _write_run_config(args, config, info, params=train_state.params, mesh=mesh)
     summary = _initial_run_summary(args, info, start_step)
@@ -563,7 +647,8 @@ def run_distributed_training(args):
             info,
             f"process={info['process_index']}/{info['process_count']} "
             f"devices={info['local_device_count']} global_batch={args.global_batch_size} "
-            f"process_batch={dataset.layout.process_batch_size} start_step={start_step}",
+            f"process_batch={dataset.layout.process_batch_size} "
+            f"data_shards={dataset.layout.data_shard_indices} start_step={start_step}",
         )
         for global_step, global_batch in iter_prefetched_global_batches(
             dataset,
@@ -670,8 +755,14 @@ def run_distributed_training(args):
                             "metrics": eval_metrics,
                             "checkpoint": None,
                         }
-                        if args.save_best_checkpoint and args.output_dir is not None:
-                            best_checkpoint = checkpoint_path(args.output_dir, completed_step)
+                        if (
+                            args.save_best_checkpoint
+                            and _checkpoint_root(args) is not None
+                        ):
+                            best_checkpoint = checkpoint_path(
+                                _checkpoint_root(args),
+                                completed_step,
+                            )
                             last_checkpoint = _save_checkpoint(
                                 args,
                                 dist,
@@ -685,6 +776,7 @@ def run_distributed_training(args):
                                     "best_metric_value": float(metric_value),
                                 },
                             )
+                            last_checkpoint_step = completed_step
                             checkpoint_saved_this_step = True
                             if last_checkpoint is not None:
                                 best_eval["checkpoint"] = last_checkpoint
@@ -693,7 +785,7 @@ def run_distributed_training(args):
                         _write_best_eval(args, info, best_eval)
 
             if (
-                args.output_dir is not None
+                _checkpoint_root(args) is not None
                 and args.save_every > 0
                 and completed_step % args.save_every == 0
                 and not checkpoint_saved_this_step
@@ -706,6 +798,7 @@ def run_distributed_training(args):
                     info,
                     protected_paths=_protected_checkpoint_paths(summary),
                 )
+                last_checkpoint_step = completed_step
                 if last_checkpoint is not None:
                     summary["latest_checkpoint"] = last_checkpoint
                     if (
@@ -723,10 +816,9 @@ def run_distributed_training(args):
             if should_write_summary:
                 _write_run_summary(args, info, summary)
 
-        if args.output_dir is not None:
+        if _checkpoint_root(args) is not None:
             final_step = int(dist.train_state.step)
-            final_path = checkpoint_path(args.output_dir, final_step)
-            if last_checkpoint != final_path:
+            if last_checkpoint_step != final_step:
                 last_checkpoint = _save_checkpoint(
                     args,
                     dist,
@@ -735,6 +827,7 @@ def run_distributed_training(args):
                     info,
                     protected_paths=_protected_checkpoint_paths(summary),
                 )
+                last_checkpoint_step = final_step
                 if last_checkpoint is not None:
                     summary["latest_checkpoint"] = last_checkpoint
                     if (

@@ -7,6 +7,7 @@ import json
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from ..api import create_train_runtime, tiny_config
@@ -16,6 +17,7 @@ from ..distributed import (
     initialize_jax_distributed,
     make_mesh,
     place_train_objects,
+    process_data_shard_indices,
     runtime_version_manifest,
     train_global_batch_data_parallel,
 )
@@ -144,16 +146,35 @@ def run_audit(args):
         axis_name="data",
         param_axis_name="model",
     )
-    ids = jnp.arange(
+    ids = np.arange(
         data_axis_size * args.ctx_len,
-        dtype=jnp.int32,
+        dtype=np.int32,
     ).reshape(data_axis_size, args.ctx_len) % args.vocab_size
     batch_sharding = sharding.named("data", None)
-    input_ids = jax.device_put(ids, batch_sharding)
+    data_shard_indices = process_data_shard_indices(mesh)
+    local_ids = np.concatenate(
+        [ids[index : index + 1] for index in data_shard_indices],
+        axis=0,
+    )
+    input_ids = jax.make_array_from_process_local_data(
+        batch_sharding,
+        local_ids,
+        global_shape=ids.shape,
+    )
+    target_ids = jax.make_array_from_process_local_data(
+        batch_sharding,
+        (local_ids + 1) % args.vocab_size,
+        global_shape=ids.shape,
+    )
+    mask = jax.make_array_from_process_local_data(
+        batch_sharding,
+        np.ones_like(local_ids, dtype=np.float32),
+        global_shape=ids.shape,
+    )
     batch = {
         "input_ids": input_ids,
-        "target_ids": jax.device_put((ids + 1) % args.vocab_size, batch_sharding),
-        "mask": jax.device_put(jnp.ones_like(ids, dtype=jnp.float32), batch_sharding),
+        "target_ids": target_ids,
+        "mask": mask,
     }
 
     graphdef, model_state = nnx.split(dist.train_state.model)
@@ -219,6 +240,7 @@ def run_audit(args):
             "axis_names": list(mesh.axis_names),
             "shape": dict(mesh.shape),
             "axis_types": [str(axis_type) for axis_type in mesh.axis_types],
+            "process_data_shards": list(data_shard_indices),
         },
         "forward": {
             "finite": bool(jnp.all(jnp.isfinite(logits))),
@@ -241,7 +263,9 @@ def run_audit(args):
 
 
 def main(argv=None):
-    print(json.dumps(run_audit(parse_args(argv)), indent=2, sort_keys=True))
+    result = run_audit(parse_args(argv))
+    if jax.process_index() == 0:
+        print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

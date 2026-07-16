@@ -11,9 +11,13 @@ from rwkv7m import (
     tiny_config,
 )
 from rwkv7m.cli import train_binidx_distributed as distributed_cli
-from rwkv7m.cli.train_binidx_distributed import parse_args, run_distributed_training
+from rwkv7m.cli.train_binidx_distributed import (
+    _validate_distributed_checkpoint_policy,
+    parse_args,
+    run_distributed_training,
+)
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
-from rwkv7m.distributed import load_distributed_checkpoint_metadata
+from rwkv7m.distributed import checkpoint_path, load_distributed_checkpoint_metadata
 
 
 def write_dp_train_data(tmp_path):
@@ -51,6 +55,40 @@ def test_distributed_cli_can_disable_and_restore_python_gc(monkeypatch):
     finally:
         if not was_enabled:
             gc.disable()
+
+
+def test_multi_process_output_requires_orbax_checkpointing():
+    args = parse_args(
+        [
+            "--data-file",
+            "unused",
+            "--ctx-len",
+            "4",
+            "--output-dir",
+            "unused-output",
+        ]
+    )
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "requires --checkpoint-backend orbax",
+    ):
+        _validate_distributed_checkpoint_policy(
+            args,
+            {"process_count": 2},
+        )
+
+    args.checkpoint_backend = "orbax"
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "explicit --checkpoint-dir",
+    ):
+        _validate_distributed_checkpoint_policy(args, {"process_count": 2})
+
+    args.checkpoint_dir = "gs://rwkv7m-test/checkpoints"
+    _validate_distributed_checkpoint_policy(args, {"process_count": 2})
+    assert str(checkpoint_path(args.checkpoint_dir, 3)) == (
+        "gs://rwkv7m-test/checkpoints/ckpt-00000003"
+    )
 
 
 def test_distributed_binidx_training_cli_runs_one_step(tmp_path):

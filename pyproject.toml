@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "etils[epath]>=1.14,<2",
     "flax>=0.12.7,<0.13",
     "jax>=0.10.0,<0.11",
     "numpy>=2.2,<2.4",
@@ -18,7 +19,10 @@ dependencies = [
 cuda12 = ["jax[cuda12]>=0.10.0,<0.11"]
 cuda13 = ["jax[cuda13]>=0.10.0,<0.11"]
 rocm = ["jax[rocm7-local]>=0.10.0,<0.11"]
-tpu = ["jax[tpu]>=0.10.0,<0.11"]
+tpu = [
+    "gcsfs>=2026.4,<2027",
+    "jax[tpu]>=0.10.0,<0.11",
+]
 
 [project.scripts]
 rwkv7m-train-binidx = "rwkv7m.cli.train_binidx:main"

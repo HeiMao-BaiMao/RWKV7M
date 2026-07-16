@@ -1,15 +1,17 @@
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import shutil
 
+from etils import epath
 from flax import nnx, serialization
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 
 from ..io import (
     load_train_checkpoint,
-    load_train_checkpoint_metadata,
     load_train_runtime_state,
     save_train_checkpoint,
 )
@@ -31,12 +33,29 @@ class DistributedCheckpointPayload:
     dataset_position: dict | None
 
 
+def _as_checkpoint_path(path):
+    text = os.fspath(path)
+    if "://" in text:
+        return epath.Path(text)
+    return Path(text)
+
+
+def _orbax_path(path):
+    path = _as_checkpoint_path(path)
+    return path if "://" in str(path) else path.resolve()
+
+
+def _canonical_checkpoint_path(path):
+    path = _as_checkpoint_path(path)
+    return str(path) if "://" in str(path) else str(path.resolve())
+
+
 def checkpoint_path(output_dir, step):
-    return Path(output_dir) / f"ckpt-{int(step):08d}"
+    return _as_checkpoint_path(output_dir) / f"ckpt-{int(step):08d}"
 
 
 def list_checkpoint_dirs(output_dir):
-    output_dir = Path(output_dir)
+    output_dir = _as_checkpoint_path(output_dir)
     if not output_dir.exists():
         return []
     checkpoints = []
@@ -52,7 +71,7 @@ def list_checkpoint_dirs(output_dir):
 
 
 def load_distributed_checkpoint_metadata(checkpoint_dir):
-    config, payload = load_train_checkpoint_metadata(checkpoint_dir)
+    config, payload = load_distributed_checkpoint_raw_metadata(checkpoint_dir)
     return DistributedCheckpointPayload(
         config=config,
         metadata=payload,
@@ -62,7 +81,7 @@ def load_distributed_checkpoint_metadata(checkpoint_dir):
 
 
 def restore_distributed_train_state(checkpoint_dir, train_state_template):
-    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir = _as_checkpoint_path(checkpoint_dir)
     config, payload = load_distributed_checkpoint_raw_metadata(checkpoint_dir)
     if payload.get("backend") == "orbax":
         train_state = load_orbax_train_state(checkpoint_dir, train_state_template)
@@ -80,7 +99,7 @@ def restore_distributed_train_state(checkpoint_dir, train_state_template):
 
 
 def restore_distributed_runtime_state(checkpoint_dir, runtime_state_template):
-    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir = _as_checkpoint_path(checkpoint_dir)
     _, payload = load_distributed_checkpoint_raw_metadata(checkpoint_dir)
     if payload.get("backend") == "orbax":
         state_dir = checkpoint_dir / ORBAX_RUNTIME_STATE_DIR
@@ -118,17 +137,17 @@ def _write_checkpoint_metadata(
         "dataset_position": dataset_position,
         "metadata": {} if metadata is None else metadata,
     }
-    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir = _as_checkpoint_path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    with open(checkpoint_dir / CHECKPOINT_JSON, "w", encoding="utf-8") as f:
+    with (checkpoint_dir / CHECKPOINT_JSON).open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
     return payload
 
 
 def load_distributed_checkpoint_raw_metadata(checkpoint_dir):
-    checkpoint_dir = Path(checkpoint_dir)
-    with open(checkpoint_dir / CHECKPOINT_JSON, "r", encoding="utf-8") as f:
+    checkpoint_dir = _as_checkpoint_path(checkpoint_dir)
+    with (checkpoint_dir / CHECKPOINT_JSON).open("r", encoding="utf-8") as f:
         payload = json.load(f)
     return model_config_from_dict(payload["config"]), payload
 
@@ -145,10 +164,9 @@ def _require_orbax():
 
 def save_orbax_train_state(checkpoint_dir, train_state, *, force=True):
     ocp = _require_orbax()
-    # Current Orbax/TensorStore versions require an absolute filesystem path.
-    # Keep the public checkpoint path unchanged while normalizing the internal
-    # path passed across the serialization boundary.
-    state_dir = (Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR).resolve()
+    state_dir = _orbax_path(
+        _as_checkpoint_path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR
+    )
     checkpointer = ocp.StandardCheckpointer()
     try:
         target = (
@@ -165,7 +183,9 @@ def save_orbax_train_state(checkpoint_dir, train_state, *, force=True):
 
 def save_orbax_runtime_state(checkpoint_dir, runtime_state, *, force=True):
     ocp = _require_orbax()
-    state_dir = (Path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR).resolve()
+    state_dir = _orbax_path(
+        _as_checkpoint_path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR
+    )
     checkpointer = ocp.StandardCheckpointer()
     try:
         checkpointer.save(state_dir, runtime_state, force=force)
@@ -177,7 +197,9 @@ def save_orbax_runtime_state(checkpoint_dir, runtime_state, *, force=True):
 
 def load_orbax_train_state(checkpoint_dir, train_state_template):
     ocp = _require_orbax()
-    state_dir = (Path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR).resolve()
+    state_dir = _orbax_path(
+        _as_checkpoint_path(checkpoint_dir) / ORBAX_TRAIN_STATE_DIR
+    )
     checkpointer = ocp.StandardCheckpointer()
     try:
         if isinstance(train_state_template, NNXTrainState):
@@ -197,7 +219,9 @@ def load_orbax_train_state(checkpoint_dir, train_state_template):
 
 def load_orbax_runtime_state(checkpoint_dir, runtime_state_template):
     ocp = _require_orbax()
-    state_dir = (Path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR).resolve()
+    state_dir = _orbax_path(
+        _as_checkpoint_path(checkpoint_dir) / ORBAX_RUNTIME_STATE_DIR
+    )
     checkpointer = ocp.StandardCheckpointer()
     try:
         return checkpointer.restore(state_dir, runtime_state_template)
@@ -246,8 +270,10 @@ def save_data_parallel_checkpoint(
                 dataset_position=dataset_position,
                 metadata=checkpoint_metadata,
             )
-            return checkpoint_dir
-        return None
+        multihost_utils.sync_global_devices(
+            f"rwkv7m-checkpoint-metadata-{int(step)}"
+        )
+        return checkpoint_dir if process_info["process_index"] == 0 else None
     if backend != "flax":
         raise ValueError(f"unknown checkpoint backend: {backend}")
     if process_info["process_index"] != 0:
@@ -285,7 +311,7 @@ def rotate_checkpoints(output_dir, keep_last, process_info, *, protected_paths=N
     protected = set()
     if protected_paths is not None:
         protected = {
-            Path(path).resolve()
+            _canonical_checkpoint_path(path)
             for path in protected_paths
             if path is not None
         }
@@ -295,8 +321,11 @@ def rotate_checkpoints(output_dir, keep_last, process_info, *, protected_paths=N
         to_remove = [
             path
             for path in to_remove
-            if path.resolve() not in protected
+            if _canonical_checkpoint_path(path) not in protected
         ]
     for path in to_remove:
-        shutil.rmtree(path)
+        if isinstance(path, Path):
+            shutil.rmtree(path)
+        else:
+            path.rmtree()
     return to_remove
