@@ -141,8 +141,10 @@ contract explicit without inserting a collective inside the time loop. It
 duplicates screening recurrence compute across the model axis, so a later
 hardware profile may justify a more specialized distributed kernel. These new
 forward/backward and sharded paths have passed forward/gradient parity,
-four-device model-sharding, and recurrence-performance gates on TPU v5e. GPU
-screening validation remains architecture-specific and pending.
+four-device model-sharding, and recurrence-performance gates on TPU v5e. The
+Triton path has also passed real L40S lowering, all-output/all-input-gradient
+parity, and the tracked recurrence-performance gate. Mosaic GPU screening
+validation remains pending on Hopper/Blackwell.
 
 ## Performance gate
 
@@ -190,22 +192,26 @@ not accepted as proof of the limiting resource.
 7. **Implemented, opt-in memory path:** token-axis head chunking and
    vocabulary-tiled online cross entropy/L2Wrap with a common analytic VJP and
    separate TPU/GPU Pallas reducers. The TPU speed gate failed, so full XLA
-   logits remain the default. Vocabulary-parallel single-collective fusion and
-   a real GPU performance gate remain pending.
+   logits remain the default. On L40S, tile 16,384 matched full-XLA
+   forward-plus-backward latency at 128 positions while reducing the largest
+   logits tensor by 4x; other tiles were slower. Vocabulary-parallel
+   single-collective fusion and broader GPU shape gates remain pending.
 8. **Implemented foundation:** optional FFI registration and explicit dispatch
    contracts exist; no native FFI implementation is bundled or selected by
    default.
 9. **Partial:** an L40S/Ada measured dispatch record now covers four WKV shapes
    and tracked 0.185B train-step configurations. Hopper/Blackwell and broader
    production-shape records remain pending.
-10. **Implemented; TPU gate passed:** screening dense projections are hoisted
+10. **Implemented; TPU and L40S gates passed:** screening dense projections are hoisted
     out of the time loop; the projected reference, independent backend
     dispatch, separate TPU/GPU persistent forward and reverse-time Pallas
     kernels, FP32 training carry tape, and explicit data/model sharding
     transpose are integrated. TPU v5e passed all-output and all-input-gradient
     parity, four-device model-sharding, a full optimizer step, and the tracked
-    `0.185b` recurrence microbenchmark. Real GPU screening gates remain
-    pending.
+    `0.185b` recurrence microbenchmark. L40S Triton lowering then passed all
+    corresponding parity tests and achieved 16.71x forward and 15.76x
+    forward-plus-backward speedup over the projected reference recurrence.
+    Mosaic GPU validation remains pending.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:
@@ -235,12 +241,18 @@ directly executed upstream fused RWKV-LM-V7 runner. This is a reference
 comparison between different timing boundaries, not a Pallas-versus-CUDA or
 JAX-versus-PyTorch ranking. Schema-v2 fixed-batch compute-only harnesses now
 record WKV forward/backward and full-model forward/backward/optimizer/full-step
-windows separately; no new strict result has been measured yet.
+windows separately. The current single-L40S local side now measures 11,561
+token/s without screening, 9,708 with read-only screening, and 10,365 with
+read/write screening at batch 1 x 512. A matching schema-v2 upstream result is
+still unmeasured, so these do not establish a strict JAX-versus-PyTorch ratio.
 
-This changes the tuning priority for the tested small shape. The canonical
-FFN-2688 read-only screening path reduced time-weighted throughput by 58.7%
-relative to its screening-free core; read/write reduced it by 60.0%. Screening
-fusion and layout work now precede further WKV replacement work on Ada.
+The projected recurrence changes the tuning priority for the tested small
+shape. Its microbenchmark is no longer the bottleneck, but complete-step
+latency remains 19.1% above baseline for read-only screening and 11.5% above
+baseline for read/write in the single current run. Profiling and fusion of the
+remaining projections, gradients, and optimizer work now precede further WKV
+replacement work on Ada. The unexpected read/write advantage is not treated as
+causal until repeated under a profiler.
 
 ## TPU v5e Pallas validation record
 

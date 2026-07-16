@@ -1,10 +1,137 @@
 # NVIDIA L40S Pallas performance validation
 
-> The screening throughput measurements in this report predate the projected
-> Pallas screening recurrence. They remain the baseline for the next hardware
-> gate; no post-change screening result has been measured yet.
+> Results dated 2026-07-14 below are the historical two-L40S baseline. The
+> 2026-07-16 gate used one L40S only and is the current result for projected
+> Pallas screening, the tiled training head, and fixed-batch train compute.
 
 ## Summary
+
+On 2026-07-16, the latest single-L40S path passed real Triton lowering and
+gradient parity for WKV, projected state-level screening, and the tiled
+training head. At the tracked `T=128, B=1` shapes, Pallas screening was 16.71x
+faster in forward and 15.76x faster in forward plus backward than its projected
+`lax.scan` reference. WKV was 8.04x and 14.92x faster, respectively.
+
+The schema-v2, fixed-device-batch `0.185b` train-compute gate measured 11,561
+token/s without screening, 9,708 token/s with read-only screening, and 10,365
+token/s with read/write screening. These correspond to 19.1% and 11.5% higher
+median complete-step latency than the no-screening core. The read/write result
+being faster than read-only is an observed single-run compiler outcome, not
+evidence that writes are intrinsically free or beneficial; a repeated profile
+is required before attributing that difference.
+
+This materially replaces the pre-projected result in which screening cost
+roughly 2.4-2.5x throughput. The recurrence itself is no longer the dominant
+GPU defect. The remaining full-step cost includes screening projections,
+gradient work, and extra optimizer parameters, and has not yet been isolated
+with a kernel timeline.
+
+## Current single-L40S gate (2026-07-16)
+
+| Item | Value |
+| --- | --- |
+| Host | disposable external server; no GCP GPU resources used |
+| GPU | 1 x NVIDIA L40S, 46,068 MiB, 350 W limit |
+| Driver | 580.159.03 |
+| Stack | Python 3.13.14, JAX/jaxlib 0.10.0, CUDA 12 plugin |
+| Source base | `33e5594`; the GPU screening lowering fix is committed with this report |
+| Dataset | deterministic 4,194,304-token synthetic binidx |
+| Fixed batch | batch 1 x 512 tokens, SHA-256 `e2ca3f794addd9202928689e675f6cd2f473e50107603369dc808bdd7f09fac9` |
+
+The real accelerator suite ran with `interpret=False`:
+
+```bash
+uv run pytest -q \
+  tests/test_wkv_pallas_accelerator.py \
+  tests/test_screening_pallas_accelerator.py \
+  tests/test_training_head_pallas_accelerator.py
+```
+
+All four tests passed. This includes WKV forward/state and gradient parity,
+screening parity for all six outputs and all 15 differentiable inputs, the
+tiled-head custom VJP, and NNX model integration.
+
+The first screening compile exposed two Triton-only defects that interpret
+mode did not reveal. Triton could not lower an eight-value `jnp.stack`, and
+Pallas GPU stores require the value dtype to match the destination `Ref`
+exactly. The GPU kernel now stores each statistic scalar directly and casts
+FP32 internal results only at typed output boundaries. FP32 recurrence math is
+unchanged.
+
+### Projected screening recurrence
+
+Inputs were fixed and device-resident, compilation was excluded, CPython
+cyclic GC was disabled, and every one of 50 calls after 5 warmups was
+synchronized.
+
+| Shape | Pallas forward | Reference forward | Speedup | Pallas fwd+bwd | Reference fwd+bwd | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `T=128, B=1, slots=16, slot=128, key=value=64` | 0.247 ms | 4.127 ms | 16.71x | 0.620 ms | 9.773 ms | 15.76x |
+
+Maximum output absolute error was `4.77e-7`. All gradients passed the
+accelerator test tolerance; the largest absolute difference was `4.88e-4` for
+the initial read keys, and the largest relative L2 difference was `0.00215`
+for delta values.
+
+### WKV recurrence rerun
+
+The same method used 100 timed calls at `T=128, B=1, H=12, N=64`:
+
+| Path | Forward | Forward + backward |
+| --- | ---: | ---: |
+| Triton Pallas | 0.202 ms | 0.518 ms |
+| `lax.scan` reference | 1.623 ms | 7.728 ms |
+| Speedup | 8.04x | 14.92x |
+
+Activation and final-state maximum absolute errors were `1.19e-7` and
+`4.66e-10`. All seven tested gradients passed tolerance.
+
+### Tiled training-head gate
+
+This gate used 128 positions, hidden size 768, vocabulary 65,536, BF16, 5
+warmups, and 50 timed calls. Ratios are `full-XLA / tiled-Pallas`; values below
+1.0 mean that tiling is slower. The untiled BF16 logits tensor is 16 MiB.
+
+| Vocabulary tile | Largest tiled logits | Forward ratio | Forward + backward ratio |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 1 MiB | 0.817x | 0.751x |
+| 8,192 | 2 MiB | 0.888x | 0.847x |
+| 16,384 | 4 MiB | 0.905x | 1.011x |
+| 32,768 | 8 MiB | 0.588x | 0.771x |
+| 65,536 | 16 MiB | 0.361x | 0.641x |
+
+All component errors were zero; maximum gradient error was `1.91e-6`. Tile
+16,384 is the only tested size that matched untiled forward-plus-backward
+latency while reducing the largest logits tensor by 4x. Tiling remains an
+opt-in memory path because forward alone was still 9.5% slower and the result
+does not establish a speed advantage across larger head chunks.
+
+### Fixed-batch complete train compute
+
+These runs used the same fixed device-resident batch, `0.185b`, no
+rematerialization, no recurrent chunking, a 512-token head chunk, vocabulary
+tile 16,384, 5 warmups, 20 timed calls, disabled cyclic GC, and synchronization
+after every call. Dataset sampling, host transfer, compilation, checkpointing,
+logging, and host metrics are excluded.
+
+| Variant | Parameters | Forward | Backward | Optimizer | Complete step | Median token/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| No screening | 183,956,736 | 6.688 ms | 34.379 ms | 16.695 ms | 44.286 ms | 11,561 |
+| Read-only screening | 184,878,725 | 7.278 ms | 38.184 ms | 17.005 ms | 52.741 ms | 9,708 |
+| Read/write screening | 184,985,222 | 7.331 ms | 36.647 ms | 16.691 ms | 49.397 ms | 10,365 |
+
+The separately timed phases are diagnostic windows and do not add to the
+complete-step time because the complete step is compiled and measured without
+intermediate barriers. One CUDA autotuning warning reported a delay-kernel
+timeout during compilation for each screening variant; compilation was outside
+the timing window, but an Nsight repeat is still needed before attributing the
+read-only/read-write difference.
+
+Only one GPU was used for this current gate. Two-GPU reruns were explicitly
+out of scope for budget reasons; the older two-GPU section remains historical
+evidence only.
+
+## Historical 2026-07-14 validation
 
 On 2026-07-14, the production Triton-Pallas WKV path was validated on a
 disposable two-GPU L40S host. The real-GPU forward and gradient parity gate
@@ -22,13 +149,11 @@ that two different complete training stacks reached similar throughput on the
 same L40S. Their 1.105 ratio is a reference comparison, not evidence that the
 Pallas WKV kernel or the JAX stack is 1.105x faster.
 
-The most important remaining result is negative: state-level screening now
-dominates this small model's GPU cost. Against the canonical FFN-2688
-screening-free core, read-only screening reduced time-weighted throughput by
-58.7%, and read/write screening reduced it by 60.0%. The write phase accounted
-for only another 3.3% relative to read-only screening.
+At that revision, state-level screening dominated this small model's GPU cost.
+Those values predate the projected Pallas screening recurrence and must not be
+used as the current screening result.
 
-## Environment and revisions
+## Historical environment and revisions
 
 | Item | Value |
 | --- | --- |
@@ -201,7 +326,9 @@ Use local `pallas_training_forward`, rather than the tape-free
 combined windows expose gradients only for the six vector inputs on both
 sides; the local zero initial state is fixed rather than a timed gradient
 argument.
-No result from these new harnesses has been measured yet.
+The 2026-07-16 local results above now satisfy the schema-v2 fixed-batch side of
+this method. A matching upstream schema-v2 result has not been measured, so a
+strict local-versus-official ratio is still unavailable.
 
 The direct Pallas-versus-reference model comparison used identical local
 configuration and data. With the tracked `0.185b` rematerialization and
@@ -232,7 +359,7 @@ run had no sample below 5,000 token/s and produced the 9,413 token/s result in
 the table. The default remains unchanged because a 200-step test does not prove
 that every long-running configuration is free of cyclic heap growth.
 
-## Screening result
+## Historical pre-projected screening result
 
 The canonical FFN-2688 comparison isolates the state-level-screening feature:
 
@@ -242,12 +369,11 @@ The canonical FFN-2688 comparison isolates the state-level-screening feature:
 | Read-only screening | 3,875 | -58.7% |
 | Read/write screening | 3,747 | -60.0% |
 
-The write phase adds 3.3% overhead relative to the read-only mechanism. The
-read/search path is therefore the primary remaining compute target. This
-reverses the old pre-Pallas diagnosis: once WKV is persistent, screening is no
-longer a secondary 10% effect. Its validation or sample-efficiency benefit must
-justify a roughly 2.4-2.5x throughput cost in this batch-1 L40S profile, or its
-implementation needs fusion and layout work.
+The write phase added 3.3% overhead relative to the read-only mechanism in
+this old implementation. The current projected-Pallas gate supersedes these
+throughput values: the corresponding complete-step latency overhead is now
+19.1% for read-only and 11.5% for read/write in one schema-v2 run. The old
+result remains useful only as the optimization baseline.
 
 ## Two-GPU behavior
 
@@ -318,8 +444,8 @@ The evidence supports the following current decisions:
   the directly executed fused upstream runner; strict compute-only ranking is
   still unmeasured;
 - keep FFI as an explicit registration boundary, not an automatic path;
-- tune or fuse state-level screening before spending effort on another WKV
-  implementation for this shape;
+- profile and fuse the remaining screening projections/gradient work before
+  spending effort on another WKV implementation for this shape;
 - use one L40S for the `0.185b` throughput profile on this `SYS` host, and use
   two-way sharding only when capacity requires it;
 - repeat complete train-step measurement on the current TPU commit before

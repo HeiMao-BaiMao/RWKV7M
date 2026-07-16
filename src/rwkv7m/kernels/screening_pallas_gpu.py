@@ -52,19 +52,30 @@ def _load_state_vector(ref):
 
 
 def _store_time_vector(ref, index, value):
-    ref[pl.dslice(index, 1), :, :] = value[None, None, :]
+    ref[pl.dslice(index, 1), :, :] = value.astype(ref.dtype)[None, None, :]
 
 
 def _store_time_matrix(ref, index, value):
-    ref[pl.dslice(index, 1), :, :, :] = value[None, None, :, :]
+    ref[pl.dslice(index, 1), :, :, :] = value.astype(ref.dtype)[
+        None, None, :, :
+    ]
+
+
+def _store_time_scalars(ref, index, values):
+    for value_index, value in enumerate(values):
+        ref[
+            pl.dslice(index, 1),
+            :,
+            pl.dslice(value_index, 1),
+        ] = jnp.reshape(value, (1, 1, 1)).astype(ref.dtype)
 
 
 def _store_state_matrix(ref, value):
-    ref[:] = value[None, :, :]
+    ref[:] = value.astype(ref.dtype)[None, :, :]
 
 
 def _store_state_vector(ref, value):
-    ref[:] = value[None, :]
+    ref[:] = value.astype(ref.dtype)[None, :]
 
 
 def _unit_norm(value, eps):
@@ -166,17 +177,15 @@ def _screening_step(
     next_usage = usage_ema_decay * usage + (
         1.0 - usage_ema_decay
     ) * activity
-    statistics = jnp.stack(
-        (
-            jnp.mean(read_relevance),
-            jnp.max(read_relevance),
-            jnp.sum(read_relevance > 1e-3).astype(jnp.float32),
-            jnp.sqrt(jnp.sum(z * z)),
-            jnp.sqrt(jnp.sum(u * u)),
-            jnp.mean(write_relevance),
-            jnp.mean(effective_write_relevance),
-            jnp.mean(next_usage),
-        )
+    statistics = (
+        jnp.mean(read_relevance),
+        jnp.max(read_relevance),
+        jnp.sum(read_relevance > 1e-3).astype(jnp.float32),
+        jnp.sqrt(jnp.sum(z * z)),
+        jnp.sqrt(jnp.sum(u * u)),
+        jnp.mean(write_relevance),
+        jnp.mean(effective_write_relevance),
+        jnp.mean(next_usage),
     )
     next_carry = (
         next_slots,
@@ -321,20 +330,18 @@ def _screening_gpu_forward_kernel(
         next_usage = usage_ema_decay * usage_t + (
             1.0 - usage_ema_decay
         ) * activity
-        statistics = jnp.stack(
-            (
-                jnp.mean(read_relevance),
-                jnp.max(read_relevance),
-                jnp.sum(read_relevance > 1e-3).astype(jnp.float32),
-                jnp.sqrt(jnp.sum(z * z)),
-                jnp.sqrt(jnp.sum(u * u)),
-                jnp.mean(write_relevance),
-                jnp.mean(effective_write_relevance),
-                jnp.mean(next_usage),
-            )
+        statistics = (
+            jnp.mean(read_relevance),
+            jnp.max(read_relevance),
+            jnp.sum(read_relevance > 1e-3).astype(jnp.float32),
+            jnp.sqrt(jnp.sum(z * z)),
+            jnp.sqrt(jnp.sum(u * u)),
+            jnp.mean(write_relevance),
+            jnp.mean(effective_write_relevance),
+            jnp.mean(next_usage),
         )
         _store_time_vector(u_ref, t, u.astype(output_dtype))
-        _store_time_vector(statistics_ref, t, statistics)
+        _store_time_scalars(statistics_ref, t, statistics)
         _store_time_vector(update_squared_ref, t, update_squared)
         return (
             next_slots,
@@ -417,7 +424,7 @@ def _screening_gpu_training_forward_kernel(
             **step_config,
         )
         _store_time_vector(u_ref, t, u.astype(output_dtype))
-        _store_time_vector(statistics_ref, t, statistics)
+        _store_time_scalars(statistics_ref, t, statistics)
         _store_time_vector(update_squared_ref, t, update_squared)
         return next_carry
 
