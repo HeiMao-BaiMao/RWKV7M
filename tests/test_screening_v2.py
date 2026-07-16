@@ -5,8 +5,9 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
+from rwkv7m.distributed.mesh import make_mesh
 from rwkv7m.io import model_config_from_dict, model_config_to_dict
-from rwkv7m.model.nnx_model import NNXStateLevelScreening
+from rwkv7m.model.nnx_model import NNXShardingConfig, NNXStateLevelScreening
 from rwkv7m.model.screened_rwkv import ModelConfig
 from rwkv7m.model.screening import (
     ScreeningConfig,
@@ -275,6 +276,40 @@ def test_screening_v2_sequence_chunks_preserve_semantics():
     assert jnp.allclose(full_state.slots, second_state.slots)
     assert jnp.allclose(full_state.ages, second_state.ages)
     assert jnp.allclose(full_state.usage_ema, second_state.usage_ema)
+
+
+def test_factorized_candidate_respects_explicit_data_model_mesh():
+    mesh = make_mesh(
+        ("data", "model"),
+        axis_sizes=(1, 1),
+        axis_types=(
+            jax.sharding.AxisType.Explicit,
+            jax.sharding.AxisType.Explicit,
+        ),
+    )
+    sharding = NNXShardingConfig(mesh)
+    module = NNXStateLevelScreening(
+        _v2_config(checkpoint_interval=None),
+        rngs=nnx.Rngs(0),
+        sharding=sharding,
+    )
+    hidden_sharding = sharding.named("data", None, "model")
+    scalar_sharding = sharding.named("data", None)
+    x = jax.device_put(jnp.ones((1, 2, 32)), hidden_sharding)
+    state = LayerScreenState(
+        slots=jax.device_put(jnp.zeros((1, 4, 16)), hidden_sharding),
+        ages=jax.device_put(jnp.zeros((1, 4)), scalar_sharding),
+        usage_ema=jax.device_put(jnp.zeros((1, 4)), scalar_sharding),
+    )
+    output, _, _ = module(
+        x,
+        x,
+        state,
+        phase="read_write",
+        deterministic=False,
+    )
+    jax.block_until_ready(output)
+    assert output.sharding.spec == hidden_sharding.spec
 
 
 @pytest.mark.parametrize("backend", ["pallas_gpu_triton", "pallas_tpu"])

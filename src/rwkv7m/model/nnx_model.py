@@ -1183,7 +1183,16 @@ class NNXStateLevelScreening(nnx.Module):
                 [x_ln_seq, h_base_seq.astype(self.compute_dtype)], axis=-1
             )
             context_latent = self.delta_context_proj(route_context)
-            slot_latent = self.delta_slot_proj(_value(self.slot_embed))
+            slot_out_sharding = None
+            if self.sharding is not None and self.sharding.uses_explicit_axes:
+                # ``slot_embed`` has no leading batch/data dimension. Override
+                # the parallel Linear default so the replicated slot/latent
+                # axes are not mistaken for ``P(data, None)``.
+                slot_out_sharding = self.sharding.named(None, None)
+            slot_latent = self.delta_slot_proj(
+                _value(self.slot_embed),
+                out_sharding=slot_out_sharding,
+            )
             latent = jax.nn.silu(
                 context_latent[..., None, :] + slot_latent[None, None, :, :]
             )
