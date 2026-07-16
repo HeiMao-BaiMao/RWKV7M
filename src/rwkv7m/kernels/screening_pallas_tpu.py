@@ -114,41 +114,66 @@ def _screening_step(
     value_size = values.shape[-1]
     key_tile_size = key_size // n_read_tiles
     value_tile_size = value_size // n_read_tiles
-    read_keys_tiled = read_keys.reshape(
-        n_slots, n_read_tiles, key_tile_size
-    )
-    values_tiled = values.reshape(
-        n_slots, n_read_tiles, value_tile_size
-    )
-    q_read_tiled = q_read_1d.reshape(n_read_tiles, key_tile_size)
-    normalized_read_keys = _unit_norm(read_keys_tiled, eps)
-    normalized_values = values_tiled
-    if use_value_unit_norm:
-        normalized_values = _unit_norm(values_tiled, eps)
-    read_similarity = jnp.sum(
-        normalized_read_keys * q_read_tiled[None, :, :], axis=-1
-    ).T
-    tau_read_tiled = tau_read.reshape(n_read_tiles, 1)
-    if use_leaky_warmup:
-        hard = _trim_square(read_similarity, tau_read_tiled, eps)
-        soft = jax.nn.sigmoid(
-            leaky_gamma * (read_similarity - tau_read_tiled)
-        )
-        read_relevance = (1.0 - leaky_alpha) * hard + leaky_alpha * soft
-    else:
-        read_relevance = _trim_square(
-            read_similarity, tau_read_tiled, eps
-        )
+    # Mosaic TPU cannot lower the otherwise natural
+    # ``[1, feature] -> [tiles, feature / tiles]`` shape cast while preserving
+    # its vector layout. Keep every tile rank-two and use static slices instead.
+    age_gate = jnp.ones_like(ages_1d)
     if use_age_mask:
         age_scores = (age_ref - ages_1d) / (age_sigma + eps)
-        read_relevance *= jax.nn.sigmoid(age_scores)[None, :]
-    z_tiled = jnp.sum(
-        read_relevance.T[:, :, None] * normalized_values, axis=0
-    )
-    u_tiled = _tanh_norm(z_tiled, tanh_norm_cap, eps)
-    z = z_tiled.reshape(1, value_size)
-    u = u_tiled.reshape(1, value_size)
-    read_activity = jnp.max(read_relevance, axis=0)
+        age_gate = jax.nn.sigmoid(age_scores)
+    read_activity = jnp.zeros_like(ages_1d)
+    read_relevance_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    read_relevance_max = jnp.asarray(0.0, dtype=jnp.float32)
+    z_tiles = []
+    u_tiles = []
+    for tile in range(n_read_tiles):
+        key_start = tile * key_tile_size
+        key_limit = key_start + key_tile_size
+        value_start = tile * value_tile_size
+        value_limit = value_start + value_tile_size
+        read_keys_tile = jax.lax.slice_in_dim(
+            read_keys, key_start, key_limit, axis=1
+        )
+        values_tile = jax.lax.slice_in_dim(
+            values, value_start, value_limit, axis=1
+        )
+        q_read_tile = jax.lax.slice_in_dim(
+            q_read_1d, key_start, key_limit, axis=0
+        )
+        normalized_read_keys = _unit_norm(read_keys_tile, eps)
+        normalized_values = values_tile
+        if use_value_unit_norm:
+            normalized_values = _unit_norm(values_tile, eps)
+        read_similarity = jnp.sum(
+            normalized_read_keys * q_read_tile[None, :], axis=-1
+        )
+        tau_read_tile = tau_read[tile]
+        if use_leaky_warmup:
+            hard = _trim_square(read_similarity, tau_read_tile, eps)
+            soft = jax.nn.sigmoid(
+                leaky_gamma * (read_similarity - tau_read_tile)
+            )
+            read_relevance_tile = (
+                (1.0 - leaky_alpha) * hard + leaky_alpha * soft
+            )
+        else:
+            read_relevance_tile = _trim_square(
+                read_similarity, tau_read_tile, eps
+            )
+        read_relevance_tile *= age_gate
+        z_tile = jnp.sum(
+            read_relevance_tile[:, None] * normalized_values, axis=0
+        )
+        u_tile = _tanh_norm(z_tile, tanh_norm_cap, eps)
+        z_tiles.append(z_tile)
+        u_tiles.append(u_tile)
+        read_activity = jnp.maximum(read_activity, read_relevance_tile)
+        read_relevance_sum += jnp.sum(read_relevance_tile)
+        read_relevance_max = jnp.maximum(
+            read_relevance_max, jnp.max(read_relevance_tile)
+        )
+    z = jnp.concatenate(tuple(z_tiles), axis=0)[None, :]
+    u = jnp.concatenate(tuple(u_tiles), axis=0)[None, :]
 
     resolved_mode = write_mode
     if resolved_mode is None:
@@ -255,8 +280,8 @@ def _screening_step(
     eviction_usage = jnp.sum(novel_route * usage_1d) / (novel_mass + eps)
     is_competitive = resolved_mode == "competitive_novel"
     statistic_scalars = (
-        jnp.mean(read_relevance),
-        jnp.max(read_relevance),
+        read_relevance_sum / (n_read_tiles * n_slots),
+        read_relevance_max,
         jnp.sum(read_activity > 1e-3).astype(jnp.float32),
         jnp.sqrt(jnp.sum(z * z)),
         jnp.sqrt(jnp.sum(u * u)),
