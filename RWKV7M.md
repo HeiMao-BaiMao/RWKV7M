@@ -7,9 +7,13 @@ RWKV-7 style recurrent language models plus optional state-level screening
 memory. The former Linen implementation is retained as a numerical and
 upstream-conversion reference rather than the training source of truth.
 
-The implementation follows the research design in `RWKV7M.paper.md`, but this document is the concrete engineering contract for the current repository.
-The approved, not-yet-implemented Screening revision is specified separately in
-`docs/state_level_screening_v2_design.md`.
+`RWKV7M.paper.md` is the broader research design, while this document is the
+concrete engineering contract for the current repository. The implemented
+Screening v2 revision is specified separately in
+`docs/state_level_screening_v2_design.md`; it maps to the paper's
+`screening-v4-legacy` and `screening-v4-competitive` predecessor semantics.
+The paper's `screening-v5-core` and `screening-v5-retention` profiles are
+design-only and are not current implementation behavior.
 
 ## 2. Current Status
 
@@ -299,6 +303,10 @@ That consistency is a required invariant across sequence chunks.
 
 ## 9. Screening Math
 
+The equations in this section describe the implemented v4 predecessor. They
+do not include the v5 paper's explicit occupancy, capacity-calibrated safe
+threshold, ambiguity penalty, or post-aggregation vector-norm bound.
+
 Unit norm:
 
 ```python
@@ -350,6 +358,10 @@ To keep from-scratch `read_write` training alive, write keys use `slots + slot_e
 Initialization creates write branch parameters whenever `cfg.use_write_screening=True`, even if variables are initialized through `read_screening_only`. This allows later `read_write` apply calls without missing parameters.
 
 ### 10.1 Implemented Opt-In Screening v2 Contract
+
+In the paper's semantics vocabulary, the legacy modes below belong to
+`screening-v4-legacy`, and `competitive_novel` belongs to
+`screening-v4-competitive`. There is no implemented v5 semantics selector.
 
 The implementation provides four explicit write modes:
 

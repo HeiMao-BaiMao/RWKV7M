@@ -77,6 +77,13 @@ RWKV7M には `read_screening_only` と `read_write` の2つの主要phaseがあ
 
 `read_write` では、`use_write_screening=True` の場合に write専用の query/key branch が有効になります。write branch は、どのslotをどれだけ更新するかを別途screeningします。`write_rel_floor` は初期slotがゼロに近い場合の互換用設定で、学術比較では `0` を指定して完全なwrite棄却を評価できます。bank更新率は従来の `mu_*_max` に加え、`--short-half-life-tokens` / `--mid-half-life-tokens` / `--long-half-life-tokens` でtoken半減期として明示できます。
 
+版の対応には注意が必要です。実装済みのScreening v2は、
+[`RWKV7M.paper.md`](RWKV7M.paper.md) v5でいう`screening-v4-legacy`および
+`screening-v4-competitive` predecessorに対応します。論文の
+`screening-v5-core`と`screening-v5-retention`は設計仕様であり、現行実装の
+機能として扱いません。実装済み挙動の契約は
+[`docs/state_level_screening_v2_design.md`](docs/state_level_screening_v2_design.md)です。
+
 ### 5. Parameter 増加との分離
 
 screening module は追加parameterを持つため、単に「RWKV7M が RWKV-7 baseline より loss が低い」だけでは、機構の有効性を示したことになりません。parameter数が増えただけで改善した可能性が残るためです。
@@ -797,6 +804,7 @@ from rwkv7m import (
 - RWKV-LM-V7 互換 `.bin/.idx` dataset reader と sampler。
 - reference RWKV state の chunked inference state carry。
 - `read_screening_only` / `read_write` phase を持つ state-level screening。
+- opt-inのScreening v2（論文上の`screening-v4-legacy` / `screening-v4-competitive` predecessor）。
 - lane wrap reset 付きの sequential carry-state binidx training / validation。
 - RWKV tokenizer API と JSONL-to-binidx 変換。
 - wheel に同梱される RWKV tokenizer vocabulary fallback。
@@ -811,6 +819,7 @@ from rwkv7m import (
 
 未対応:
 
+- 論文の`screening-v5-core` / `screening-v5-retention`意味論。
 - production fused RWKV kernels。
 - pretrained RWKV checkpoint conversion。
 - repository 内 PyTorch/non-JAX runtime backend（意図的に対象外）。

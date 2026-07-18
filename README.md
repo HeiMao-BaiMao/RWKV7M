@@ -239,16 +239,21 @@ select `reference`, `pallas_tpu`, `pallas_gpu_mosaic`, or
 `pallas_gpu_triton`. Training uses backend-specific reverse-time Pallas kernels
 with an FP32 carry tape. Model sharding gathers the slot feature once at the
 recurrence boundary, averages replicated outputs for a single logical
-transpose contribution, and slices final slots back to their owners. These new
-screening paths have real-TPU forward, gradient, four-device model-sharding,
-optimizer-step, and recurrence-performance validation. The Triton path also
-has real L40S forward, all-input-gradient, and recurrence-performance
-validation. Mosaic GPU still requires Hopper/Blackwell validation.
+transpose contribution, and slices final slots back to their owners. This
+screening boundary has real-TPU forward, gradient, four-device model-sharding,
+optimizer-step, and recurrence-performance validation for the corrected
+competitive predecessor semantics. The Triton kernel body has real L40S
+forward, all-input-gradient, and recurrence-performance validation only for
+the earlier projected recurrence; corrected competitive routing still needs a
+new real-GPU gate. Mosaic GPU also requires Hopper/Blackwell validation.
 
 The Screening v2 revision is implemented behind explicit opt-in settings in the
-[State-Level Screening v2 engineering contract](docs/state_level_screening_v2_design.md)
-and the updated [research paper](RWKV7M.paper.md). It adds value-space gating,
-a factorized candidate, confidence-preserving competitive writes,
+[State-Level Screening v2 engineering contract](docs/state_level_screening_v2_design.md).
+The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
+profiles `screening-v4-legacy` and `screening-v4-competitive`; the paper's
+`screening-v5-core` and `screening-v5-retention` profiles are design-only and
+are not implemented. Screening v2 adds value-space gating, a factorized
+candidate, confidence-preserving competitive writes,
 hard-forward/soft-backward novelty and admission with sparse bank-aware novel
 allocation, interval training-tape
 checkpointing, and fixed-total-dimension multi-read tiles. Existing configs
@@ -786,8 +791,9 @@ Not yet included:
   the validated L40S shapes,
 - Hopper/Blackwell Mosaic screening validation and a non-duplicated model-axis
   screening recurrence,
-- the design-locked Screening v2 gate/candidate/routing/checkpointing/multi-read
-  stages,
+- the paper's design-only Screening v5 core and retention semantics, including
+  occupancy, capacity calibration, bounded read aggregation, ambiguity-aware
+  confidence, and erase/write separation,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,

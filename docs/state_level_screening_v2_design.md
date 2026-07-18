@@ -6,15 +6,20 @@ lowering, all-output/all-input-gradient parity, recurrence timing, and a full
 four-way model-axis step at the tracked maximum context. Real GPU v2 and
 multi-host gates remain pending.
 
-Here, "v2" names the second Screening architecture, while the accompanying
-paper is `design-locked-draft-v4`; the two version labels track different
-artifacts.
+Here, "v2" names the second implemented Screening architecture. The
+accompanying paper is now `design-locked-draft-v5`; its
+`screening-v4-legacy` and `screening-v4-competitive` profiles describe the
+predecessor implemented by this contract, while `screening-v5-core` and
+`screening-v5-retention` are design-only profiles. The architecture revision,
+paper draft, and semantics labels therefore track different artifacts.
 
 This document is the implementation contract for State-Level Screening v2.
 The research motivation and evaluation claims live in
-[`RWKV7M.paper.md`](../RWKV7M.paper.md). Existing configurations continue to
-select the legacy projected recurrence. V2 is available only through explicit
-settings; the tracked example is
+[`RWKV7M.paper.md`](../RWKV7M.paper.md). The v5 equations in that paper must not
+be read as current implementation behavior; this document remains the source
+of truth for the implemented v4 predecessor semantics. Existing configurations
+continue to select the legacy projected recurrence. V2 is available only
+through explicit settings; the tracked example is
 [`configs/rwkv7m-0.185b-screening-v2.json.example`](../configs/rwkv7m-0.185b-screening-v2.json.example).
 
 ## Scope and invariants

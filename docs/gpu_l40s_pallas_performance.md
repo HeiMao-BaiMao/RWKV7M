@@ -4,6 +4,12 @@
 > 2026-07-16 gate used one L40S only and is the current result for projected
 > Pallas screening, the tiled training head, and fixed-batch train compute.
 
+The screening measurements here predate the corrected competitive Screening
+v2 path. In the semantics vocabulary of
+[`RWKV7M.paper.md`](../RWKV7M.paper.md) v5, they cover the
+earlier projected legacy recurrence, not `screening-v4-competitive` and not the
+design-only `screening-v5-core` or `screening-v5-retention` profiles.
+
 ## Summary
 
 On 2026-07-16, the latest single-L40S path passed real Triton lowering and
