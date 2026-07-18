@@ -170,11 +170,13 @@ The opt-in recurrence revision is specified in
 [State-Level Screening v2 engineering contract](state_level_screening_v2_design.md).
 It is implemented in the portable reference and in separate GPU/TPU Pallas
 kernel bodies. CPU interpret-mode forward and all-input-gradient parity pass.
-The 2026-07-16 TPU v5e-4 record covers competitive routing, novel allocation,
-value-space gating, checkpointing, and multi-read at commit `6fc9a48`, but it
-predates the hard-forward/soft-backward novelty/admission correction. Current
-L40S records apply to the legacy projected recurrence. Neither record is
-real-hardware evidence for the corrected v2 HEAD.
+Corrected commit `f35f6fc` passed real TPU v5e-4 lowering, six-output/17-input
+gradient parity, recurrence timing, checkpointed `T=512` parity, and full
+0.185B model-axis steps at contexts 128 and 512 on 2026-07-18. Direct
+single-kernel `T=2048` exceeds v5e scoped VMEM, while the production
+128-token-chunk path reaches the configured 512-token maximum. Current L40S
+records apply to the legacy projected recurrence, so real GPU v2 remains
+pending.
 
 The backend boundary remains:
 
@@ -294,16 +296,18 @@ not accepted as proof of the limiting resource.
     range are integrated. CPU interpret parity passes; L40S and Mosaic
     complete-step and profiler records are still required before dispatch
     defaults change.
-12. **Implemented; corrected v2 accelerator refresh pending:** Screening v2 write-mode migration
+12. **Implemented; corrected TPU v5e-4 gate passed:** Screening v2 write-mode migration
     and metrics, value-space gate, factorized candidate, confidence-preserving
     matched routing, hard-forward/soft-backward novelty and admission with sparse bank-aware novel
     allocation, interval training-tape checkpointing, and fixed-total-dimension
     multi-read tiles are integrated. Portable/NNX tests and CPU Pallas
-    interpret-mode GPU/TPU forward and gradient parity pass. The pre-correction
-    TPU v5e-4 path passed real lowering, six-output/17-input-gradient parity, a
-    tracked-shape recurrence gate, and a four-device model-axis optimizer step.
-    Corrected real TPU, L40S and Mosaic v2, measured peak memory, and
-    complete-step records remain required.
+    interpret-mode GPU/TPU forward and gradient parity pass. Corrected commit
+    `f35f6fc` passed real TPU v5e-4 lowering, six-output/17-input-gradient
+    parity, tracked-shape and checkpointed-T=512 recurrence gates, and
+    four-device 0.185B model-axis optimizer steps through context 512. Direct
+    single-kernel T=2048 exceeds v5e scoped VMEM. L40S and Mosaic v2, measured
+    peak memory, steady-state complete-step throughput, and multi-host records
+    remain required.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:

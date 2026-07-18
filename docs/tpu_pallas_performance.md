@@ -33,6 +33,21 @@ These ratios apply only to the projected screening recurrence. A complete
 `0.185b` train step includes the RWKV blocks, dense projections, vocabulary
 head, loss, and optimizer, so its end-to-end ratio is necessarily different.
 
+On 2026-07-18, the corrected hard-forward/soft-backward novelty and admission
+equations were revalidated from public commit `f35f6fc` on a fresh
+`v5litepod-4`. For the tracked Screening v2 recurrence shape, the corrected TPU
+Pallas path passed the fail-closed output, gradient, and loss gate and retained
+a 6.83x forward and 2.69x forward-plus-backward median speedup.
+
+| Corrected Screening v2 operation | Pallas TPU median | reference median | Speedup |
+| --- | ---: | ---: | ---: |
+| Forward | 0.578 ms | 3.949 ms | 6.83x |
+| Forward + backward | 4.888 ms | 13.171 ms | 2.69x |
+
+This latest table supersedes the 2026-07-16 table only for the corrected v2
+routing equations. It is still a recurrence microbenchmark, not complete-model
+tokens per second.
+
 ## Implementation change
 
 The previous accelerator path expressed the time recurrence as `lax.scan` over
@@ -72,6 +87,8 @@ removed the compiler failure without changing the public shapes.
 
 The WKV session used `rwkv7m-pallas-260714`. The screening session used
 `rwkv7m-screening-260716`; both were `v5litepod-4` TPU VMs in `us-west4-a`.
+The corrected Screening v2 session used `rwkv7m-screening-st-260718`, also a
+single-host `v5litepod-4` in `us-west4-a`.
 
 ## WKV microbenchmark method
 
@@ -262,6 +279,121 @@ returned `NOT_FOUND`. The approximately 42.5-minute READY-to-delete interval is
 about 3.4 USD at the previously documented 1.20 USD per v5e chip-hour rate;
 this is an estimate, not an exported billing record.
 
+## Corrected Screening v2 real-hardware revalidation
+
+On 2026-07-18, public commit
+`f35f6fca1461217d54fb3b494d68563eaf7e8a95` was cloned directly from
+`https://github.com/HeiMao-BaiMao/RWKV7M.git` onto temporary TPU VM
+`rwkv7m-screening-st-260718`. The VM exposed four TPU v5 lite devices in a
+`2 x 2` topology. Python 3.13.14, JAX/jaxlib 0.10.0, libtpu 0.0.40, Flax
+0.12.7, and Optax 0.2.8 were installed through the repository's TPU extra.
+
+The real-accelerator regression test passed with native TPU lowering rather
+than interpret mode:
+
+```bash
+uv run pytest -q tests/test_screening_pallas_accelerator.py
+```
+
+It completed as `1 passed` in 11.68 seconds and compared all six public outputs
+and all 17 input gradients against the portable reference. The tracked
+recurrence benchmark then used `T=128, B=1, M=16`, slot size 128, key/value
+size 64, four read tiles, route power 2, competitive novel routing, and
+interval-16 checkpointing. Three warmups and ten synchronized iterations were
+used with Python GC disabled and device-resident inputs.
+
+```bash
+uv run python scripts/benchmark_screening_accelerator.py \
+  --backend pallas_tpu \
+  --write-mode competitive_novel \
+  --time 128 --batch 1 --slots 16 \
+  --slot-size 128 --key-size 64 --value-size 64 \
+  --read-tiles 4 --route-power 2 \
+  --checkpoint-interval 16 \
+  --warmup 3 --iterations 10 --disable-python-gc
+```
+
+| Corrected v2 measurement | Pallas TPU median | reference median | Speedup |
+| --- | ---: | ---: | ---: |
+| Forward | 0.5778045 ms | 3.9487745 ms | 6.834x |
+| Forward + backward | 4.8878200 ms | 13.1706545 ms | 2.695x |
+
+The fail-closed parity gate passed. The loss difference was `0.0`, maximum
+output absolute error was `2.3842e-7`, maximum gradient absolute error was
+`0.0078125`, and maximum gradient relative L2 error was `1.6613e-5`. These
+figures are for the corrected novelty and admission VJP and therefore close
+the real-v5e correctness gap left by the 2026-07-16 record.
+
+### Checkpoint length and strength boundary
+
+The same recurrence shape was also run at `T=512` with interval-8
+checkpointing. It passed the default parity gate and produced these medians:
+
+| `T=512` measurement | Pallas TPU median | reference median | Speedup |
+| --- | ---: | ---: | ---: |
+| Forward | 1.736230 ms | 15.425279 ms | 8.884x |
+| Forward + backward | 18.854747 ms | 55.000542 ms | 2.917x |
+
+The maximum output absolute error was `1.1921e-6`, maximum gradient absolute
+error was `6.1035e-5`, maximum gradient relative L2 error was `9.1872e-6`, and
+the loss difference was zero.
+
+A direct single-kernel `T=2048` run did not compile on v5e. Both interval 16
+and interval 32 failed with `CompileTimeScopedVmemOom`: the scoped allocation
+was reported as `17.05M` against a `16.00M` limit. Repeating the failure with a
+larger checkpoint interval shows that boundary checkpoint count is not the
+dominant scoped allocation. `T=4096` was not attempted after the repeat
+reproduced the same compiler limit. This is a direct long-kernel limit, not a
+failure of the production chunked path: the tracked 0.185B config keeps
+`sequence_chunk_size=128`.
+
+Near-limit reconstruction was probed at `T=512`, interval 8, with every update
+rate set to 0.90, 0.925, and 0.95. Loss difference remained zero and maximum
+gradient relative L2 error remained at or below `1.43e-4`, but the default
+independent absolute-error gate rejected every rate because the initial-age
+gradient differed by about 0.03. At rate 0.95 the reference age gradient
+reached 45,404.73, the absolute difference was 0.03223, relative L2 error was
+`8.65e-7`, and a combined `atol=1e-2, rtol=5e-3` all-close check passed. This
+does not demonstrate divergence at 0.95; it demonstrates that the deliberately
+strict scale-independent absolute gate is conservative for large-magnitude
+carry gradients. The public 0.95 configuration ceiling remains an algebraic
+reconstruction bound, not a per-shape numerical-accuracy guarantee.
+
+### Full tracked model and four-way mesh
+
+The tracked `rwkv7m-0.185b-screening-v2` config was audited with
+`data=1, model=4`, full vocabulary 65,536, write screening enabled,
+rematerialization enabled, and its configured 128-token recurrent chunk. Both
+context 128 and the configured maximum context 512 completed finite forward
+and a complete backward/optimizer step:
+
+```bash
+uv run rwkv7m-audit-nnx-model-parallel \
+  --model-axis-size 4 \
+  --model-config configs/rwkv7m-0.185b-screening-v2.json.example \
+  --ctx-len 512 \
+  --vocab-size 65536 \
+  --write-screening
+```
+
+| Context | Loss | Optimizer step | Forward collectives |
+| ---: | ---: | ---: | --- |
+| 128 | 20.728317 | 1 | 31 all-gathers, 54 all-reduces, 6 all-to-alls |
+| 512 | 20.723475 | 1 | 40 all-gathers, 54 all-reduces, 6 all-to-alls |
+
+Both compiled executables exercised row- and column-parallel kernels. BF16
+logits had shapes `[1, 128, 65536]` and `[1, 512, 65536]`. FP32 screening slots
+retained `P('data', None, 'model')`, WKV state retained
+`P('data', 'model', None, None)`, and all arrays had four addressable shards.
+The approximately 97- and 112-second process durations include compilation and
+are intentionally not reported as training throughput.
+
+This gate establishes corrected single-host v5e lowering, recurrence parity
+and latency, checkpointed `T=512` parity, and full configured-context
+four-device execution. It does not establish measured peak memory,
+steady-state complete-model throughput, multi-host or multi-slice scaling,
+model-quality benefit, or real-GPU v2 behavior.
+
 ## Complete-model compute-only check
 
 A fixed device-resident `1 x 128` batch was used with the `0.185b` preset on
@@ -346,3 +478,7 @@ after its final four-device audit. A subsequent `tpu-vm list` for
 The 2026-07-16 training-head VM `rwkv7m-head-260716` was deleted after its
 standalone and NNX integration gates. The zone list returned no rows and an
 explicit describe returned `NOT_FOUND`.
+
+The 2026-07-18 corrected-v2 VM `rwkv7m-screening-st-260718` was deleted after
+the context-512 model-axis audit. A subsequent TPU VM list for `us-west4-a`
+returned `[]`, and an explicit describe returned `NOT_FOUND`.

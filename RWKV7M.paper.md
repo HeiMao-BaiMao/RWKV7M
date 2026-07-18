@@ -5,7 +5,7 @@
 
 **対象**: RWKV-7 系、または固定サイズ recurrent state を持つ efficient sequence model
 
-**実装対応**: 本リポジトリの JAX/Flax NNX、portable reference、GPU/TPU Pallas paths。v4機構はopt-in実装済み。TPU v5e-4実機検証済み、GPU v2実機検証は未実施。
+**実装対応**: 本リポジトリの JAX/Flax NNX、portable reference、GPU/TPU Pallas paths。v4機構はopt-in実装済み。補正後TPU v5e-4実機検証済み、GPU v2実機検証は未実施。
 
 **主張の強さ**: 本稿は研究仮説であり、性能改善や memory hygiene は実験で検証されるべきである。
 
@@ -310,7 +310,7 @@ accelerator path は dense projection を XLA へ出し、time recurrence を Pa
 6. Screening training-tape checkpointing,
 7. fixed-total-dimension multi-read tile と `1/sqrt(n_read_tiles)` scaling.
 
-各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。benchmarkはoutput・gradient・lossの閾値を既定でfail-closedにする。TPU v5e-4では2026-07-16時点のv2について、実機lowering、6出力と17入力gradient parity、`T=128, B=1, M=16, d_slot=128, d_k=d_v=64`のrecurrence測定、4-device model-axis optimizer stepを確認した。Pallas medianはforward `0.572 ms`、forward+backward `4.856 ms`で、同一referenceの`3.874 ms`、`12.380 ms`に対してそれぞれ6.77倍、2.55倍であった。ただしこの実機記録はhard-forward/soft-backward novelty・admission修正前であり、修正後のreal-TPU lowering/parityは再検証を要する。これはpeak memory、完全0.185B train step、model quality、GPU v2の証拠でもない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
+各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。benchmarkはoutput・gradient・lossの閾値を既定でfail-closedにする。補正後commit `f35f6fc`は2026-07-18にTPU v5e-4で実機lowering、6出力と17入力gradient parity、`T=128, B=1, M=16, d_slot=128, d_k=d_v=64`のrecurrence測定、checkpointed `T=512` parity、4-device 0.185B model-axis optimizer stepを確認した。補正後Pallas medianはforward `0.578 ms`、forward+backward `4.888 ms`で、同一referenceの`3.949 ms`、`13.171 ms`に対してそれぞれ6.83倍、2.69倍であった。完全モデルはconfigured maximum context 512まで動作した一方、単一kernel `T=2048`はv5e scoped VMEMを超えた。これはmeasured peak memory、steady-state完全train-step throughput、model quality、multi-host scaling、GPU v2の証拠ではない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
 
 ---
 

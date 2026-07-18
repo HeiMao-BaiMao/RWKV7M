@@ -71,11 +71,12 @@ pretrained RWKV checkpoint conversion, or a PyTorch/non-JAX runtime. The
 external recurrent state carry is implemented for this research model, but it
 should not be treated as compatibility with upstream RWKV-7 production
 checkpoints. Screening v2 is implemented as an opt-in configuration and has
-portable-reference plus CPU Pallas interpret-mode parity coverage. A
-2026-07-16 TPU v5e-4 run validated the pre-correction v2 lowering and
-recurrence throughput, but the subsequent hard-forward/soft-backward
-novelty/admission correction still needs real-accelerator revalidation. Peak
-memory and complete-model throughput gates have not run.
+portable-reference plus CPU Pallas interpret-mode parity coverage. Corrected
+commit `f35f6fc` passed real TPU v5e-4 lowering, recurrence parity and timing,
+checkpointed `T=512`, and four-way model-axis optimizer steps through the
+tracked 512-token maximum on 2026-07-18. Direct single-kernel `T=2048` exceeds
+v5e scoped VMEM; measured peak memory and steady-state complete-model
+throughput gates have not run.
 
 ## 3. Package Layout
 
@@ -390,10 +391,11 @@ The tracked small-model configuration is
 CPU interpret mode verifies both GPU and TPU Pallas kernel equations, including
 checkpointed backward gradients. TPU v5e-4 passed real-device v2 lowering,
 all-output/all-input-gradient parity, the tracked recurrence benchmark, and a
-four-device model-axis optimizer step on 2026-07-16, before the corrected
-novelty/admission gates landed. The latest equations therefore require a fresh
-real-TPU gate. The existing L40S report predates v2, and real GPU v2 remains
-unverified.
+four-device model-axis optimizer step before the routing correction. Corrected
+commit `f35f6fc` was then revalidated on 2026-07-18: the default parity gate,
+checkpointed `T=512`, and full 0.185B contexts 128 and 512 all passed. Direct
+single-kernel `T=2048` exceeded v5e scoped VMEM. The existing L40S report
+predates v2, and real GPU v2 remains unverified.
 
 ## 11. Training
 
@@ -581,8 +583,9 @@ Prefer:
 Next engineering steps:
 
 1. Validate Screening v2 on real NVIDIA GPUs. On TPU, measure checkpoint peak
-   memory and complete 0.185B train-step throughput; v5e-4 kernel parity,
-   recurrence latency, and four-device model-axis execution already pass.
+   memory and steady-state 0.185B train-step throughput; corrected v5e-4 kernel
+   parity, recurrence latency through `T=512`, and four-device model-axis
+   execution through context 512 already pass.
 2. Validate full RWKV7M Orbax train-state and runtime-state checkpoint
    save/resume on real TPU pods, including sharded optimizer, parameter,
    recurrent, and screening states. The independent small NNX lifecycle probe

@@ -1,8 +1,10 @@
 # State-Level Screening v2 engineering contract
 
-Status: opt-in implementation complete; corrected GPU/TPU Pallas equations
-pass CPU interpret parity. The earlier TPU v5e-4 gate predates the corrected
-novelty/admission estimators; refreshed real-accelerator gates are pending.
+Status: opt-in implementation complete. Corrected GPU/TPU Pallas equations
+pass CPU interpret parity, and the corrected TPU path passes real v5e-4
+lowering, all-output/all-input-gradient parity, recurrence timing, and a full
+four-way model-axis step at the tracked maximum context. Real GPU v2 and
+multi-host gates remain pending.
 
 Here, "v2" names the second Screening architecture, while the accompanying
 paper is `design-locked-draft-v4`; the two version labels track different
@@ -359,13 +361,17 @@ multi-read paths. The benchmark is fail-closed by default: any configured
 output, gradient, or loss threshold violation exits nonzero, with
 `--no-require-parity` reserved for diagnostics.
 
-TPU v5e-4 passed real lowering, all-output/all-input-gradient parity, the
-tracked 0.185B recurrence shape, and a four-device model-axis optimizer step on
-2026-07-16. That record predates the hard-forward/soft-backward novelty and
-admission correction. It remains historical evidence for the rest of v2, but
-the current routing equations require a fresh real-TPU lowering/parity run.
-Real GPU lowering, measured peak memory, complete-model throughput, and
-multi-host scaling also remain unverified for the corrected v2 path.
+On 2026-07-18, corrected commit `f35f6fc` passed real TPU v5e-4 lowering and
+all-output/all-input-gradient parity. At the tracked recurrence shape, Pallas
+median latency was 0.578 ms forward and 4.888 ms forward plus backward, versus
+3.949 ms and 13.171 ms for the portable reference. The tracked 0.185B v2 model
+also completed finite forward and optimizer step 1 with `data=1, model=4` at
+contexts 128 and 512; context 512 exercised four configured 128-token chunks.
+Direct single-kernel `T=2048` exceeds v5e scoped VMEM, so long contexts must
+remain chunked on this device. Real GPU lowering, measured peak memory,
+steady-state complete-model throughput, and multi-host scaling remain
+unverified for the corrected v2 path. Full measurements and cleanup evidence
+are in [the TPU report](tpu_pallas_performance.md).
 
 Every stage must pass:
 

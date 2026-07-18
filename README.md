@@ -255,13 +255,14 @@ checkpointing, and fixed-total-dimension multi-read tiles. Existing configs
 continue to map to explicit legacy write modes; the tracked opt-in example is
 [`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
 Portable reference tests and CPU Pallas interpret-mode tests cover the v2
-forward and gradients for both backend-specific kernel bodies. TPU v5e-4
-covered v2 lowering, all six outputs, all 17 input gradients, the tracked
-0.185B recurrence shape, and a four-device model-axis optimizer step on
-2026-07-16. That record predates the corrected novelty/admission gates, so the
-latest equations need a fresh real-TPU gate. The published L40S result still
-measures the legacy recurrence. Real GPU v2, measured checkpoint peak memory,
-and complete 0.185B train-step gates remain pending.
+forward and gradients for both backend-specific kernel bodies. Corrected commit
+`f35f6fc` passed real TPU v5e-4 lowering, all six outputs, all 17 input
+gradients, the tracked recurrence gate, checkpointed `T=512` parity, and
+four-device 0.185B model-axis optimizer steps at contexts 128 and 512 on
+2026-07-18. Direct single-kernel `T=2048` exceeds v5e scoped VMEM, so the
+production path remains chunked. The published L40S result still measures the
+legacy recurrence. Real GPU v2, measured checkpoint peak memory, steady-state
+complete-model throughput, and multi-host gates remain pending.
 
 Run the synchronized screening recurrence benchmark with:
 
