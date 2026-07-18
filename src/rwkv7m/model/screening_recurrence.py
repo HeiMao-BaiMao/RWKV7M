@@ -75,11 +75,12 @@ class ScreeningRecurrenceConfig:
     bank_ids: tuple[int, ...] = ()
     route_power: float = 1.0
     novelty_threshold: float = 0.1
+    novelty_temperature: float = 0.1
     allocation_temperature: float = 1.0
     bank_route_temperature: float = 1.0
     allocation_age_weight: float = 1.0
     allocation_usage_weight: float = 1.0
-    hard_admission: bool = False
+    hard_admission: bool = True
     admission_threshold: float = 0.5
     n_read_tiles: int = 1
     checkpoint_interval: int | None = None
@@ -113,6 +114,10 @@ def _validate_screening_recurrence_inputs(
     config: ScreeningRecurrenceConfig,
 ):
     _resolved_write_mode(config)
+    if config.novelty_temperature <= 0.0:
+        raise ValueError("novelty_temperature must be positive")
+    if not 0.0 <= config.admission_threshold <= 1.0:
+        raise ValueError("admission_threshold must be in [0, 1]")
     if config.n_read_tiles <= 0:
         raise ValueError("n_read_tiles must be positive")
     if (
@@ -324,7 +329,7 @@ def _screening_recurrence_reference_impl(
         write_mode = _resolved_write_mode(config)
         matched_route = jnp.zeros_like(read_activity)
         novel_route = jnp.zeros_like(read_activity)
-        effective_admission = jnp.zeros_like(admission_t)
+        admission_probability = jnp.zeros_like(admission_t)
         is_novel = jnp.zeros_like(admission_t, dtype=jnp.bool_)
         if write_mode in ("legacy_threshold", "competitive_novel"):
             write_keys_normalized = unit_norm(
@@ -351,11 +356,11 @@ def _screening_recurrence_reference_impl(
         elif write_mode == "competitive_novel":
             (
                 effective_write_relevance,
-                raw_matched_route,
+                matched_route,
                 novel_route,
                 _,
                 is_novel,
-                effective_admission,
+                admission_probability,
                 _,
             ) = competitive_write_routing(
                 write_relevance,
@@ -366,6 +371,7 @@ def _screening_recurrence_reference_impl(
                 config.bank_ids or (0,) * n_slots,
                 route_power=config.route_power,
                 novelty_threshold=config.novelty_threshold,
+                novelty_temperature=config.novelty_temperature,
                 allocation_temperature=config.allocation_temperature,
                 bank_route_temperature=config.bank_route_temperature,
                 allocation_age_weight=config.allocation_age_weight,
@@ -373,9 +379,6 @@ def _screening_recurrence_reference_impl(
                 hard_admission=config.hard_admission,
                 admission_threshold=config.admission_threshold,
                 eps=config.eps,
-            )
-            matched_route = jnp.where(
-                is_novel[:, None], 0.0, raw_matched_route
             )
             strength = mu[None, :] * effective_write_relevance
             next_ages = jnp.where(
@@ -457,18 +460,18 @@ def _screening_recurrence_reference_impl(
                 novel_mass,
                 route_entropy,
                 route_top1,
-                effective_admission,
+                admission_probability,
                 is_novel.astype(jnp.float32),
                 (route_mass <= config.eps).astype(jnp.float32),
                 *bank_write_mass,
                 eviction_age,
                 eviction_usage,
                 (
-                    (effective_admission < 0.05)
+                    (admission_probability < 0.05)
                     & (write_mode == "competitive_novel")
                 ).astype(jnp.float32),
                 (
-                    (effective_admission > 0.95)
+                    (admission_probability > 0.95)
                     & (write_mode == "competitive_novel")
                 ).astype(jnp.float32),
             ),

@@ -63,6 +63,9 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--screening-novelty-threshold", type=float, default=0.1
     )
+    parser.add_argument(
+        "--screening-novelty-temperature", type=float, default=0.1
+    )
     parser.add_argument("--screening-admission-init", type=float, default=0.1)
     parser.add_argument(
         "--screening-allocation-temperature", type=float, default=1.0
@@ -77,7 +80,7 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         "--screening-allocation-usage-weight", type=float, default=1.0
     )
     parser.add_argument(
-        "--screening-admission-threshold", type=float, default=None
+        "--screening-admission-threshold", type=float, default=0.5
     )
     parser.add_argument(
         "--screening-checkpoint-interval", type=int, default=None
@@ -97,6 +100,9 @@ def screening_v2_kwargs(args):
         "novelty_threshold": getattr(
             args, "screening_novelty_threshold", 0.1
         ),
+        "novelty_temperature": getattr(
+            args, "screening_novelty_temperature", 0.1
+        ),
         "admission_init": getattr(args, "screening_admission_init", 0.1),
         "allocation_temperature": getattr(
             args, "screening_allocation_temperature", 1.0
@@ -111,7 +117,7 @@ def screening_v2_kwargs(args):
             args, "screening_allocation_usage_weight", 1.0
         ),
         "admission_threshold": getattr(
-            args, "screening_admission_threshold", None
+            args, "screening_admission_threshold", 0.5
         ),
         "checkpoint_interval": getattr(
             args, "screening_checkpoint_interval", None

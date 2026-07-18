@@ -15,7 +15,7 @@
 
 本稿は、RWKV 系 recurrent language model の compressed state に、Multiscreen 的な absolute relevance screening を移植する設計を提案する。
 
-標準 softmax attention は候補集合上で相対重みを作るため、全候補が無関係でも総和 1 の重みが必ず割り当てられる。これに対して state-level screening は、固定個数の state slot を独立に評価し、readでは閾値を超えたslotだけを絶対relevanceで集約する。writeでは絶対eligibilityを保持したままeligible slotを競合させ、既存slotと一致しない情報だけを、continuous admissionと疎なbank-aware victim routingを通して割り当てる。
+標準 softmax attention は候補集合上で相対重みを作るため、全候補が無関係でも総和 1 の重みが必ず割り当てられる。これに対して state-level screening は、固定個数の state slot を独立に評価し、readでは閾値を超えたslotだけを絶対relevanceで集約する。writeでは絶対eligibilityを保持したままeligible slotを競合させ、既存slotと一致しない情報だけを、hard-forward/soft-backward admissionと疎なbank-aware victim routingを通して割り当てる。
 
 中心仮説は次である。
 
@@ -160,11 +160,17 @@ r_matched_m = c * p_m
 
 ### 4.3 Admission-Controlled Sparse Novel Allocation
 
-`c` が novelty threshold 未満の token は、既存 slot と一致しない新規候補とみなす。ただし novelty だけでは保存価値を意味しないため、学習可能な continuous admission を通す。
+`c` が novelty threshold 未満の token は、既存 slot と一致しない新規候補とみなす。ただし novelty だけでは保存価値を意味しないため、学習可能な admission を通す。noveltyとadmissionはいずれもforwardではhard、backwardではsoft surrogateを使う。
 
 ```text
-is_novel = c < novelty_threshold
-admission = sigmoid(admission_logit(x_t, h_base_t))
+novel_hard = c < novelty_threshold
+novel_soft = sigmoid((novelty_threshold - c) / novelty_temperature)
+novel_st = novel_soft + stop_gradient(novel_hard - novel_soft)
+
+admission_soft = sigmoid(admission_logit(x_t, h_base_t))
+admission_hard = admission_soft >= admission_threshold
+admission_st = admission_soft
+             + stop_gradient(admission_hard - admission_soft)
 ```
 
 初期実装は bank と slot を階層的に選ぶ。3-way bank projection は token ごとの short / mid / long route を作り、各 bank 内では age と usage から victim score を作る。age は bank 内で正規化する。
@@ -183,10 +189,12 @@ slot_hard_b = one_hot(argmax(slot_logit within bank b))
 slot_st_b = slot_soft_b + stop_gradient(slot_hard_b - slot_soft_b)
 
 victim_st_m = sum_b bank_st_b * slot_st_b,m
-r_novel_m = is_novel * admission * victim_st_m
+r_novel_m = novel_st * admission_st * victim_st_m
+r_matched_applied_m = (1 - novel_st) * r_matched_m
+r_write_m = r_novel_m + r_matched_applied_m
 ```
 
-forward は一つの bank の top-1 victim へ疎に書き、backward は bank と slot の両 soft route を通して勾配を流す。top-k と quota は独立 ablation とする。評価・推論では、必要に応じて admission threshold を加えた完全 hard mode を選べる。学習時に admission を hard 判定だけで切らない。
+forward は不採用tokenを厳密にrejectし、採用時は一つの bank の top-1 victim へ疎に書く。backward は novelty、admission、bank、slot のsoft surrogateを通して勾配を流す。これにより不採用writeはcontentとageを変更しない。novelty surrogateはTrim-and-Squareの微分が非ゼロな領域でconfidence勾配を回復するが、Trim-and-Square自身の完全reject領域は意図どおりゼロ勾配のままである。top-k と quota は独立 ablation とする。
 
 ### 4.4 Final Update and Accounting
 
@@ -253,7 +261,7 @@ checkpointを無効にしたaccelerator backwardはtokenごとに6個のFP32 car
   * (C * (d_slot + 2*d_k + d_v) + 3*T) bytes
 ```
 
-backwardはcandidateとscalar tapeから区間内contentを逆算し、境界checkpointで累積誤差を打ち切る。更新係数は1未満に制約する。interval 16では、tracked 0.185B presetのbatch 1、512 tokenが約0.74 MiB、7B presetのbatch 1、4,096 token、4 screened layerが約115.44 MiBとなる。これはtapeだけの理論値であり、実デバイスのpeak memory削減量や再計算コストを示すものではない。GPUとTPUは別々のcheckpoint forward/reverse kernel本文を持つ。
+backwardはcandidateとscalar tapeから区間内contentを逆算し、境界checkpointで累積誤差を打ち切る。逆算は`1 - strength`で除算するため、checkpoint有効時はhalf-life由来rateと`write_rel_floor`を含む最大実効strengthを`0.95`以下にconfig validationで制約し、kernel内clampによる暗黙の勾配変更は行わない。interval 16では、tracked 0.185B presetのbatch 1、512 tokenが約0.74 MiB、7B presetのbatch 1、4,096 token、4 screened layerが約115.44 MiBとなる。これはtapeだけの理論値であり、実デバイスのpeak memory削減量や再計算コストを示すものではない。GPUとTPUは別々のcheckpoint forward/reverse kernel本文を持つ。
 
 ### 5.3 Multi-Read Tile
 
@@ -298,11 +306,11 @@ accelerator path は dense projection を XLA へ出し、time recurrence を Pa
 2. value-space gate,
 3. factorized slot candidate,
 4. confidence-preserving competitive routing,
-5. continuous admission と straight-through sparse bank-aware allocation,
+5. hard-forward/soft-backward novelty・admission と straight-through sparse bank-aware allocation,
 6. Screening training-tape checkpointing,
 7. fixed-total-dimension multi-read tile と `1/sqrt(n_read_tiles)` scaling.
 
-各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。加えてTPU v5e-4では、実機lowering、6出力と17入力gradient parity、`T=128, B=1, M=16, d_slot=128, d_k=d_v=64`のrecurrence測定、4-device model-axis optimizer stepを確認した。Pallas medianはforward `0.572 ms`、forward+backward `4.856 ms`で、同一referenceの`3.874 ms`、`12.380 ms`に対してそれぞれ6.77倍、2.55倍であった。これはpeak memory、完全0.185B train step、model quality、GPU v2の証拠ではない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
+各段階はconfigで個別に切り替え可能であり、tracked exampleは`configs/rwkv7m-0.185b-screening-v2.json.example`である。portable referenceと、GPU/TPUそれぞれのPallas kernel本文は、CPU interpret modeでforwardおよびall-input gradient parityを確認している。benchmarkはoutput・gradient・lossの閾値を既定でfail-closedにする。TPU v5e-4では2026-07-16時点のv2について、実機lowering、6出力と17入力gradient parity、`T=128, B=1, M=16, d_slot=128, d_k=d_v=64`のrecurrence測定、4-device model-axis optimizer stepを確認した。Pallas medianはforward `0.572 ms`、forward+backward `4.856 ms`で、同一referenceの`3.874 ms`、`12.380 ms`に対してそれぞれ6.77倍、2.55倍であった。ただしこの実機記録はhard-forward/soft-backward novelty・admission修正前であり、修正後のreal-TPU lowering/parityは再検証を要する。これはpeak memory、完全0.185B train step、model quality、GPU v2の証拠でもない。group-wise slot updateはSection 5.1のinvariantを満たす再設計まで対象外とする。
 
 ---
 
@@ -340,7 +348,7 @@ parameter 数だけでなく、学習 token 数と wall-clock の双方で比較
 - sigmoid gate vs `tanh(silu(.))`
 - factorized candidate rank `32 / 64 / 128` vs legacy candidate
 - confidence multiplier on/off
-- admission on/off and hard-inference threshold
+- admission on/off、hard-forward threshold、surrogate temperature
 - victim top-1 vs top-k, temperature, straight-through estimator
 - fixed / biased / quota-based bank allocation
 - bank-specific update rate on/off

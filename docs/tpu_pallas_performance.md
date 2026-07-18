@@ -202,6 +202,12 @@ was validated on a temporary single-host `v5litepod-4` named
 earlier gate: Python 3.13.14, JAX/jaxlib 0.10.0, Flax 0.12.7, Optax 0.2.8, and
 libtpu 0.0.40. Transparent hugepages remained disabled.
 
+This is a historical record for that commit. The later
+hard-forward/soft-backward novelty and admission correction changes both the
+forward route and its VJP. CPU interpret-mode GPU/TPU parity passes for the
+corrected equations, but this table must not be cited as real-v5e validation of
+the corrected HEAD until the accelerator parity command is rerun.
+
 The real-accelerator regression test used `competitive_novel`, two read tiles,
 and interval-2 tape checkpointing. It passed all six public outputs and all 17
 input gradients against the portable reference:
@@ -245,9 +251,10 @@ The real TPU gate exposed two classes of issue hidden by CPU interpret mode:
   explicit and has a local regression test.
 
 This establishes single-host v5e functional and recurrence-performance gates
-for Screening v2. It does not establish measured checkpoint peak-memory
-savings, complete 0.185B train-step throughput, multi-host scaling, GPU v2
-lowering, or model-quality benefit.
+for Screening v2 at commit `6fc9a48`. It does not establish the post-gate
+novelty/admission correction, measured checkpoint peak-memory savings,
+complete 0.185B train-step throughput, multi-host scaling, GPU v2 lowering, or
+model-quality benefit.
 
 The VM was READY at `2026-07-16T12:35:52Z`. The delete operation completed by
 approximately `13:18:23Z`; the zone listing was empty and describing the VM

@@ -1,7 +1,9 @@
+from dataclasses import dataclass
+import math
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from dataclasses import dataclass
 
 
 _PHASE_ALIASES = {"read_only": "read_screening_only"}
@@ -174,6 +176,7 @@ def competitive_write_routing(
     *,
     route_power,
     novelty_threshold,
+    novelty_temperature,
     allocation_temperature,
     bank_route_temperature,
     allocation_age_weight,
@@ -202,11 +205,24 @@ def competitive_write_routing(
         powered_sum > 0.0, powered_sum, 1.0
     )
     confidence = jnp.max(eligibility, axis=-1)
-    matched_route = confidence[..., None] * matched_distribution
+    raw_matched_route = confidence[..., None] * matched_distribution
     is_novel = confidence < novelty_threshold
+    novel_soft = jax.nn.sigmoid(
+        (novelty_threshold - confidence) / novelty_temperature
+    )
+    novel_hard = is_novel.astype(jnp.float32)
+    novel_gate = novel_soft + jax.lax.stop_gradient(
+        novel_hard - novel_soft
+    )
 
+    admission_soft = admission
     if hard_admission:
-        admission = (admission >= admission_threshold).astype(jnp.float32)
+        admission_hard = (
+            admission_soft >= admission_threshold
+        ).astype(jnp.float32)
+        admission = admission_soft + jax.lax.stop_gradient(
+            admission_hard - admission_soft
+        )
 
     # Mosaic TPU requires ``iota`` itself to have an integer/index dtype.
     # Convert only after materializing the tie-break indices.
@@ -273,17 +289,18 @@ def competitive_write_routing(
         )
         victim_route += bank_route[..., bank_id, None] * slot_route
 
-    novel_route = is_novel[..., None] * admission[..., None] * victim_route
-    write_route = jnp.where(
-        is_novel[..., None], novel_route, matched_route
+    novel_route = (
+        novel_gate[..., None] * admission[..., None] * victim_route
     )
+    matched_route = (1.0 - novel_gate[..., None]) * raw_matched_route
+    write_route = novel_route + matched_route
     return (
         write_route,
         matched_route,
         novel_route,
         confidence,
         is_novel,
-        admission,
+        admission_soft,
         victim_route,
     )
 
@@ -325,13 +342,14 @@ class ScreeningConfig:
     candidate_rank: int | None = None
     route_power: float = 1.0
     novelty_threshold: float = 0.1
+    novelty_temperature: float = 0.1
     admission_init: float = 0.1
     allocation_temperature: float = 1.0
     bank_route_temperature: float = 1.0
     allocation_top_k: int = 1
     allocation_age_weight: float = 1.0
     allocation_usage_weight: float = 1.0
-    admission_threshold: float | None = None
+    admission_threshold: float | None = 0.5
     checkpoint_interval: int | None = None
     n_read_tiles: int = 1
 
@@ -380,6 +398,8 @@ class ScreeningConfig:
             raise ValueError("route_power must be positive")
         if not 0.0 <= self.novelty_threshold <= 1.0:
             raise ValueError("novelty_threshold must be in [0, 1]")
+        if self.novelty_temperature <= 0.0:
+            raise ValueError("novelty_temperature must be positive")
         if not 0.0 < self.admission_init < 1.0:
             raise ValueError("admission_init must be in (0, 1)")
         if self.allocation_temperature <= 0.0:
@@ -412,6 +432,39 @@ class ScreeningConfig:
         )
         if any(value is not None and value <= 0.0 for value in half_lives):
             raise ValueError("memory half-life values must be positive when provided")
+        if self.checkpoint_interval is not None:
+            update_rate_limits = tuple(
+                maximum
+                if half_life is None
+                else -math.expm1(-math.log(2.0) / half_life)
+                for maximum, half_life in zip(
+                    (
+                        self.mu_short_max,
+                        self.mu_mid_max,
+                        self.mu_long_max,
+                    ),
+                    half_lives,
+                    strict=True,
+                )
+            )
+            threshold_routing_possible = (
+                self.write_mode == "legacy_threshold"
+                or (self.write_mode is None and self.use_write_screening)
+            )
+            route_limit = (
+                max(1.0, self.write_rel_floor)
+                if threshold_routing_possible
+                else 1.0
+            )
+            maximum_effective_strength = (
+                max(update_rate_limits) * route_limit
+            )
+            if maximum_effective_strength > 0.95:
+                raise ValueError(
+                    "checkpoint_interval requires maximum effective screening "
+                    "update strength <= 0.95; got "
+                    f"{maximum_effective_strength:.6g}"
+                )
         if not 0.0 <= self.usage_ema_decay < 1.0:
             raise ValueError("usage_ema_decay must be in [0, 1)")
 
@@ -648,13 +701,12 @@ class StateLevelScreening(nn.Module):
             bank_ids=cfg.bank_ids,
             route_power=cfg.route_power,
             novelty_threshold=cfg.novelty_threshold,
+            novelty_temperature=cfg.novelty_temperature,
             allocation_temperature=cfg.allocation_temperature,
             bank_route_temperature=cfg.bank_route_temperature,
             allocation_age_weight=cfg.allocation_age_weight,
             allocation_usage_weight=cfg.allocation_usage_weight,
-            hard_admission=(
-                deterministic and cfg.admission_threshold is not None
-            ),
+            hard_admission=(write_mode == "competitive_novel"),
             admission_threshold=(
                 cfg.admission_threshold
                 if cfg.admission_threshold is not None

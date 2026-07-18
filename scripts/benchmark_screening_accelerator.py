@@ -45,7 +45,22 @@ def parse_args(argv=None):
     )
     parser.add_argument("--read-tiles", type=int, default=1)
     parser.add_argument("--route-power", type=float, default=1.0)
+    parser.add_argument("--novelty-temperature", type=float, default=0.1)
+    parser.add_argument("--admission-threshold", type=float, default=0.5)
     parser.add_argument("--checkpoint-interval", type=int, default=None)
+    parser.add_argument(
+        "--require-parity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="fail with a non-zero exit when any parity threshold is exceeded",
+    )
+    parser.add_argument("--output-max-abs", type=float, default=5e-3)
+    parser.add_argument("--output-max-relative-l2", type=float, default=5e-3)
+    parser.add_argument("--gradient-max-abs", type=float, default=1e-2)
+    parser.add_argument(
+        "--gradient-max-relative-l2", type=float, default=5e-3
+    )
+    parser.add_argument("--loss-atol", type=float, default=1e-4)
     parser.add_argument("--disable-python-gc", action="store_true")
     parser.add_argument(
         "--interpret",
@@ -71,6 +86,19 @@ def parse_args(argv=None):
         parser.error("--read-tiles must be positive")
     if args.route_power <= 0.0:
         parser.error("--route-power must be positive")
+    if args.novelty_temperature <= 0.0:
+        parser.error("--novelty-temperature must be positive")
+    if not 0.0 <= args.admission_threshold <= 1.0:
+        parser.error("--admission-threshold must be in [0, 1]")
+    for name in (
+        "output_max_abs",
+        "output_max_relative_l2",
+        "gradient_max_abs",
+        "gradient_max_relative_l2",
+        "loss_atol",
+    ):
+        if getattr(args, name) < 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
     if args.key_size % args.read_tiles != 0:
         parser.error("--key-size must be divisible by --read-tiles")
     if args.value_size % args.read_tiles != 0:
@@ -103,6 +131,9 @@ def _config(args):
         write_mode=args.write_mode,
         bank_ids=bank_ids,
         route_power=args.route_power,
+        novelty_temperature=args.novelty_temperature,
+        hard_admission=(args.write_mode == "competitive_novel"),
+        admission_threshold=args.admission_threshold,
         n_read_tiles=args.read_tiles,
         checkpoint_interval=args.checkpoint_interval,
     )
@@ -191,6 +222,63 @@ def _errors(actual, expected, names):
     return errors
 
 
+def _parity_gate(output_errors, gradient_errors, loss_difference, args):
+    thresholds = {
+        "output_max_abs": args.output_max_abs,
+        "output_max_relative_l2": args.output_max_relative_l2,
+        "gradient_max_abs": args.gradient_max_abs,
+        "gradient_max_relative_l2": args.gradient_max_relative_l2,
+        "loss_atol": args.loss_atol,
+    }
+    failures = []
+    for group, errors, max_abs_limit, relative_l2_limit in (
+        (
+            "output",
+            output_errors,
+            args.output_max_abs,
+            args.output_max_relative_l2,
+        ),
+        (
+            "gradient",
+            gradient_errors,
+            args.gradient_max_abs,
+            args.gradient_max_relative_l2,
+        ),
+    ):
+        for name, error in errors.items():
+            for metric, limit in (
+                ("max_abs", max_abs_limit),
+                ("relative_l2", relative_l2_limit),
+            ):
+                value = error[metric]
+                if not np.isfinite(value) or value > limit:
+                    failures.append(
+                        {
+                            "group": group,
+                            "name": name,
+                            "metric": metric,
+                            "value": value,
+                            "limit": limit,
+                        }
+                    )
+    if not np.isfinite(loss_difference) or loss_difference > args.loss_atol:
+        failures.append(
+            {
+                "group": "loss",
+                "name": "loss_difference",
+                "metric": "max_abs",
+                "value": loss_difference,
+                "limit": args.loss_atol,
+            }
+        )
+    return {
+        "required": args.require_parity,
+        "passed": not failures,
+        "thresholds": thresholds,
+        "failures": failures,
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     backend = resolve_screening_backend(args.backend)
@@ -266,6 +354,38 @@ def main(argv=None):
             ),
         }
 
+    output_errors = _errors(
+        pallas_outputs,
+        reference_outputs,
+        ("u", "slots", "ages", "usage", "statistics", "update_squared"),
+    )
+    gradient_errors = _errors(
+        pallas_gradients,
+        reference_gradients,
+        (
+            "q_read",
+            "q_write",
+            "admission",
+            "bank_logits",
+            "delta_slots",
+            "delta_read_keys",
+            "delta_values",
+            "delta_write_keys",
+            "initial_slots",
+            "initial_read_keys",
+            "initial_values",
+            "initial_write_keys",
+            "initial_ages",
+            "initial_usage",
+            "mu",
+            "tau_read",
+            "tau_write",
+        ),
+    )
+    loss_difference = float(jnp.abs(pallas_loss - reference_loss))
+    parity_gate = _parity_gate(
+        output_errors, gradient_errors, loss_difference, args
+    )
     report = {
         "backend": backend,
         "device": str(jax.devices()[0]),
@@ -282,6 +402,8 @@ def main(argv=None):
             "write_mode": args.write_mode,
             "read_tiles": args.read_tiles,
             "route_power": args.route_power,
+            "novelty_temperature": args.novelty_temperature,
+            "admission_threshold": args.admission_threshold,
             "checkpoint_interval": args.checkpoint_interval,
         },
         "measurement": {
@@ -291,35 +413,10 @@ def main(argv=None):
             "synchronized_each_iteration": True,
             "python_gc_disabled": args.disable_python_gc,
         },
-        "output_errors": _errors(
-            pallas_outputs,
-            reference_outputs,
-            ("u", "slots", "ages", "usage", "statistics", "update_squared"),
-        ),
-        "gradient_errors": _errors(
-            pallas_gradients,
-            reference_gradients,
-            (
-                "q_read",
-                "q_write",
-                "admission",
-                "bank_logits",
-                "delta_slots",
-                "delta_read_keys",
-                "delta_values",
-                "delta_write_keys",
-                "initial_slots",
-                "initial_read_keys",
-                "initial_values",
-                "initial_write_keys",
-                "initial_ages",
-                "initial_usage",
-                "mu",
-                "tau_read",
-                "tau_write",
-            ),
-        ),
-        "loss_difference": float(jnp.abs(pallas_loss - reference_loss)),
+        "output_errors": output_errors,
+        "gradient_errors": gradient_errors,
+        "loss_difference": loss_difference,
+        "parity_gate": parity_gate,
         "timings": timings,
     }
     rendered = json.dumps(report, indent=2, sort_keys=True)
@@ -329,6 +426,8 @@ def main(argv=None):
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write(rendered + "\n")
     print(rendered)
+    if args.require_parity and not parity_gate["passed"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

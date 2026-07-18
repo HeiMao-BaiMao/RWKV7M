@@ -71,9 +71,11 @@ pretrained RWKV checkpoint conversion, or a PyTorch/non-JAX runtime. The
 external recurrent state carry is implemented for this research model, but it
 should not be treated as compatibility with upstream RWKV-7 production
 checkpoints. Screening v2 is implemented as an opt-in configuration and has
-portable-reference plus CPU Pallas interpret-mode parity coverage, but its
-real-accelerator lowering, memory, and throughput gates have not run. Current
-published accelerator results describe the legacy projected recurrence only.
+portable-reference plus CPU Pallas interpret-mode parity coverage. A
+2026-07-16 TPU v5e-4 run validated the pre-correction v2 lowering and
+recurrence throughput, but the subsequent hard-forward/soft-backward
+novelty/admission correction still needs real-accelerator revalidation. Peak
+memory and complete-model throughput gates have not run.
 
 ## 3. Package Layout
 
@@ -363,11 +365,13 @@ competitive_novel
 
 `competitive_novel` first computes absolute Trim-and-Square eligibility. For a
 matched write, eligible slots compete but the normalized route is multiplied by
-`max(eligibility)`. For a novel write, a continuous sigmoid admission controls
-the amount, while a bank-aware top-1 victim is sparse in the forward pass and
-uses a soft straight-through route in the backward pass. Slot updates, age
-reset, and write counts follow the applied route. Usage EMA instead follows
-absolute read activity so frequently read slots are protected from eviction.
+`max(eligibility)`. Novelty and sigmoid admission both use hard-forward,
+soft-backward gates; rejected tokens therefore apply exactly zero write mass,
+while the selection boundaries retain surrogate gradients. A bank-aware top-1
+victim is sparse in the forward pass and soft in the backward pass. Slot
+updates, age reset, and write counts follow the applied route. Usage EMA instead
+follows absolute read activity so frequently read slots are protected from
+eviction.
 
 The opt-in revision moves the gate from model space to value space, factorizes
 the slot candidate through a configurable low-rank latent, adds interval
@@ -375,7 +379,8 @@ checkpointing for the six-value FP32 training tape, and finally adds multi-read
 tiles with fixed total dimensions and `1 / sqrt(n_read_tiles)` residual
 scaling. Group-wise slot updates are deferred because changing slot channels
 without matching projected read-key/value/write-key updates would break chunk
-invariance.
+invariance. Checkpointed inverse reconstruction is accepted only when the
+configured maximum effective update strength is at most `0.95`.
 
 The complete formulas, compatibility mapping, configuration surface, memory
 equation, metrics, implementation status, and acceptance gates are in
@@ -383,10 +388,12 @@ equation, metrics, implementation status, and acceptance gates are in
 The tracked small-model configuration is
 [`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
 CPU interpret mode verifies both GPU and TPU Pallas kernel equations, including
-checkpointed backward gradients. TPU v5e-4 additionally passes real-device v2
-lowering, all-output/all-input-gradient parity, the tracked recurrence
-benchmark, and a four-device model-axis optimizer step. The existing L40S
-report predates v2, and real GPU v2 remains unverified.
+checkpointed backward gradients. TPU v5e-4 passed real-device v2 lowering,
+all-output/all-input-gradient parity, the tracked recurrence benchmark, and a
+four-device model-axis optimizer step on 2026-07-16, before the corrected
+novelty/admission gates landed. The latest equations therefore require a fresh
+real-TPU gate. The existing L40S report predates v2, and real GPU v2 remains
+unverified.
 
 ## 11. Training
 
@@ -536,12 +543,14 @@ Run:
 uv run pytest -q
 ```
 
-As of 2026-07-16, the current worktree suite completed with 196 passing tests
+As of 2026-07-18, the current worktree suite completed with 200 passing tests
 and five accelerator/optional-runtime skips. This count includes GPU optimizer
 and benchmark-harness coverage plus Screening v2 legacy migration, routing
-invariants, sequence-chunk parity, and CPU Pallas interpret-mode GPU/TPU
-checkpointed-gradient parity. Real TPU evidence is recorded separately and is
-not part of this local test count.
+invariants, hard-forward/soft-backward admission and novelty gradients,
+checkpoint strength limits, fail-closed benchmark parity, sequence-chunk
+parity, and CPU Pallas interpret-mode GPU/TPU checkpointed-gradient parity.
+Real TPU evidence is recorded separately and is not part of this local test
+count.
 
 ## 14. Design Rules
 
@@ -553,7 +562,7 @@ Do not:
 4. use in-place slot mutation,
 5. silently accept unknown phase names,
 6. initialize write parameters only in write phase,
-7. use a hard-only admission decision during training,
+7. use a hard-only admission decision without a soft backward surrogate,
 8. introduce group-wise slot rates without a matching projected-state contract,
 9. report CPU interpret-mode Screening v2 parity as real GPU/TPU validation or
    measured speedup.

@@ -1,7 +1,8 @@
 # State-Level Screening v2 engineering contract
 
-Status: opt-in implementation complete; TPU v5e-4 gate passed; real GPU and
-larger-scale TPU gates pending.
+Status: opt-in implementation complete; corrected GPU/TPU Pallas equations
+pass CPU interpret parity. The earlier TPU v5e-4 gate predates the corrected
+novelty/admission estimators; refreshed real-accelerator gates are pending.
 
 Here, "v2" names the second Screening architecture, while the accompanying
 paper is `design-locked-draft-v4`; the two version labels track different
@@ -71,13 +72,15 @@ gate_activation: sigmoid | tanh_silu
 candidate_rank: None | 32 | 64 | 128
 route_power: float
 novelty_threshold: float
+novelty_temperature: float
 admission_init: float
 allocation_temperature: float
 bank_route_temperature: float
 allocation_top_k: int
 allocation_age_weight: float
 allocation_usage_weight: float
-admission_threshold: optional float for hard inference
+admission_threshold: float for hard-forward/soft-backward admission
+  (`None` is accepted only as a legacy-config fallback to 0.5)
 checkpoint_interval: None | 8 | 16 | 32
 n_read_tiles: int
 ```
@@ -169,11 +172,24 @@ A token is novel when no existing slot reaches the configured eligibility:
 
 ```text
 is_novel = confidence < novelty_threshold
-admission = sigmoid(admission_logit)
+novel_hard = float(is_novel)
+novel_soft = sigmoid((novelty_threshold - confidence) / novelty_temperature)
+novel_gate = novel_soft + stop_gradient(novel_hard - novel_soft)
+
+admission_soft = sigmoid(admission_logit)
+admission_hard = admission_soft >= admission_threshold
+admission_gate = admission_soft + stop_gradient(
+    admission_hard - admission_soft
+)
 ```
 
-Novelty is not sufficient for allocation. `admission` continuously controls the
-write amount and remains differentiable during training.
+Novelty is not sufficient for allocation. Both decisions are hard in the
+forward pass and use continuous surrogate gradients in training. A rejected
+token therefore has exactly zero applied write mass and cannot reset slot age,
+while the admission projection and the confidence boundary remain trainable.
+The novelty surrogate restores confidence gradients where Trim-and-Square has
+nonzero derivative; the intentional hard reject region of Trim-and-Square
+itself remains zero-gradient.
 
 The first implementation uses a hierarchical bank-then-slot route. A small
 three-way projection selects short, mid, or long from the current token. Within
@@ -199,20 +215,20 @@ slot_hard_b = one_hot(argmax(slot_logit within bank b))
 slot_route_b = slot_soft_b + stop_gradient(slot_hard_b - slot_soft_b)
 
 victim_route_m = sum_b bank_route_b * slot_route_b,m
-novel_route = is_novel * admission * victim_route
+novel_route = novel_gate * admission_gate * victim_route
+matched_applied = (1 - novel_gate) * matched_route
+write_route = novel_route + matched_applied
 ```
 
 Forward therefore chooses one bank and one victim slot; backward has soft paths
-through both decisions. This avoids flattening short/mid/long semantics into an
-unrestricted global slot softmax. Top-k and bank quotas are ablations after
-top-1 correctness. A balance regularizer is added only if bank-collapse metrics
-justify it. Evaluation and inference may apply a hard `admission_threshold`;
-training must not use a hard-only admission path.
+through novelty, admission, bank, and victim decisions. This avoids flattening
+short/mid/long semantics into an unrestricted global slot softmax. Top-k and
+bank quotas are ablations after top-1 correctness. A balance regularizer is
+added only if bank-collapse metrics justify it.
 
 ### State update and accounting
 
 ```text
-write_route = where(is_novel, novel_route, matched_route)
 strength_m = mu_bank(m) * write_route_m
 next_state_m = state_m + strength_m * (candidate_m - state_m)
 ```
@@ -281,6 +297,13 @@ backward:
   continue with the previous boundary
 ```
 
+Because reconstruction divides by `1 - strength`, public configuration
+validation requires the maximum possible effective strength to be at most
+`0.95` whenever checkpointing is enabled. The bound includes half-life-derived
+update rates and, for `legacy_threshold`, `write_rel_floor`. Configurations over
+the bound fail before model initialization; the reverse kernel does not clamp
+the denominator and silently change gradients.
+
 For interval `I`, let `C = ceil(T / I) + 1`. The checkpointed tape-only memory
 is:
 
@@ -321,20 +344,28 @@ Implemented:
 2. value-space gate with model-space compatibility path;
 3. factorized candidate with validation that the selected rank reduces
    parameters;
-4. confidence-preserving matched routing, continuous admission, and sparse
-   bank-aware novel allocation in the portable reference;
+4. confidence-preserving matched routing, hard-forward/soft-backward novelty
+   and admission, and sparse bank-aware novel allocation in the portable
+   reference;
 5. separate GPU and TPU Pallas forward/backward kernel bodies;
 6. interval Screening training-tape checkpointing;
 7. fixed-total-dimension multi-read tiles and tile-count residual scaling.
 
 Portable and NNX tests cover legacy mapping, rejected-write accounting,
-confidence preservation, straight-through routing gradients, and sequence
-chunk parity. CPU Pallas interpret mode covers forward and all-input-gradient
-parity for the GPU and TPU checkpointed multi-read paths. TPU v5e-4 additionally
-passes real lowering, all-output/all-input-gradient parity, the tracked 0.185B
-recurrence shape with four read tiles and interval-16 checkpointing, and a
-four-device model-axis optimizer step. Real GPU lowering, measured peak memory,
-complete-model throughput, and multi-host scaling remain unverified for v2.
+confidence preservation, straight-through routing gradients, checkpoint
+strength validation, and sequence chunk parity. CPU Pallas interpret mode
+covers forward and all-input-gradient parity for the GPU and TPU checkpointed
+multi-read paths. The benchmark is fail-closed by default: any configured
+output, gradient, or loss threshold violation exits nonzero, with
+`--no-require-parity` reserved for diagnostics.
+
+TPU v5e-4 passed real lowering, all-output/all-input-gradient parity, the
+tracked 0.185B recurrence shape, and a four-device model-axis optimizer step on
+2026-07-16. That record predates the hard-forward/soft-backward novelty and
+admission correction. It remains historical evidence for the rest of v2, but
+the current routing equations require a fresh real-TPU lowering/parity run.
+Real GPU lowering, measured peak memory, complete-model throughput, and
+multi-host scaling also remain unverified for the corrected v2 path.
 
 Every stage must pass:
 

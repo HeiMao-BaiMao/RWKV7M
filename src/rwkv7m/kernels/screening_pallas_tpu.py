@@ -72,6 +72,7 @@ def _competitive_write_routing_tpu(
     *,
     route_power,
     novelty_threshold,
+    novelty_temperature,
     allocation_temperature,
     bank_route_temperature,
     allocation_age_weight,
@@ -116,12 +117,23 @@ def _competitive_write_routing_tpu(
         for powered in powered_values
     )
     is_novel = confidence < novelty_threshold
+    novel_soft = jax.nn.sigmoid(
+        (novelty_threshold - confidence) / novelty_temperature
+    )
+    novel_hard = is_novel.astype(jnp.float32)
+    novel_gate = novel_soft + jax.lax.stop_gradient(
+        novel_hard - novel_soft
+    )
 
-    effective_admission = admission
+    admission_soft = admission
+    admission_route = admission_soft
     if hard_admission:
-        effective_admission = (
-            admission >= admission_threshold
+        admission_hard = (
+            admission_soft >= admission_threshold
         ).astype(jnp.float32)
+        admission_route = admission_soft + jax.lax.stop_gradient(
+            admission_hard - admission_soft
+        )
 
     bank_members = tuple(
         tuple(
@@ -201,13 +213,16 @@ def _competitive_write_routing_tpu(
             victim_values[slot] = bank_routes[bank] * slot_route
 
     novel_values = tuple(
-        is_novel.astype(jnp.float32)
-        * effective_admission
+        novel_gate
+        * admission_route
         * victim_values[slot]
         for slot in range(slot_count)
     )
+    matched_values = tuple(
+        (1.0 - novel_gate) * value for value in matched_values
+    )
     write_values = tuple(
-        jnp.where(is_novel, novel_values[slot], matched_values[slot])
+        novel_values[slot] + matched_values[slot]
         for slot in range(slot_count)
     )
     write_route = jnp.stack(write_values)
@@ -220,7 +235,7 @@ def _competitive_write_routing_tpu(
         novel_route,
         confidence,
         is_novel,
-        effective_admission,
+        admission_soft,
         victim_route,
     )
 
@@ -245,6 +260,7 @@ def _screening_step(
     write_mode: str | None,
     route_power: float,
     novelty_threshold: float,
+    novelty_temperature: float,
     allocation_temperature: float,
     bank_route_temperature: float,
     allocation_age_weight: float,
@@ -353,7 +369,7 @@ def _screening_step(
         )
     matched_route = jnp.zeros_like(read_activity)
     novel_route = jnp.zeros_like(read_activity)
-    effective_admission = jnp.asarray(0.0, dtype=jnp.float32)
+    admission_probability = jnp.asarray(0.0, dtype=jnp.float32)
     is_novel = jnp.asarray(False)
     if resolved_mode in ("legacy_threshold", "competitive_novel"):
         write_relevance_values = []
@@ -382,11 +398,11 @@ def _screening_step(
     elif resolved_mode == "competitive_novel":
         (
             effective_write_relevance,
-            raw_matched_route,
+            matched_route,
             novel_route,
             _,
             is_novel,
-            effective_admission,
+            admission_probability,
             _,
         ) = _competitive_write_routing_tpu(
             write_relevance,
@@ -397,6 +413,7 @@ def _screening_step(
             bank_ids_static,
             route_power=route_power,
             novelty_threshold=novelty_threshold,
+            novelty_temperature=novelty_temperature,
             allocation_temperature=allocation_temperature,
             bank_route_temperature=bank_route_temperature,
             allocation_age_weight=allocation_age_weight,
@@ -405,7 +422,6 @@ def _screening_step(
             admission_threshold=admission_threshold,
             eps=eps,
         )
-        matched_route = jnp.where(is_novel, 0.0, raw_matched_route)
         strength = mu_1d * effective_write_relevance
         next_ages = jnp.where(
             effective_write_relevance > eps, 0.0, ages_1d + 1.0
@@ -482,14 +498,14 @@ def _screening_step(
         novel_mass,
         route_entropy,
         route_top1,
-        effective_admission,
+        admission_probability,
         is_novel.astype(jnp.float32),
         (route_mass <= eps).astype(jnp.float32),
         *tuple(bank_write_mass),
         eviction_age,
         eviction_usage,
-        ((effective_admission < 0.05) & is_competitive).astype(jnp.float32),
-        ((effective_admission > 0.95) & is_competitive).astype(jnp.float32),
+        ((admission_probability < 0.05) & is_competitive).astype(jnp.float32),
+        ((admission_probability > 0.95) & is_competitive).astype(jnp.float32),
     )
     statistics = jnp.concatenate(
         tuple(jnp.reshape(value, (1, 1)) for value in statistic_scalars),
@@ -1408,6 +1424,7 @@ def _screening_step_config(config, time: int):
         "write_mode": config.write_mode,
         "route_power": config.route_power,
         "novelty_threshold": config.novelty_threshold,
+        "novelty_temperature": config.novelty_temperature,
         "allocation_temperature": config.allocation_temperature,
         "bank_route_temperature": config.bank_route_temperature,
         "allocation_age_weight": config.allocation_age_weight,

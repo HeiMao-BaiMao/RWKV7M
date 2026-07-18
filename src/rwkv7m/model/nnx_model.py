@@ -1266,13 +1266,12 @@ class NNXStateLevelScreening(nnx.Module):
             bank_ids=cfg.bank_ids,
             route_power=cfg.route_power,
             novelty_threshold=cfg.novelty_threshold,
+            novelty_temperature=cfg.novelty_temperature,
             allocation_temperature=cfg.allocation_temperature,
             bank_route_temperature=cfg.bank_route_temperature,
             allocation_age_weight=cfg.allocation_age_weight,
             allocation_usage_weight=cfg.allocation_usage_weight,
-            hard_admission=(
-                deterministic and cfg.admission_threshold is not None
-            ),
+            hard_admission=(write_mode == "competitive_novel"),
             admission_threshold=(
                 cfg.admission_threshold
                 if cfg.admission_threshold is not None

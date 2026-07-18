@@ -32,13 +32,14 @@
     "candidate_rank": 64,
     "route_power": 2.0,
     "novelty_threshold": 0.1,
+    "novelty_temperature": 0.1,
     "admission_init": 0.1,
     "allocation_temperature": 1.0,
     "bank_route_temperature": 1.0,
     "allocation_top_k": 1,
     "allocation_age_weight": 1.0,
     "allocation_usage_weight": 1.0,
-    "admission_threshold": null,
+    "admission_threshold": 0.5,
     "checkpoint_interval": 16,
     "n_read_tiles": 4
   }

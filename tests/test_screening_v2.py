@@ -127,6 +127,19 @@ def test_screening_v2_config_roundtrip_and_validation():
         _v2_config(candidate_rank=32)
     with pytest.raises(ValueError, match="divisible by n_read_tiles"):
         _v2_config(n_read_tiles=3)
+    with pytest.raises(ValueError, match="novelty_temperature"):
+        _v2_config(novelty_temperature=0.0)
+    with pytest.raises(ValueError, match="maximum effective screening"):
+        _v2_config(mu_short_max=0.96)
+    with pytest.raises(ValueError, match="maximum effective screening"):
+        _v2_config(short_half_life_tokens=0.1)
+    with pytest.raises(ValueError, match="maximum effective screening"):
+        _v2_config(
+            write_mode="legacy_threshold",
+            mu_short_max=0.5,
+            write_rel_floor=2.0,
+        )
+    _v2_config(checkpoint_interval=None, mu_short_max=0.99)
     with pytest.raises(ValueError, match="Unknown write mode"):
         screening_recurrence_reference(
             *_recurrence_inputs(),
@@ -150,6 +163,7 @@ def test_matched_route_preserves_absolute_confidence():
             (0, 1, 2),
             route_power=2.0,
             novelty_threshold=0.0,
+            novelty_temperature=0.1,
             allocation_temperature=1.0,
             bank_route_temperature=1.0,
             allocation_age_weight=1.0,
@@ -181,6 +195,7 @@ def test_novel_route_is_sparse_forward_with_soft_gradient():
             (0, 1, 2),
             route_power=1.0,
             novelty_threshold=0.1,
+            novelty_temperature=0.1,
             allocation_temperature=1.0,
             bank_route_temperature=1.0,
             allocation_age_weight=1.0,
@@ -201,6 +216,7 @@ def test_novel_route_is_sparse_forward_with_soft_gradient():
         (0, 1, 2),
         route_power=1.0,
         novelty_threshold=0.1,
+        novelty_temperature=0.1,
         allocation_temperature=1.0,
         bank_route_temperature=1.0,
         allocation_age_weight=1.0,
@@ -212,6 +228,90 @@ def test_novel_route_is_sparse_forward_with_soft_gradient():
     assert jnp.count_nonzero(route) == 1
     assert jnp.allclose(jnp.sum(route), 0.7)
     assert jnp.linalg.norm(jax.grad(objective)(logits)) > 0.0
+
+
+def test_training_admission_is_hard_forward_with_soft_gradient():
+    eligibility = jnp.zeros((1, 3), dtype=jnp.float32)
+    ages = jnp.asarray([[3.0, 2.0, 1.0]], dtype=jnp.float32)
+    usage = jnp.zeros((1, 3), dtype=jnp.float32)
+    bank_logits = jnp.zeros((1, 3), dtype=jnp.float32)
+
+    def objective(admission):
+        route, *_ = competitive_write_routing(
+            eligibility,
+            ages,
+            usage,
+            admission,
+            bank_logits,
+            (0, 1, 2),
+            route_power=1.0,
+            novelty_threshold=0.1,
+            novelty_temperature=0.1,
+            allocation_temperature=1.0,
+            bank_route_temperature=1.0,
+            allocation_age_weight=1.0,
+            allocation_usage_weight=1.0,
+            hard_admission=True,
+            admission_threshold=0.5,
+            eps=1e-6,
+        )
+        return jnp.sum(route)
+
+    rejected = jnp.asarray([0.1], dtype=jnp.float32)
+    assert objective(rejected) == 0.0
+    assert jax.grad(objective)(rejected)[0] > 0.0
+
+
+def test_novelty_switch_is_hard_forward_with_soft_confidence_gradient():
+    ages = jnp.asarray([[3.0, 2.0, 1.0]], dtype=jnp.float32)
+    usage = jnp.zeros((1, 3), dtype=jnp.float32)
+    weights = jnp.asarray([[1.0, 2.0, 4.0]], dtype=jnp.float32)
+
+    def objective(eligibility):
+        route, *_ = competitive_write_routing(
+            eligibility,
+            ages,
+            usage,
+            jnp.asarray([0.9], dtype=jnp.float32),
+            jnp.zeros((1, 3), dtype=jnp.float32),
+            (0, 1, 2),
+            route_power=1.0,
+            novelty_threshold=0.1,
+            novelty_temperature=0.1,
+            allocation_temperature=1.0,
+            bank_route_temperature=1.0,
+            allocation_age_weight=1.0,
+            allocation_usage_weight=1.0,
+            hard_admission=True,
+            admission_threshold=0.5,
+            eps=1e-6,
+        )
+        return jnp.sum(route * weights)
+
+    eligibility = jnp.asarray([[0.05, 0.02, 0.01]], dtype=jnp.float32)
+    route, *_ = competitive_write_routing(
+        eligibility,
+        ages,
+        usage,
+        jnp.asarray([0.9], dtype=jnp.float32),
+        jnp.zeros((1, 3), dtype=jnp.float32),
+        (0, 1, 2),
+        route_power=1.0,
+        novelty_threshold=0.1,
+        novelty_temperature=0.1,
+        allocation_temperature=1.0,
+        bank_route_temperature=1.0,
+        allocation_age_weight=1.0,
+        allocation_usage_weight=1.0,
+        hard_admission=True,
+        admission_threshold=0.5,
+        eps=1e-6,
+    )
+    assert jnp.count_nonzero(route) == 1
+    assert jnp.allclose(jnp.sum(route), 1.0)
+    gradient = jax.grad(objective)(eligibility)
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.linalg.norm(gradient) > 0.0
 
 
 def test_rejected_novel_write_does_not_change_content_or_reset_age():
@@ -228,7 +328,6 @@ def test_rejected_novel_write_does_not_change_content_or_reset_age():
     outputs = screening_recurrence_reference(
         *inputs,
         _recurrence_config(
-            hard_admission=True,
             admission_threshold=0.5,
             novelty_threshold=0.1,
             bank_ids=(0, 1, 2),
