@@ -1471,6 +1471,17 @@ class NNXStateLevelScreening(nnx.Module):
                 screening_v5_recurrence_reference,
             )
 
+            # Keep the complete state-forming recurrence boundary in FP32.
+            # Casting BF16 projection results inside individual scan steps is
+            # forward-equivalent, but leaves their reverse-scan cotangents on
+            # a mixed-precision path. Learned, weak routes can make that path
+            # non-finite at production context lengths on ROCm. Projection
+            # GEMMs and the module output remain in the configured compute
+            # dtype; only recurrent state/cotangent transport is promoted.
+            v5_projected_inputs = tuple(
+                value.astype(jnp.float32) for value in projected_inputs
+            )
+
             v5_config = ScreeningV5RecurrenceConfig(
                 use_value_unit_norm=cfg.use_value_unit_norm,
                 usage_ema_decay=cfg.usage_ema_decay,
@@ -1504,8 +1515,8 @@ class NNXStateLevelScreening(nnx.Module):
                 write_accounting_floor=cfg.write_accounting_floor,
             )
             recurrence_outputs = screening_v5_recurrence_reference(
-                projected_inputs[0],
-                projected_inputs[1],
+                v5_projected_inputs[0],
+                v5_projected_inputs[1],
                 jnp.swapaxes(admission_seq, 0, 1),
                 _value(self.admission_feature_weights).astype(jnp.float32),
                 jnp.swapaxes(bank_logits_seq, 0, 1),
@@ -1513,11 +1524,11 @@ class NNXStateLevelScreening(nnx.Module):
                 jnp.swapaxes(matched_write_logits, 0, 1),
                 jnp.swapaxes(novel_erase_logits, 0, 1),
                 jnp.swapaxes(novel_write_logits, 0, 1),
-                *projected_inputs[2:],
+                *v5_projected_inputs[2:],
                 slots,
-                initial_read_keys,
-                initial_values,
-                initial_write_keys,
+                initial_read_keys.astype(jnp.float32),
+                initial_values.astype(jnp.float32),
+                initial_write_keys.astype(jnp.float32),
                 ages,
                 usage_ema,
                 occupancy,
