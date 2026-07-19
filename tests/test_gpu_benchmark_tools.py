@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+from flax import nnx
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -28,6 +30,7 @@ PROFILE = _load("profile_gpu_train_compute")
 COMPARE = _load("compare_compute_benchmarks")
 CUDA_RANGE = _load("cuda_profiler_range")
 LOCAL = _load("benchmark_local_train_compute")
+DIAGNOSE = _load("diagnose_local_train_step")
 
 
 def test_fixed_batch_content_hash_ignores_container_and_mapping_order(tmp_path):
@@ -118,6 +121,21 @@ def test_local_benchmark_reports_the_executed_v5_screening_backend():
     )
     config.use_screening = False
     assert LOCAL._screening_execution(config) == ("disabled", None)
+
+
+def test_gradient_diagnostic_reports_nonfinite_values_and_largest_leaf():
+    gradients = nnx.State(
+        {
+            "finite": jnp.asarray([1.0, -3.0], dtype=jnp.float32),
+            "invalid": jnp.asarray([jnp.nan, jnp.inf], dtype=jnp.float32),
+        }
+    )
+    summary = DIAGNOSE.summarize_gradient_state(gradients, top_k=1)
+    assert summary["leaf_count"] == 2
+    assert summary["nonfinite_leaf_count"] == 1
+    assert summary["nonfinite_value_count"] == 2
+    assert summary["nonfinite_gradients"][0]["path"] == "invalid"
+    assert summary["largest_finite_gradients"][0]["path"] == "finite"
 
 
 def test_nsight_rejects_conflicting_profile_mode():
