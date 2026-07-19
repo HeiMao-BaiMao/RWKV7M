@@ -123,6 +123,15 @@ def test_local_benchmark_reports_the_executed_v5_screening_backend():
     assert LOCAL._screening_execution(config) == ("disabled", None)
 
 
+def test_local_benchmark_finite_gate_checks_every_inexact_leaf():
+    assert LOCAL._tree_all_finite(
+        {"finite": jnp.asarray([1.0]), "step": jnp.asarray(1)}
+    )
+    assert not LOCAL._tree_all_finite(
+        {"invalid": jnp.asarray([jnp.nan]), "finite": jnp.asarray([1.0])}
+    )
+
+
 def test_gradient_diagnostic_reports_nonfinite_values_and_largest_leaf():
     gradients = nnx.State(
         {

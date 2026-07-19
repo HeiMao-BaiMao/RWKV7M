@@ -75,6 +75,15 @@ def parse_args(argv=None):
     parser.add_argument("--profile-iterations", type=int, default=3)
     parser.add_argument("--profile-output", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--require-finite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Fail after writing the report if setup gradients, losses, or "
+            "the final updated train state contain non-finite values."
+        ),
+    )
     remat = parser.add_mutually_exclusive_group()
     remat.add_argument("--remat-blocks", dest="remat_blocks", action="store_true")
     remat.add_argument("--no-remat-blocks", dest="remat_blocks", action="store_false")
@@ -122,6 +131,18 @@ def _screening_execution(config):
     return backend, semantics
 
 
+def _tree_all_finite(tree):
+    checks = [
+        jnp.all(jnp.isfinite(value))
+        for value in jax.tree.leaves(tree)
+        if hasattr(value, "dtype")
+        and jnp.issubdtype(value.dtype, jnp.inexact)
+    ]
+    if not checks:
+        return True
+    return bool(jax.device_get(jnp.all(jnp.stack(checks))))
+
+
 def _measure(function, arguments, *, warmup, iterations):
     for _ in range(warmup):
         jax.block_until_ready(function(*arguments))
@@ -151,7 +172,7 @@ def _measure_full_step(
         train_state, last_loss = function(train_state)
         jax.block_until_ready((train_state, last_loss))
         samples.append((time.perf_counter_ns() - started) / 1_000_000.0)
-    return timing_summary(samples), last_loss
+    return timing_summary(samples), last_loss, train_state
 
 
 def _measure_optimizer(
@@ -324,7 +345,11 @@ def main(argv=None):
                 iterations=args.benchmark_iterations,
             ),
         }
-        timings["full_step"], last_loss = _measure_full_step(
+        (
+            timings["full_step"],
+            last_loss,
+            final_train_state,
+        ) = _measure_full_step(
             full_step,
             bundle_state,
             warmup=args.benchmark_warmup,
@@ -383,6 +408,13 @@ def main(argv=None):
     )
     devices = jax.devices()
     screening_backend, screening_semantics = _screening_execution(config)
+    finite_gate = {
+        "prepared_loss": bool(jax.device_get(jnp.isfinite(prepared_loss))),
+        "prepared_gradients": _tree_all_finite(gradients),
+        "last_loss": bool(jax.device_get(jnp.isfinite(last_loss))),
+        "final_train_state": _tree_all_finite(final_train_state),
+    }
+    finite_gate["passed"] = all(finite_gate.values())
     payload = {
         "schema_version": COMPUTE_BENCHMARK_SCHEMA_VERSION,
         "benchmark_kind": "train_compute_only",
@@ -462,12 +494,15 @@ def main(argv=None):
             "eps": config.adam_eps,
         },
         "last_loss": float(last_loss),
+        "finite_gate": finite_gate,
         "timings": timings,
     }
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
+    if args.require_finite and not finite_gate["passed"]:
+        raise SystemExit("non-finite benchmark state detected")
     return 0
 
 
