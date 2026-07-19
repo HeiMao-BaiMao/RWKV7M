@@ -49,6 +49,14 @@ def parse_args(argv=None):
             "chunking without changing checkpoint tensor shapes."
         ),
     )
+    parser.add_argument(
+        "--float32-model",
+        action="store_true",
+        help=(
+            "Run the restored weights and activations in float32 to separate "
+            "mixed-precision overflow from the recurrence equations."
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -160,6 +168,9 @@ def main(argv=None):
             if args.sequence_chunk_size == 0
             else args.sequence_chunk_size
         )
+    if args.float32_model:
+        config.dtype = "float32"
+        config.param_dtype = "float32"
     runtime, train_state = create_train_runtime(
         jax.random.key(args.seed),
         config,
@@ -172,6 +183,15 @@ def main(argv=None):
             train_state,
         )
         checkpoint_step = restored.start_step
+    if args.float32_model:
+        promoted_params = jax.tree.map(
+            lambda value: value.astype(jnp.float32)
+            if hasattr(value, "dtype")
+            and jnp.issubdtype(value.dtype, jnp.inexact)
+            else value,
+            nnx.state(train_state.model, nnx.Param),
+        )
+        nnx.update(train_state.model, promoted_params)
     graphdef, params = nnx.split(train_state.model, nnx.Param)
 
     def loss_function(active_params):
@@ -201,6 +221,7 @@ def main(argv=None):
         "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
         "training_step": int(checkpoint_step),
         "sequence_chunk_size": config.sequence_chunk_size,
+        "float32_model": bool(args.float32_model),
         "devices": [
             {
                 "platform": device.platform,
