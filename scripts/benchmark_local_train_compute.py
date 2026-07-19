@@ -37,7 +37,11 @@ from rwkv7m.kernels import (
     resolve_training_loss_backend,
     resolve_wkv_backend,
 )
-from rwkv7m.model import MODEL_PRESET_NAMES, model_preset
+from rwkv7m.model import (
+    MODEL_PRESET_NAMES,
+    model_preset,
+    resolve_semantics_version,
+)
 from rwkv7m.train.nnx_train import nnx_model_loss
 
 
@@ -104,6 +108,18 @@ def _git_revision():
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return None
+
+
+def _screening_execution(config):
+    if not config.use_screening:
+        return "disabled", None
+    semantics = resolve_semantics_version(config.screening)
+    backend = (
+        "portable_jax_v5"
+        if semantics in {"screening-v5-core", "screening-v5-retention"}
+        else resolve_screening_backend()
+    )
+    return backend, semantics
 
 
 def _measure(function, arguments, *, warmup, iterations):
@@ -366,6 +382,7 @@ def main(argv=None):
         tokens * 1000.0 / timings["full_step"]["median_ms"]
     )
     devices = jax.devices()
+    screening_backend, screening_semantics = _screening_execution(config)
     payload = {
         "schema_version": COMPUTE_BENCHMARK_SCHEMA_VERSION,
         "benchmark_kind": "train_compute_only",
@@ -402,7 +419,8 @@ def main(argv=None):
             "head_chunk_size": config.head_chunk_size,
             "training_vocab_tile_size": config.training_vocab_tile_size,
             "wkv_backend": resolve_wkv_backend(),
-            "screening_backend": resolve_screening_backend(),
+            "screening_backend": screening_backend,
+            "screening_semantics_version": screening_semantics,
             "training_loss_backend": (
                 resolve_training_loss_backend()
                 if config.training_vocab_tile_size is not None

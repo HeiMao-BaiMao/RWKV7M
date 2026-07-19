@@ -3,6 +3,7 @@ import copy
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -26,6 +27,7 @@ MATRIX = _load("benchmark_gpu_train_matrix")
 PROFILE = _load("profile_gpu_train_compute")
 COMPARE = _load("compare_compute_benchmarks")
 CUDA_RANGE = _load("cuda_profiler_range")
+LOCAL = _load("benchmark_local_train_compute")
 
 
 def test_fixed_batch_content_hash_ignores_container_and_mapping_order(tmp_path):
@@ -100,6 +102,22 @@ def test_nsight_systems_command_uses_post_warmup_cuda_range(tmp_path):
 def test_cuda_runtime_candidate_search_is_safe_without_cuda_installation():
     candidates = tuple(CUDA_RANGE._cudart_candidates())
     assert len(candidates) == len(set(candidates))
+
+
+def test_local_benchmark_reports_the_executed_v5_screening_backend():
+    config = SimpleNamespace(
+        use_screening=True,
+        screening=SimpleNamespace(
+            semantics_version="screening-v5-core",
+            write_mode="competitive_novel",
+        ),
+    )
+    assert LOCAL._screening_execution(config) == (
+        "portable_jax_v5",
+        "screening-v5-core",
+    )
+    config.use_screening = False
+    assert LOCAL._screening_execution(config) == ("disabled", None)
 
 
 def test_nsight_rejects_conflicting_profile_mode():
