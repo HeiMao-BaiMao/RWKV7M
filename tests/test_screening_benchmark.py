@@ -2,6 +2,8 @@ from argparse import Namespace
 from pathlib import Path
 import sys
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -25,6 +27,18 @@ def test_screening_benchmark_requires_parity_by_default():
     args = parse_args([])
     assert args.require_parity is True
     assert parse_args(["--no-require-parity"]).require_parity is False
+
+
+def test_screening_benchmark_rejects_v5_accelerator_label():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--semantics-version",
+                "screening-v5-core",
+                "--write-mode",
+                "competitive_novel",
+            ]
+        )
 
 
 def test_screening_benchmark_parity_gate_is_fail_closed():

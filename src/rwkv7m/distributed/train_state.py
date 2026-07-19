@@ -53,6 +53,11 @@ def _place_recurrent_states(tree, mesh, *, data_axis, model_axis):
                     slots=jax.device_put(layer.slots, slots),
                     ages=jax.device_put(layer.ages, token_state),
                     usage_ema=jax.device_put(layer.usage_ema, token_state),
+                    occupancy=(
+                        None
+                        if layer.occupancy is None
+                        else jax.device_put(layer.occupancy, token_state)
+                    ),
                 )
                 for layer in tree.layers
             )

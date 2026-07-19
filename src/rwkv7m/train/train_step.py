@@ -70,6 +70,19 @@ def _linen_train_step(train_state, batch, rwkv_state, screen_state, phase="read_
             "slot_utilization",
             "dead_slot_rate",
             "slot_cosine_redundancy",
+            "matched_erase_mass",
+            "matched_write_mass",
+            "novel_erase_mass",
+            "novel_write_mass",
+            "accepted_novel_rate",
+            "empty_allocation_rate",
+            "occupied_eviction_rate",
+            "read_energy_mean",
+            "write_saturation_rate",
+            "write_budget_rate",
+            "screening_residual_rms",
+            "base_residual_rms",
+            "screening_base_rms_ratio",
         ):
             metrics[key] = stats.get(key, jnp.zeros(()))
         return loss, (metrics, new_rwkv_state, new_screen_state)

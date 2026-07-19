@@ -8,7 +8,8 @@ The screening measurements here predate the corrected competitive Screening
 v2 path. In the semantics vocabulary of
 [`RWKV7M.paper.md`](../RWKV7M.paper.md) v5, they cover the
 earlier projected legacy recurrence, not `screening-v4-competitive` and not the
-design-only `screening-v5-core` or `screening-v5-retention` profiles.
+portable-only `screening-v5-core` candidate or design-only
+`screening-v5-retention` profile.
 
 ## Summary
 

@@ -10,8 +10,10 @@ parity and stable-learning gates remain open. Multi-host gates remain pending.
 Here, "v2" names the second implemented Screening architecture. The
 accompanying paper is now `design-locked-draft-v5`; its
 `screening-v4-legacy` and `screening-v4-competitive` profiles describe the
-predecessor implemented by this contract, while `screening-v5-core` and
-`screening-v5-retention` are design-only profiles. The architecture revision,
+predecessor implemented by this contract. The portable `screening-v5-core`
+Phase 1 candidate is documented separately in
+[`state_level_screening_v5_design.md`](state_level_screening_v5_design.md),
+while `screening-v5-retention` remains design-only. The architecture revision,
 paper draft, and semantics labels therefore track different artifacts.
 
 This document is the implementation contract for State-Level Screening v2.

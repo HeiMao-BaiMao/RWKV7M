@@ -6,7 +6,7 @@
 
 **対象**: RWKV-7系、または固定容量recurrent stateを持つefficient sequence model
 
-**基礎実装**: JAX/Flax NNX、portable reference recurrence、GPU/TPU Pallas recurrence
+**基礎実装**: JAX/Flax NNX、portable reference recurrence、v4 GPU/TPU Pallas recurrence
 
 **意味論バージョン**:
 
@@ -20,10 +20,13 @@ screening-v5-retention
 **実装状況**:
 
 * v4 legacyおよびcompetitive screeningはopt-in実装済み
-* portable referenceとGPU/TPU Pallas pathが存在する
+* v4にはportable referenceとGPU/TPU Pallas pathが存在する
 * 補正後v4 recurrenceはTPU v5e-4で実機parityおよび性能測定済み
 * corrected v4 competitive GPU pathの実機検証は未実施
-* 本稿のv5 core修正およびv5 retentionは設計仕様であり、未実装である
+* v5 coreのPhase 1 portable referenceおよびNNX統合は実装済みである
+* tracked v5 configは`tied` editを用い、continuous editingとredundancy victim policyをheadline pathから外している
+* v5 Pallas、v5 checkpoint redesign、v5 retentionは未実装である
+* warm-up限定admission floorはopt-in実装済みだが、有効性は未実証である
 * v5のmodel quality改善は未実証
 
 **主張の強さ**:
@@ -1011,6 +1014,47 @@ memory branch causal delta
 ```
 
 で検出する。
+
+## 8.3 Warm-up-Limited Admission Floor
+
+上限write budgetはalways-writeを抑制するが、never-writeには罰則を与えない。
+Phase 1のopt-in curriculumとして、空容量が残る初期期間だけsoft admissionへ下限を置く。
+
+```text
+remaining_empty_fraction_t =
+    1 - mean_m(o_t,m)
+
+target_min_rate(step) =
+    initial_min_rate
+    * max(
+        1 - step / admission_floor_steps,
+        0
+      )
+    * stop_gradient(
+        remaining_empty_fraction_t
+      )
+```
+
+```text
+L_admission_floor =
+    lambda_floor
+    * relu(
+        target_min_rate(step)
+        - mean_t(
+            novel_soft_t
+            * admission_soft_t
+          )
+      )^2
+```
+
+この補助損失は、warm-up終了後またはmemory満杯時に厳密に0とする。恒久的なwrite quota、
+固定最適write rate、memory利用の証拠として扱わない。headline比較では、floorなし、floorあり、
+およびmemory branch counterfactualを分けて報告する。
+
+同じwarm-up区間では、`lambda_screen`にもannealする非負下限を設定できる。これは初期に
+residual scaleだけを0へ落とす退化解を抑えるためのcurriculumであり、warm-up終了後はlearned
+scaleだけを使用する。gate biasは飽和初期化せず、read RMS、base RMS、両者の比、learned scale、
+適用中のfloorを記録する。
 
 ---
 
@@ -2205,7 +2249,7 @@ semantics_version:
 | --- | --- | --- |
 | `screening-v4-legacy` | `disabled`, `legacy_unconditional`, `legacy_threshold` | implemented compatibility contract |
 | `screening-v4-competitive` | `competitive_novel` | implemented predecessor contract |
-| `screening-v5-core` | `competitive_novel` | design-only |
+| `screening-v5-core` | `competitive_novel` | portable Phase 1 candidate; accelerator gate未通過 |
 | `screening-v5-retention` | `competitive_novel` | design-only |
 
 同じ`write_mode=competitive_novel`でも、semantics versionが異なればoccupancy、

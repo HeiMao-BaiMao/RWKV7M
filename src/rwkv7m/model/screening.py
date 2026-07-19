@@ -16,6 +16,14 @@ _VALID_WRITE_MODES = {
 }
 _VALID_GATE_SPACES = {"model", "value"}
 _VALID_GATE_ACTIVATIONS = {"sigmoid", "tanh_silu"}
+_VALID_SEMANTICS_VERSIONS = {
+    "screening-v4-legacy",
+    "screening-v4-competitive",
+    "screening-v5-core",
+    "screening-v5-retention",
+}
+_VALID_CAPACITY_CALIBRATION = {"fixed", "analytic"}
+_VALID_EDIT_MODES = {"tied", "capacity_conserving", "free_edit"}
 
 
 def normalize_phase(phase: str) -> str:
@@ -35,6 +43,32 @@ def normalize_write_mode(write_mode: str) -> str:
             f"{sorted(_VALID_WRITE_MODES)}."
         )
     return write_mode
+
+
+def normalize_semantics_version(semantics_version: str) -> str:
+    if semantics_version not in _VALID_SEMANTICS_VERSIONS:
+        raise ValueError(
+            f"Unknown screening semantics version {semantics_version!r}. "
+            f"Expected one of {sorted(_VALID_SEMANTICS_VERSIONS)}."
+        )
+    return semantics_version
+
+
+def resolve_semantics_version(config) -> str:
+    """Resolve missing versions without silently upgrading v4 artifacts."""
+
+    if config.semantics_version is not None:
+        return normalize_semantics_version(config.semantics_version)
+    if config.write_mode == "competitive_novel":
+        return "screening-v4-competitive"
+    return "screening-v4-legacy"
+
+
+def is_v5_semantics(config) -> bool:
+    return resolve_semantics_version(config) in {
+        "screening-v5-core",
+        "screening-v5-retention",
+    }
 
 
 def resolve_write_mode(config, phase: str) -> str:
@@ -84,6 +118,42 @@ def theta_from_tau(tau):
 def trim_square(sim, tau, eps=1e-6):
     x = (sim - tau) / (1.0 - tau + eps)
     return jnp.square(jax.nn.relu(x))
+
+
+def capacity_calibrated_similarity_threshold(
+    test_count,
+    key_dimension,
+    false_positive_rate,
+    *,
+    tau_min,
+    tau_max,
+):
+    """High-dimensional null-similarity threshold from the v5 contract.
+
+    This is the paper's analytic initialization approximation. It is a
+    calibration policy, not a guarantee about learned key distributions.
+    """
+
+    tests = jnp.maximum(
+        jnp.asarray(test_count, dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+    )
+    dimension = jnp.asarray(key_dimension, dtype=jnp.float32)
+    delta = jnp.asarray(false_positive_rate, dtype=jnp.float32)
+    threshold = jnp.sqrt(2.0 * jnp.log(tests / delta) / dimension)
+    return jnp.clip(threshold, tau_min, tau_max)
+
+
+def bounded_non_amplifying_aggregate(z_sum):
+    """Clip only aggregate vectors whose norm exceeds one."""
+
+    energy = jnp.sum(
+        z_sum.astype(jnp.float32) ** 2,
+        axis=-1,
+        keepdims=True,
+    )
+    denominator = jnp.sqrt(1.0 + jax.nn.relu(energy - 1.0))
+    return z_sum / denominator, energy[..., 0]
 
 
 def relevance_with_warmup(sim, tau, alpha, gamma=8.0):
@@ -332,11 +402,15 @@ class ScreeningConfig:
     tau_init: float = 0.0
     tanh_norm_cap: float = 1.0
     lambda_screen_init: float = 0.01
+    lambda_screen_warmup_floor: float = 0.0
+    lambda_screen_warmup_steps: int = 0
     eps: float = 1e-6
     use_value_unit_norm: bool = True
     use_age_mask: bool = False
     use_bank_bias: bool = False
     use_write_screening: bool = False
+    # Missing versions retain the historical v4 migration rule.
+    semantics_version: str | None = None
     # ``None`` preserves the legacy phase/use_write_screening mapping.
     write_mode: str | None = None
     write_rel_floor: float = 1e-3
@@ -367,6 +441,24 @@ class ScreeningConfig:
     admission_threshold: float | None = 0.5
     checkpoint_interval: int | None = None
     n_read_tiles: int = 1
+    capacity_calibration: str = "fixed"
+    tau_min: float = -0.95
+    tau_max: float = 0.95
+    target_false_read_rate: float = 0.05
+    target_false_write_rate: float = 0.05
+    target_false_match_rate: float = 0.01
+    threshold_warmup_by_load: bool = True
+    threshold_warmup_tau: float = -0.25
+    eta_ambiguity: float = 0.5
+    edit_mode: str = "capacity_conserving"
+    erase_gate_init: float = 0.9
+    write_gate_init: float = 0.9
+    write_accounting_floor: float = 1e-4
+    allocation_redundancy_weight: float = 1.0
+    # Initial anti-starvation curriculum; this is not a permanent write quota.
+    admission_floor_target_initial: float = 0.0
+    admission_floor_weight: float = 0.0
+    admission_floor_steps: int = 0
 
     def __post_init__(self):
         self.screened_layers = tuple(self.screened_layers)
@@ -378,6 +470,18 @@ class ScreeningConfig:
             raise ValueError("bank_ids values must be only 0, 1, or 2")
         if self.write_rel_floor < 0.0:
             raise ValueError("write_rel_floor must be non-negative")
+        if self.lambda_screen_warmup_floor < 0.0:
+            raise ValueError("lambda_screen_warmup_floor must be non-negative")
+        if self.lambda_screen_warmup_steps < 0:
+            raise ValueError("lambda_screen_warmup_steps must be non-negative")
+        if (
+            self.lambda_screen_warmup_floor > 0.0
+            and self.lambda_screen_warmup_steps == 0
+        ):
+            raise ValueError(
+                "an enabled lambda warm-up floor requires "
+                "lambda_screen_warmup_steps > 0"
+            )
         for name, value in (
             ("mu_short_max", self.mu_short_max),
             ("mu_mid_max", self.mu_mid_max),
@@ -387,6 +491,22 @@ class ScreeningConfig:
                 raise ValueError(f"{name} must be in [0, 1)")
         if self.write_mode is not None:
             normalize_write_mode(self.write_mode)
+        semantics_version = resolve_semantics_version(self)
+        if (
+            semantics_version == "screening-v4-legacy"
+            and self.write_mode == "competitive_novel"
+        ):
+            raise ValueError(
+                "screening-v4-legacy does not allow competitive_novel"
+            )
+        if (
+            semantics_version
+            in {"screening-v4-competitive", "screening-v5-core", "screening-v5-retention"}
+            and self.write_mode != "competitive_novel"
+        ):
+            raise ValueError(
+                f"{semantics_version} requires write_mode='competitive_novel'"
+            )
         if self.gate_space not in _VALID_GATE_SPACES:
             raise ValueError(
                 f"gate_space must be one of {sorted(_VALID_GATE_SPACES)}"
@@ -440,6 +560,90 @@ class ScreeningConfig:
             raise ValueError("d_k must be divisible by n_read_tiles")
         if self.d_v % self.n_read_tiles != 0:
             raise ValueError("d_v must be divisible by n_read_tiles")
+        if self.capacity_calibration not in _VALID_CAPACITY_CALIBRATION:
+            raise ValueError(
+                "capacity_calibration must be one of "
+                f"{sorted(_VALID_CAPACITY_CALIBRATION)}"
+            )
+        if not -1.0 < self.tau_min < self.tau_max < 1.0:
+            raise ValueError("tau_min and tau_max must satisfy -1 < min < max < 1")
+        if not self.tau_min <= self.tau_init <= self.tau_max:
+            raise ValueError("tau_init must lie within [tau_min, tau_max]")
+        if not self.tau_min <= self.threshold_warmup_tau <= self.tau_max:
+            raise ValueError(
+                "threshold_warmup_tau must lie within [tau_min, tau_max]"
+            )
+        for name, value in (
+            ("target_false_read_rate", self.target_false_read_rate),
+            ("target_false_write_rate", self.target_false_write_rate),
+            ("target_false_match_rate", self.target_false_match_rate),
+        ):
+            if not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be in (0, 1)")
+        if self.eta_ambiguity < 0.0:
+            raise ValueError("eta_ambiguity must be non-negative")
+        if self.edit_mode not in _VALID_EDIT_MODES:
+            raise ValueError(
+                f"edit_mode must be one of {sorted(_VALID_EDIT_MODES)}"
+            )
+        for name, value in (
+            ("erase_gate_init", self.erase_gate_init),
+            ("write_gate_init", self.write_gate_init),
+        ):
+            if not 0.0 < value < 1.0:
+                raise ValueError(f"{name} must be in (0, 1)")
+        if not 0.0 < self.write_accounting_floor <= 1.0:
+            raise ValueError("write_accounting_floor must be in (0, 1]")
+        if self.allocation_redundancy_weight < 0.0:
+            raise ValueError(
+                "allocation_redundancy_weight must be non-negative"
+            )
+        if not 0.0 <= self.admission_floor_target_initial <= 1.0:
+            raise ValueError(
+                "admission_floor_target_initial must be in [0, 1]"
+            )
+        if self.admission_floor_weight < 0.0:
+            raise ValueError("admission_floor_weight must be non-negative")
+        if self.admission_floor_steps < 0:
+            raise ValueError("admission_floor_steps must be non-negative")
+        if (
+            self.admission_floor_target_initial > 0.0
+            and self.admission_floor_weight > 0.0
+            and self.admission_floor_steps == 0
+        ):
+            raise ValueError(
+                "an enabled admission floor requires admission_floor_steps > 0"
+            )
+        if semantics_version in {"screening-v5-core", "screening-v5-retention"}:
+            if self.gate_space != "value":
+                raise ValueError("v5 semantics requires gate_space='value'")
+            if self.candidate_rank is None:
+                raise ValueError("v5 semantics requires a factorized candidate")
+            if self.capacity_calibration != "analytic":
+                raise ValueError(
+                    "v5 semantics requires capacity_calibration='analytic'"
+                )
+            if self.use_age_mask:
+                raise ValueError("v5 semantics does not use age as a read mask")
+            if self.use_leaky_warmup:
+                raise ValueError(
+                    "v5 hard-read semantics does not use the v4 leaky warmup"
+                )
+            if self.checkpoint_interval is not None:
+                raise ValueError(
+                    "v5 checkpoint redesign is not implemented; "
+                    "checkpoint_interval must be None"
+                )
+        elif (
+            self.admission_floor_target_initial > 0.0
+            or self.admission_floor_weight > 0.0
+            or self.admission_floor_steps > 0
+            or self.lambda_screen_warmup_floor > 0.0
+            or self.lambda_screen_warmup_steps > 0
+        ):
+            raise ValueError(
+                "anti-starvation curricula are defined only for v5 semantics"
+            )
         half_lives = (
             self.short_half_life_tokens,
             self.mid_half_life_tokens,
@@ -491,6 +695,11 @@ class StateLevelScreening(nn.Module):
 
     def setup(self):
         cfg = self.config
+        if is_v5_semantics(cfg):
+            raise NotImplementedError(
+                "Screening v5 model integration is NNX-only; the portable "
+                "semantic reference is screening_v5_recurrence_reference"
+            )
         self.q_proj_r = nn.Dense(cfg.d_k, use_bias=False, name="q_proj_r")
         self.k_proj_r = nn.Dense(cfg.d_k, use_bias=False, name="k_proj_r")
         self.v_proj = nn.Dense(cfg.d_v, use_bias=False, name="v_proj")

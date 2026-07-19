@@ -36,8 +36,18 @@ def add_optimizer_backend_arg(parser: argparse.ArgumentParser):
 
 
 def add_screening_v2_args(parser: argparse.ArgumentParser):
-    """Add architecture controls for the opt-in Screening v2 path."""
+    """Add versioned architecture controls for Screening v4/v5 paths."""
 
+    parser.add_argument(
+        "--screening-semantics-version",
+        choices=(
+            "screening-v4-legacy",
+            "screening-v4-competitive",
+            "screening-v5-core",
+            "screening-v5-retention",
+        ),
+        default=None,
+    )
     parser.add_argument(
         "--write-mode",
         choices=(
@@ -57,6 +67,12 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         "--screening-gate-activation",
         choices=("sigmoid", "tanh_silu"),
         default="sigmoid",
+    )
+    parser.add_argument(
+        "--screening-lambda-warmup-floor", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--screening-lambda-warmup-steps", type=int, default=0
     )
     parser.add_argument("--screening-candidate-rank", type=int, default=None)
     parser.add_argument("--screening-route-power", type=float, default=1.0)
@@ -86,14 +102,100 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         "--screening-checkpoint-interval", type=int, default=None
     )
     parser.add_argument("--screening-read-tiles", type=int, default=1)
+    parser.add_argument(
+        "--screening-capacity-calibration",
+        choices=("fixed", "analytic"),
+        default="fixed",
+    )
+    parser.add_argument("--screening-tau-min", type=float, default=-0.95)
+    parser.add_argument("--screening-tau-max", type=float, default=0.95)
+    parser.add_argument(
+        "--screening-target-false-read-rate",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--screening-target-false-write-rate",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--screening-target-false-match-rate",
+        type=float,
+        default=0.01,
+    )
+    parser.add_argument(
+        "--screening-threshold-warmup-by-load",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--screening-threshold-warmup-tau",
+        type=float,
+        default=-0.25,
+    )
+    parser.add_argument(
+        "--screening-eta-ambiguity",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--screening-edit-mode",
+        choices=("tied", "capacity_conserving", "free_edit"),
+        default="capacity_conserving",
+    )
+    parser.add_argument(
+        "--screening-erase-gate-init",
+        type=float,
+        default=0.9,
+    )
+    parser.add_argument(
+        "--screening-write-gate-init",
+        type=float,
+        default=0.9,
+    )
+    parser.add_argument(
+        "--screening-write-accounting-floor",
+        type=float,
+        default=1e-4,
+    )
+    parser.add_argument(
+        "--screening-allocation-redundancy-weight",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--screening-admission-floor-target-initial",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--screening-admission-floor-weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--screening-admission-floor-steps",
+        type=int,
+        default=0,
+    )
 
 
 def screening_v2_kwargs(args):
     return {
+        "semantics_version": getattr(
+            args, "screening_semantics_version", None
+        ),
         "write_mode": getattr(args, "write_mode", None),
         "gate_space": getattr(args, "screening_gate_space", "model"),
         "gate_activation": getattr(
             args, "screening_gate_activation", "sigmoid"
+        ),
+        "lambda_screen_warmup_floor": getattr(
+            args, "screening_lambda_warmup_floor", 0.0
+        ),
+        "lambda_screen_warmup_steps": getattr(
+            args, "screening_lambda_warmup_steps", 0
         ),
         "candidate_rank": getattr(args, "screening_candidate_rank", None),
         "route_power": getattr(args, "screening_route_power", 1.0),
@@ -123,6 +225,53 @@ def screening_v2_kwargs(args):
             args, "screening_checkpoint_interval", None
         ),
         "n_read_tiles": getattr(args, "screening_read_tiles", 1),
+        "capacity_calibration": getattr(
+            args, "screening_capacity_calibration", "fixed"
+        ),
+        "tau_min": getattr(args, "screening_tau_min", -0.95),
+        "tau_max": getattr(args, "screening_tau_max", 0.95),
+        "target_false_read_rate": getattr(
+            args, "screening_target_false_read_rate", 0.05
+        ),
+        "target_false_write_rate": getattr(
+            args, "screening_target_false_write_rate", 0.05
+        ),
+        "target_false_match_rate": getattr(
+            args, "screening_target_false_match_rate", 0.01
+        ),
+        "threshold_warmup_by_load": getattr(
+            args, "screening_threshold_warmup_by_load", True
+        ),
+        "threshold_warmup_tau": getattr(
+            args, "screening_threshold_warmup_tau", -0.25
+        ),
+        "eta_ambiguity": getattr(
+            args, "screening_eta_ambiguity", 0.5
+        ),
+        "edit_mode": getattr(
+            args, "screening_edit_mode", "capacity_conserving"
+        ),
+        "erase_gate_init": getattr(
+            args, "screening_erase_gate_init", 0.9
+        ),
+        "write_gate_init": getattr(
+            args, "screening_write_gate_init", 0.9
+        ),
+        "write_accounting_floor": getattr(
+            args, "screening_write_accounting_floor", 1e-4
+        ),
+        "allocation_redundancy_weight": getattr(
+            args, "screening_allocation_redundancy_weight", 1.0
+        ),
+        "admission_floor_target_initial": getattr(
+            args, "screening_admission_floor_target_initial", 0.0
+        ),
+        "admission_floor_weight": getattr(
+            args, "screening_admission_floor_weight", 0.0
+        ),
+        "admission_floor_steps": getattr(
+            args, "screening_admission_floor_steps", 0
+        ),
     }
 
 

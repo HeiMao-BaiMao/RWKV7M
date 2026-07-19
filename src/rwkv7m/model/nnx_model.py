@@ -28,7 +28,9 @@ from .screening import (
     apply_screening_gate,
     bounded_tau,
     compute_slot_delta,
+    is_v5_semantics,
     normalize_phase,
+    resolve_semantics_version,
     resolve_write_mode,
     theta_from_tau,
     unit_norm,
@@ -935,6 +937,11 @@ class NNXStateLevelScreening(nnx.Module):
         param_dtype=jnp.float32,
     ):
         self.config = config
+        self.semantics_version = resolve_semantics_version(config)
+        if self.semantics_version == "screening-v5-retention":
+            raise NotImplementedError(
+                "screening-v5-retention is gated on v5-core evaluation"
+            )
         self.sharding = sharding
         self.compute_dtype = compute_dtype
         C = config.d_model
@@ -1051,15 +1058,26 @@ class NNXStateLevelScreening(nnx.Module):
             param_dtype=param_dtype,
         )
         tau_r_shape = () if config.n_read_tiles == 1 else (config.n_read_tiles,)
-        self.tau_r_raw = _param(
-            rngs,
-            lambda k, s, d=jnp.float32: jnp.full(
-                s, theta_from_tau(config.tau_init), dtype=d
-            ),
-            tau_r_shape,
-            sharding=sharding,
-            dtype=param_dtype,
-        )
+        if is_v5_semantics(config):
+            self.tau_r_raw = nnx.data(None)
+            self.tau_r_offset = _param(
+                rngs,
+                initializers.zeros_init(),
+                tau_r_shape,
+                sharding=sharding,
+                dtype=param_dtype,
+            )
+        else:
+            self.tau_r_raw = _param(
+                rngs,
+                lambda k, s, d=jnp.float32: jnp.full(
+                    s, theta_from_tau(config.tau_init), dtype=d
+                ),
+                tau_r_shape,
+                sharding=sharding,
+                dtype=param_dtype,
+            )
+            self.tau_r_offset = nnx.data(None)
         lambda_init = math.log(math.expm1(config.lambda_screen_init))
         self.lambda_raw = _param(rngs, initializers.constant(lambda_init), (), sharding=sharding, dtype=param_dtype)
         self.slot_embed = _param(rngs, initializers.normal(0.02), (config.n_slots, config.d_slot), axes=slot, sharding=sharding, dtype=param_dtype)
@@ -1085,11 +1103,23 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
-            self.tau_w_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding, dtype=param_dtype)
+            if is_v5_semantics(config):
+                self.tau_w_raw = nnx.data(None)
+                self.tau_w_offset = _param(
+                    rngs,
+                    initializers.zeros_init(),
+                    (),
+                    sharding=sharding,
+                    dtype=param_dtype,
+                )
+            else:
+                self.tau_w_raw = _param(rngs, lambda k, s, d=jnp.float32: jnp.asarray(theta_from_tau(config.tau_init), d), (), sharding=sharding, dtype=param_dtype)
+                self.tau_w_offset = nnx.data(None)
         else:
             self.q_proj_w = nnx.data(None)
             self.k_proj_w = nnx.data(None)
             self.tau_w_raw = nnx.data(None)
+            self.tau_w_offset = nnx.data(None)
         if config.write_mode == "competitive_novel":
             route_input_size = 2 * C
             admission_bias = math.log(
@@ -1114,9 +1144,68 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
+            if is_v5_semantics(config):
+                self.admission_feature_weights = _param(
+                    rngs,
+                    initializers.zeros_init(),
+                    (5,),
+                    sharding=sharding,
+                    dtype=param_dtype,
+                )
+            else:
+                self.admission_feature_weights = nnx.data(None)
+            if is_v5_semantics(config) and config.edit_mode != "tied":
+                erase_bias = math.log(
+                    config.erase_gate_init / (1.0 - config.erase_gate_init)
+                )
+                write_bias = math.log(
+                    config.write_gate_init / (1.0 - config.write_gate_init)
+                )
+
+                def matched_edit_bias(key, shape, dtype=jnp.float32):
+                    del key
+                    return jnp.concatenate(
+                        [
+                            jnp.full((config.n_slots,), erase_bias, dtype=dtype),
+                            jnp.full((config.n_slots,), write_bias, dtype=dtype),
+                        ]
+                    )
+
+                def novel_edit_bias(key, shape, dtype=jnp.float32):
+                    del key, shape
+                    return jnp.asarray([erase_bias, write_bias], dtype=dtype)
+
+                self.matched_edit_proj = _linear(
+                    route_input_size,
+                    2 * config.n_slots,
+                    kernel_axes=row,
+                    kernel_init=initializers.zeros_init(),
+                    bias_init=matched_edit_bias,
+                    rngs=rngs,
+                    sharding=sharding,
+                    dtype=compute_dtype,
+                    param_dtype=param_dtype,
+                )
+                self.novel_edit_proj = _linear(
+                    route_input_size,
+                    2,
+                    kernel_axes=row,
+                    kernel_init=initializers.zeros_init(),
+                    bias_init=novel_edit_bias,
+                    rngs=rngs,
+                    sharding=sharding,
+                    dtype=compute_dtype,
+                    param_dtype=param_dtype,
+                )
+            else:
+                self.matched_edit_proj = nnx.data(None)
+                self.novel_edit_proj = nnx.data(None)
         else:
             self.admission_proj = nnx.data(None)
             self.bank_route_proj = nnx.data(None)
+            self.matched_edit_proj = nnx.data(None)
+            self.novel_edit_proj = nnx.data(None)
+            self.admission_feature_weights = nnx.data(None)
 
     def _compute_mu(self):
         cfg = self.config
@@ -1145,13 +1234,30 @@ class NNXStateLevelScreening(nnx.Module):
         *,
         phase="read_screening_only",
         deterministic=True,
+        training_step=None,
     ):
         cfg = self.config
         phase = normalize_phase(phase)
+        v5_enabled = is_v5_semantics(cfg)
+        if v5_enabled and phase != "read_write":
+            raise ValueError(
+                "v5 semantics requires phase='read_write' so occupancy can be "
+                "initialized through explicit novel allocation"
+            )
         write_mode = resolve_write_mode(cfg, phase)
         slots = _constrain_slots(state.slots.astype(jnp.float32), self.sharding)
         ages = state.ages.astype(jnp.float32)
         usage_ema = state.usage_ema.astype(jnp.float32)
+        if v5_enabled and state.occupancy is None:
+            raise ValueError(
+                "screening-v5 state requires explicit occupancy metadata; "
+                "a v4 checkpoint cannot be upgraded implicitly"
+            )
+        occupancy = (
+            jnp.zeros_like(ages)
+            if state.occupancy is None
+            else state.occupancy.astype(jnp.float32)
+        )
         x_ln_seq = _apply_norm_in_float32(
             self.screen_ln,
             x_seq,
@@ -1203,9 +1309,34 @@ class NNXStateLevelScreening(nnx.Module):
         delta_read_keys = self.k_proj_r(delta_s_seq)
         delta_values = self.v_proj(delta_s_seq)
 
-        tau_r = bounded_tau(_value(self.tau_r_raw)).astype(jnp.float32)
-        lambda_screen = jax.nn.softplus(_value(self.lambda_raw)).astype(
+        tau_r = (
+            _value(self.tau_r_offset).astype(jnp.float32)
+            if v5_enabled
+            else bounded_tau(_value(self.tau_r_raw)).astype(jnp.float32)
+        )
+        learned_lambda_screen = jax.nn.softplus(_value(self.lambda_raw)).astype(
             jnp.float32
+        )
+        lambda_screen_floor = jnp.zeros((), dtype=jnp.float32)
+        if (
+            v5_enabled
+            and training_step is not None
+            and cfg.lambda_screen_warmup_floor > 0.0
+            and cfg.lambda_screen_warmup_steps > 0
+        ):
+            lambda_screen_floor = (
+                cfg.lambda_screen_warmup_floor
+                * jnp.clip(
+                    1.0
+                    - jnp.asarray(training_step, dtype=jnp.float32)
+                    / float(cfg.lambda_screen_warmup_steps),
+                    0.0,
+                    1.0,
+                )
+            )
+        lambda_screen = jnp.maximum(
+            learned_lambda_screen,
+            lambda_screen_floor,
         )
         mu = self._compute_mu().astype(jnp.float32)
         uses_write_score = write_mode in (
@@ -1219,14 +1350,26 @@ class NNXStateLevelScreening(nnx.Module):
             q_w_seq = unit_norm(
                 self.q_proj_w(q_w_in).astype(jnp.float32), eps=cfg.eps
             )
-            tau_w = bounded_tau(_value(self.tau_w_raw)).astype(jnp.float32)
+            tau_w = (
+                _value(self.tau_w_offset).astype(jnp.float32)
+                if v5_enabled
+                else bounded_tau(_value(self.tau_w_raw)).astype(jnp.float32)
+            )
             slot_embed = _value(self.slot_embed)
-            initial_write_keys = self.k_proj_w(
-                slots + slot_embed[None, :, :]
-            )
-            delta_write_keys = self.k_proj_w(
-                delta_s_seq + slot_embed[None, None, :, :]
-            )
+            if v5_enabled:
+                # Explicit occupancy removes the v4 need to perturb zero keys
+                # with slot identity. Keeping the identity term here would
+                # break P((1-e)s + w*d) consistency when write_mass !=
+                # erase_mass.
+                initial_write_keys = self.k_proj_w(slots)
+                delta_write_keys = self.k_proj_w(delta_s_seq)
+            else:
+                initial_write_keys = self.k_proj_w(
+                    slots + slot_embed[None, :, :]
+                )
+                delta_write_keys = self.k_proj_w(
+                    delta_s_seq + slot_embed[None, None, :, :]
+                )
         else:
             q_w_seq = jnp.zeros_like(q_r_seq)
             tau_w = jnp.zeros((), dtype=jnp.float32)
@@ -1237,49 +1380,60 @@ class NNXStateLevelScreening(nnx.Module):
             route_input = jnp.concatenate(
                 [x_ln_seq, h_base_seq.astype(self.compute_dtype)], axis=-1
             )
-            admission_seq = jax.nn.sigmoid(
-                self.admission_proj(route_input).astype(jnp.float32)[..., 0]
+            admission_projection = self.admission_proj(route_input).astype(
+                jnp.float32
+            )[..., 0]
+            admission_seq = (
+                admission_projection
+                if v5_enabled
+                else jax.nn.sigmoid(admission_projection)
             )
             bank_logits_seq = self.bank_route_proj(route_input).astype(
                 jnp.float32
             )
+            if v5_enabled and cfg.edit_mode != "tied":
+                matched_edit_logits = self.matched_edit_proj(
+                    route_input
+                ).astype(jnp.float32)
+                matched_erase_logits, matched_write_logits = jnp.split(
+                    matched_edit_logits,
+                    2,
+                    axis=-1,
+                )
+                novel_edit_logits = self.novel_edit_proj(route_input).astype(
+                    jnp.float32
+                )
+                novel_erase_logits = novel_edit_logits[..., 0]
+                novel_write_logits = novel_edit_logits[..., 1]
+            else:
+                matched_erase_logits = jnp.zeros(
+                    (*q_r_seq.shape[:2], cfg.n_slots),
+                    dtype=jnp.float32,
+                )
+                matched_write_logits = jnp.zeros_like(
+                    matched_erase_logits
+                )
+                novel_erase_logits = jnp.zeros(
+                    q_r_seq.shape[:2],
+                    dtype=jnp.float32,
+                )
+                novel_write_logits = jnp.zeros_like(novel_erase_logits)
         else:
             admission_seq = jnp.zeros(q_r_seq.shape[:2], dtype=jnp.float32)
             bank_logits_seq = jnp.zeros(
                 (*q_r_seq.shape[:2], 3), dtype=jnp.float32
             )
+            matched_erase_logits = jnp.zeros(
+                (*q_r_seq.shape[:2], cfg.n_slots),
+                dtype=jnp.float32,
+            )
+            matched_write_logits = jnp.zeros_like(matched_erase_logits)
+            novel_erase_logits = jnp.zeros(
+                q_r_seq.shape[:2],
+                dtype=jnp.float32,
+            )
+            novel_write_logits = jnp.zeros_like(novel_erase_logits)
 
-        recurrence_config = ScreeningRecurrenceConfig(
-            write_enabled=uses_write_score,
-            use_value_unit_norm=cfg.use_value_unit_norm,
-            use_leaky_warmup=cfg.use_leaky_warmup,
-            leaky_alpha=cfg.leaky_alpha,
-            leaky_gamma=cfg.leaky_gamma,
-            use_age_mask=cfg.use_age_mask,
-            age_ref=cfg.age_ref,
-            age_sigma=cfg.age_sigma,
-            write_rel_floor=cfg.write_rel_floor,
-            usage_ema_decay=cfg.usage_ema_decay,
-            tanh_norm_cap=cfg.tanh_norm_cap,
-            eps=cfg.eps,
-            write_mode=write_mode,
-            bank_ids=cfg.bank_ids,
-            route_power=cfg.route_power,
-            novelty_threshold=cfg.novelty_threshold,
-            novelty_temperature=cfg.novelty_temperature,
-            allocation_temperature=cfg.allocation_temperature,
-            bank_route_temperature=cfg.bank_route_temperature,
-            allocation_age_weight=cfg.allocation_age_weight,
-            allocation_usage_weight=cfg.allocation_usage_weight,
-            hard_admission=(write_mode == "competitive_novel"),
-            admission_threshold=(
-                cfg.admission_threshold
-                if cfg.admission_threshold is not None
-                else 0.5
-            ),
-            n_read_tiles=cfg.n_read_tiles,
-            checkpoint_interval=cfg.checkpoint_interval,
-        )
         projected_inputs = tuple(
             jnp.swapaxes(value, 0, 1)
             for value in (
@@ -1291,47 +1445,150 @@ class NNXStateLevelScreening(nnx.Module):
                 delta_write_keys,
             )
         )
-        recurrence_inputs = (
-            projected_inputs[0],
-            projected_inputs[1],
-            jnp.swapaxes(admission_seq, 0, 1),
-            jnp.swapaxes(bank_logits_seq, 0, 1),
-            *projected_inputs[2:],
-        )
-        state_inputs = (
-            slots,
-            initial_read_keys,
-            initial_values,
-            initial_write_keys,
-            ages,
-            usage_ema,
-            mu,
-            tau_r,
-            tau_w,
-        )
-        if self.sharding is None:
-            recurrence_outputs = screening_recurrence(
-                *recurrence_inputs,
-                *state_inputs,
-                recurrence_config,
+        if v5_enabled:
+            from .screening_v5 import (
+                ScreeningV5RecurrenceConfig,
+                screening_v5_recurrence_reference,
             )
+
+            v5_config = ScreeningV5RecurrenceConfig(
+                use_value_unit_norm=cfg.use_value_unit_norm,
+                usage_ema_decay=cfg.usage_ema_decay,
+                tanh_norm_cap=cfg.tanh_norm_cap,
+                eps=cfg.eps,
+                bank_ids=cfg.bank_ids,
+                route_power=cfg.route_power,
+                novelty_temperature=cfg.novelty_temperature,
+                admission_threshold=(
+                    cfg.admission_threshold
+                    if cfg.admission_threshold is not None
+                    else 0.5
+                ),
+                allocation_temperature=cfg.allocation_temperature,
+                bank_route_temperature=cfg.bank_route_temperature,
+                allocation_age_weight=cfg.allocation_age_weight,
+                allocation_usage_weight=cfg.allocation_usage_weight,
+                allocation_redundancy_weight=(
+                    cfg.allocation_redundancy_weight
+                ),
+                n_read_tiles=cfg.n_read_tiles,
+                tau_min=cfg.tau_min,
+                tau_max=cfg.tau_max,
+                target_false_read_rate=cfg.target_false_read_rate,
+                target_false_write_rate=cfg.target_false_write_rate,
+                target_false_match_rate=cfg.target_false_match_rate,
+                threshold_warmup_by_load=cfg.threshold_warmup_by_load,
+                threshold_warmup_tau=cfg.threshold_warmup_tau,
+                eta_ambiguity=cfg.eta_ambiguity,
+                edit_mode=cfg.edit_mode,
+                write_accounting_floor=cfg.write_accounting_floor,
+            )
+            recurrence_outputs = screening_v5_recurrence_reference(
+                projected_inputs[0],
+                projected_inputs[1],
+                jnp.swapaxes(admission_seq, 0, 1),
+                _value(self.admission_feature_weights).astype(jnp.float32),
+                jnp.swapaxes(bank_logits_seq, 0, 1),
+                jnp.swapaxes(matched_erase_logits, 0, 1),
+                jnp.swapaxes(matched_write_logits, 0, 1),
+                jnp.swapaxes(novel_erase_logits, 0, 1),
+                jnp.swapaxes(novel_write_logits, 0, 1),
+                *projected_inputs[2:],
+                slots,
+                initial_read_keys,
+                initial_values,
+                initial_write_keys,
+                ages,
+                usage_ema,
+                occupancy,
+                mu,
+                tau_r,
+                tau_w,
+                v5_config,
+            )
+            (
+                u_time,
+                final_slots,
+                final_ages,
+                final_usage,
+                final_occupancy,
+                step_statistics,
+                update_squared,
+            ) = recurrence_outputs
         else:
-            recurrence_outputs = screening_recurrence_sharded(
-                *recurrence_inputs,
-                *state_inputs,
-                recurrence_config,
-                mesh=self.sharding.mesh,
-                data_axis=self.sharding.data_axis,
-                model_axis=self.sharding.model_axis,
+            recurrence_config = ScreeningRecurrenceConfig(
+                write_enabled=uses_write_score,
+                use_value_unit_norm=cfg.use_value_unit_norm,
+                use_leaky_warmup=cfg.use_leaky_warmup,
+                leaky_alpha=cfg.leaky_alpha,
+                leaky_gamma=cfg.leaky_gamma,
+                use_age_mask=cfg.use_age_mask,
+                age_ref=cfg.age_ref,
+                age_sigma=cfg.age_sigma,
+                write_rel_floor=cfg.write_rel_floor,
+                usage_ema_decay=cfg.usage_ema_decay,
+                tanh_norm_cap=cfg.tanh_norm_cap,
+                eps=cfg.eps,
+                write_mode=write_mode,
+                bank_ids=cfg.bank_ids,
+                route_power=cfg.route_power,
+                novelty_threshold=cfg.novelty_threshold,
+                novelty_temperature=cfg.novelty_temperature,
+                allocation_temperature=cfg.allocation_temperature,
+                bank_route_temperature=cfg.bank_route_temperature,
+                allocation_age_weight=cfg.allocation_age_weight,
+                allocation_usage_weight=cfg.allocation_usage_weight,
+                hard_admission=(write_mode == "competitive_novel"),
+                admission_threshold=(
+                    cfg.admission_threshold
+                    if cfg.admission_threshold is not None
+                    else 0.5
+                ),
+                n_read_tiles=cfg.n_read_tiles,
+                checkpoint_interval=cfg.checkpoint_interval,
             )
-        (
-            u_time,
-            final_slots,
-            final_ages,
-            final_usage,
-            step_statistics,
-            update_squared,
-        ) = recurrence_outputs
+            recurrence_inputs = (
+                projected_inputs[0],
+                projected_inputs[1],
+                jnp.swapaxes(admission_seq, 0, 1),
+                jnp.swapaxes(bank_logits_seq, 0, 1),
+                *projected_inputs[2:],
+            )
+            state_inputs = (
+                slots,
+                initial_read_keys,
+                initial_values,
+                initial_write_keys,
+                ages,
+                usage_ema,
+                mu,
+                tau_r,
+                tau_w,
+            )
+            if self.sharding is None:
+                recurrence_outputs = screening_recurrence(
+                    *recurrence_inputs,
+                    *state_inputs,
+                    recurrence_config,
+                )
+            else:
+                recurrence_outputs = screening_recurrence_sharded(
+                    *recurrence_inputs,
+                    *state_inputs,
+                    recurrence_config,
+                    mesh=self.sharding.mesh,
+                    data_axis=self.sharding.data_axis,
+                    model_axis=self.sharding.model_axis,
+                )
+            (
+                u_time,
+                final_slots,
+                final_ages,
+                final_usage,
+                step_statistics,
+                update_squared,
+            ) = recurrence_outputs
+            final_occupancy = state.occupancy
 
         u_seq = jnp.swapaxes(u_time, 0, 1)
         effective_lambda = lambda_screen / math.sqrt(cfg.n_read_tiles)
@@ -1348,6 +1605,15 @@ class NNXStateLevelScreening(nnx.Module):
         h_seq = (
             h_base_seq + effective_lambda * memory_branch
         ).astype(h_base_seq.dtype)
+        screening_residual = (
+            effective_lambda * memory_branch.astype(jnp.float32)
+        )
+        screening_residual_rms = jnp.sqrt(
+            jnp.mean(screening_residual**2)
+        )
+        base_residual_rms = jnp.sqrt(
+            jnp.mean(h_base_seq.astype(jnp.float32) ** 2)
+        )
 
         final_slots_normalized = unit_norm(final_slots, eps=cfg.eps)
         if self.sharding is not None and self.sharding.uses_explicit_axes:
@@ -1369,7 +1635,21 @@ class NNXStateLevelScreening(nnx.Module):
             )
         slot_count = final_slots.shape[1]
         off_diagonal = 1.0 - jnp.eye(slot_count, dtype=jnp.float32)
-        redundancy_denominator = max(slot_count * (slot_count - 1), 1)
+        if v5_enabled:
+            occupancy_pair = (
+                final_occupancy[:, :, None] * final_occupancy[:, None, :]
+            )
+            redundancy_mask = off_diagonal[None, :, :] * occupancy_pair
+            redundancy_denominator = jnp.maximum(
+                jnp.sum(redundancy_mask),
+                1.0,
+            )
+        else:
+            redundancy_mask = off_diagonal[None, :, :]
+            redundancy_denominator = (
+                final_slots.shape[0]
+                * max(slot_count * (slot_count - 1), 1)
+            )
 
         stats = {
             "rel_read_mean": jnp.mean(step_statistics[..., READ_MEAN]),
@@ -1381,9 +1661,6 @@ class NNXStateLevelScreening(nnx.Module):
             ),
             "z_norm_mean": jnp.mean(step_statistics[..., Z_NORM]),
             "u_norm_mean": jnp.mean(step_statistics[..., U_NORM]),
-            "tau_r": jnp.mean(tau_r),
-            "tau_r_min": jnp.min(tau_r),
-            "tau_r_max": jnp.max(tau_r),
             "lambda_screen": effective_lambda,
             "rel_write_mean": jnp.mean(
                 step_statistics[..., WRITE_MEAN]
@@ -1395,7 +1672,6 @@ class NNXStateLevelScreening(nnx.Module):
             "slot_usage_ema_mean": jnp.mean(
                 step_statistics[..., USAGE_MEAN]
             ),
-            "tau_w": tau_w,
             "matched_route_mass": jnp.mean(
                 step_statistics[..., MATCHED_ROUTE_MASS]
             ),
@@ -1438,18 +1714,109 @@ class NNXStateLevelScreening(nnx.Module):
             "eviction_usage_mean": jnp.mean(
                 step_statistics[..., EVICTION_USAGE_MEAN]
             ),
-            "slot_utilization": jnp.mean(final_usage > 1e-3),
-            "dead_slot_rate": jnp.mean(final_usage <= 1e-3),
             "slot_cosine_redundancy": jnp.sum(
-                jnp.abs(slot_similarity) * off_diagonal[None, :, :]
-            ) / (final_slots.shape[0] * redundancy_denominator),
+                jnp.abs(slot_similarity) * redundancy_mask
+            )
+            / redundancy_denominator,
         }
+        if v5_enabled:
+            from .screening_v5 import (
+                ACCEPTED_NOVEL_RATE,
+                EMPTY_ALLOCATION_RATE,
+                MATCHED_ERASE_MASS,
+                MATCHED_WRITE_MASS,
+                NOVEL_ERASE_MASS,
+                NOVEL_WRITE_MASS,
+                OCCUPIED_EVICTION_RATE,
+                READ_ENERGY_MEAN,
+                TAU_NOVEL_MEAN,
+                TAU_READ_MEAN,
+                TAU_WRITE_MEAN,
+                WRITE_BUDGET_RATE,
+                WRITE_SATURATION_RATE,
+            )
+
+            stats.update(
+                {
+                    "tau_r": jnp.mean(
+                        step_statistics[..., TAU_READ_MEAN]
+                    ),
+                    "tau_r_min": jnp.min(
+                        step_statistics[..., TAU_READ_MEAN]
+                    ),
+                    "tau_r_max": jnp.max(
+                        step_statistics[..., TAU_READ_MEAN]
+                    ),
+                    "tau_w": jnp.mean(
+                        step_statistics[..., TAU_WRITE_MEAN]
+                    ),
+                    "tau_novel": jnp.mean(
+                        step_statistics[..., TAU_NOVEL_MEAN]
+                    ),
+                    "slot_utilization": jnp.mean(final_occupancy),
+                    "dead_slot_rate": jnp.mean(final_occupancy <= 0.5),
+                    "matched_erase_mass": jnp.mean(
+                        step_statistics[..., MATCHED_ERASE_MASS]
+                    ),
+                    "matched_write_mass": jnp.mean(
+                        step_statistics[..., MATCHED_WRITE_MASS]
+                    ),
+                    "novel_erase_mass": jnp.mean(
+                        step_statistics[..., NOVEL_ERASE_MASS]
+                    ),
+                    "novel_write_mass": jnp.mean(
+                        step_statistics[..., NOVEL_WRITE_MASS]
+                    ),
+                    "accepted_novel_rate": jnp.mean(
+                        step_statistics[..., ACCEPTED_NOVEL_RATE]
+                    ),
+                    "empty_allocation_rate": jnp.mean(
+                        step_statistics[..., EMPTY_ALLOCATION_RATE]
+                    ),
+                    "occupied_eviction_rate": jnp.mean(
+                        step_statistics[..., OCCUPIED_EVICTION_RATE]
+                    ),
+                    "read_energy_mean": jnp.mean(
+                        step_statistics[..., READ_ENERGY_MEAN]
+                    ),
+                    "write_saturation_rate": jnp.mean(
+                        step_statistics[..., WRITE_SATURATION_RATE]
+                    ),
+                    "write_budget_rate": jnp.mean(
+                        step_statistics[..., WRITE_BUDGET_RATE]
+                    ),
+                    "screening_residual_rms": screening_residual_rms,
+                    "base_residual_rms": base_residual_rms,
+                    "screening_base_rms_ratio": screening_residual_rms
+                    / (base_residual_rms + cfg.eps),
+                    "lambda_screen_learned": learned_lambda_screen
+                    / math.sqrt(cfg.n_read_tiles),
+                    "lambda_screen_floor": lambda_screen_floor
+                    / math.sqrt(cfg.n_read_tiles),
+                }
+            )
+        else:
+            stats.update(
+                {
+                    "tau_r": jnp.mean(tau_r),
+                    "tau_r_min": jnp.min(tau_r),
+                    "tau_r_max": jnp.max(tau_r),
+                    "tau_w": tau_w,
+                    "slot_utilization": jnp.mean(final_usage > 1e-3),
+                    "dead_slot_rate": jnp.mean(final_usage <= 1e-3),
+                }
+            )
         new_state = LayerScreenState(
             slots=_constrain_slots(final_slots, self.sharding).astype(
                 state.slots.dtype
             ),
             ages=final_ages,
             usage_ema=final_usage.astype(state.usage_ema.dtype),
+            occupancy=(
+                final_occupancy.astype(jnp.float32)
+                if v5_enabled
+                else state.occupancy
+            ),
         )
         return h_seq, new_state, stats
 
@@ -1489,7 +1856,15 @@ class NNXScreenedRWKVLayer(nnx.Module):
             )
 
     def __call__(
-        self, x, v_first, rwkv_state, screen_state, *, phase, deterministic
+        self,
+        x,
+        v_first,
+        rwkv_state,
+        screen_state,
+        *,
+        phase,
+        deterministic,
+        training_step=None,
     ):
         block = getattr(self, self._block_name)
         h_base, v_first, new_rwkv_state = block(x, v_first, rwkv_state)
@@ -1501,6 +1876,7 @@ class NNXScreenedRWKVLayer(nnx.Module):
                 screen_state,
                 phase=phase,
                 deterministic=deterministic,
+                training_step=training_step,
             )
         else:
             h, new_screen, stats = h_base, screen_state, {}
@@ -1515,6 +1891,7 @@ def _call_screened_layer(
     screen_state,
     phase,
     deterministic,
+    training_step,
 ):
     return layer(
         x,
@@ -1523,6 +1900,7 @@ def _call_screened_layer(
         screen_state,
         phase=phase,
         deterministic=deterministic,
+        training_step=training_step,
     )
 
 
@@ -1610,6 +1988,7 @@ class NNXScreenedRWKVModel(nnx.Module):
         *,
         phase="read_screening_only",
         deterministic=True,
+        training_step=None,
     ):
         cfg = self.config
         phase = normalize_phase(phase)
@@ -1656,6 +2035,7 @@ class NNXScreenedRWKVModel(nnx.Module):
                 scr_state,
                 phase,
                 deterministic,
+                training_step,
             )
             new_rwkv_layers[layer_idx] = new_rwkv
             if layer_idx in screened_idx:
@@ -1761,6 +2141,7 @@ class NNXScreenedRWKVModel(nnx.Module):
         *,
         phase="read_screening_only",
         deterministic=True,
+        training_step=None,
     ):
         hidden, new_rwkv, new_screen, stats = self.compute_recurrent_hidden(
             input_ids,
@@ -1768,6 +2149,7 @@ class NNXScreenedRWKVModel(nnx.Module):
             screen_state,
             phase=phase,
             deterministic=deterministic,
+            training_step=training_step,
         )
         return (
             self.compute_logits(hidden),

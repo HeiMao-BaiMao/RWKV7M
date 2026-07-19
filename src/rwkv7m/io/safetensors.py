@@ -7,7 +7,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from safetensors import safe_open
 from safetensors.flax import load_file, save_file
 
-from ..model import ModelConfig
+from ..model import ModelConfig, resolve_semantics_version
 from ..tokenizer import tokenizer_metadata as default_tokenizer_metadata
 from .config import model_config_from_dict, model_config_to_dict
 
@@ -40,6 +40,7 @@ def _standard_metadata(config: ModelConfig, tokenizer_metadata=None):
             if screening.write_mode is not None
             else "legacy_phase_mapping"
         ),
+        "screening_semantics_version": resolve_semantics_version(screening),
         "screening_gate_space": screening.gate_space,
         "screening_gate_activation": screening.gate_activation,
         "screening_candidate_rank": (

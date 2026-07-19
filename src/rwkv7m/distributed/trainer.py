@@ -107,6 +107,19 @@ def _linen_eval_step_data_parallel(train_state, batch, rwkv_state, screen_state,
         "slot_utilization",
         "dead_slot_rate",
         "slot_cosine_redundancy",
+        "matched_erase_mass",
+        "matched_write_mass",
+        "novel_erase_mass",
+        "novel_write_mass",
+        "accepted_novel_rate",
+        "empty_allocation_rate",
+        "occupied_eviction_rate",
+        "read_energy_mean",
+        "write_saturation_rate",
+        "write_budget_rate",
+        "screening_residual_rms",
+        "base_residual_rms",
+        "screening_base_rms_ratio",
     ):
         metrics[key] = stats.get(key, jnp.zeros(()))
     return metrics, new_rwkv_state, new_screen_state
@@ -114,7 +127,12 @@ def _linen_eval_step_data_parallel(train_state, batch, rwkv_state, screen_state,
 
 @nnx.jit(static_argnames=("phase",))
 def _nnx_eval_step_data_parallel(
-    model, batch, rwkv_state, screen_state, phase="read_screening_only"
+    model,
+    batch,
+    rwkv_state,
+    screen_state,
+    training_step,
+    phase="read_screening_only",
 ):
     _, (metrics, new_rwkv_state, new_screen_state) = nnx_model_loss(
         model,
@@ -124,6 +142,7 @@ def _nnx_eval_step_data_parallel(
         phase=phase,
         deterministic=True,
         include_l2wrap=False,
+        training_step=training_step,
     )
     return metrics, new_rwkv_state, new_screen_state
 
@@ -137,6 +156,7 @@ def eval_step_data_parallel(
             batch,
             rwkv_state,
             screen_state,
+            train_state.step,
             phase=phase,
         )
     return _linen_eval_step_data_parallel(

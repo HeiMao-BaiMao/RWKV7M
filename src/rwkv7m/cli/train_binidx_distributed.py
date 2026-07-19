@@ -241,6 +241,23 @@ def _metric_record(args, split, step, metrics, *, elapsed=None):
         "slot_utilization",
         "dead_slot_rate",
         "slot_cosine_redundancy",
+        "matched_erase_mass",
+        "matched_write_mass",
+        "novel_erase_mass",
+        "novel_write_mass",
+        "accepted_novel_rate",
+        "empty_allocation_rate",
+        "occupied_eviction_rate",
+        "read_energy_mean",
+        "write_saturation_rate",
+        "write_budget_rate",
+        "admission_floor_loss",
+        "admission_floor_target",
+        "lambda_screen_learned",
+        "lambda_screen_floor",
+        "screening_residual_rms",
+        "base_residual_rms",
+        "screening_base_rms_ratio",
     ):
         record[key] = metrics.get(key)
     if elapsed is not None and elapsed > 0:

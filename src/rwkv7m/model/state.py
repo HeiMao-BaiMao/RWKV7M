@@ -1,6 +1,8 @@
 from flax import struct
 import jax.numpy as jnp
 
+from .screening import is_v5_semantics
+
 
 @struct.dataclass
 class LayerRWKVState:
@@ -14,6 +16,7 @@ class LayerScreenState:
     slots: jnp.ndarray      # [B, M, d_s]
     ages: jnp.ndarray       # [B, M]
     usage_ema: jnp.ndarray  # [B, M]
+    occupancy: jnp.ndarray | None = None  # v5 hard state [B, M]
 
 
 @struct.dataclass
@@ -29,6 +32,14 @@ def init_screen_state(batch_size, config):
                 slots=jnp.zeros((batch_size, config.n_slots, config.d_slot), dtype=jnp.float32),
                 ages=jnp.zeros((batch_size, config.n_slots), dtype=jnp.float32),
                 usage_ema=jnp.zeros((batch_size, config.n_slots), dtype=jnp.float32),
+                occupancy=(
+                    jnp.zeros(
+                        (batch_size, config.n_slots),
+                        dtype=jnp.float32,
+                    )
+                    if is_v5_semantics(config)
+                    else None
+                ),
             )
         )
     return ModelScreenState(layers=tuple(layer_states))

@@ -33,6 +33,7 @@ def test_safetensors_roundtrip_params_and_config(tmp_path):
     assert metadata["dtype"] == config.dtype
     assert metadata["d_model"] == str(config.d_model)
     assert metadata["n_layers"] == str(config.n_layers)
+    assert metadata["screening_semantics_version"] == "screening-v4-legacy"
     assert metadata["tokenizer_format"] == "rwkv_vocab"
     assert len(metadata["tokenizer_vocab_sha256"]) == 64
     assert metadata["step"] == "7"

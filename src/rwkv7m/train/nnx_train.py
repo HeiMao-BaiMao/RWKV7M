@@ -163,6 +163,45 @@ def _merge_hidden_chunks(model, chunked_hidden):
     return jnp.reshape(transposed, shape)
 
 
+def compute_v5_admission_floor_loss(
+    write_rate,
+    slot_utilization,
+    screening_config,
+    training_step,
+):
+    """Return the temporary empty-capacity admission floor and its target."""
+
+    if (
+        training_step is None
+        or getattr(screening_config, "semantics_version", None)
+        not in {"screening-v5-core", "screening-v5-retention"}
+        or screening_config.admission_floor_weight <= 0.0
+        or screening_config.admission_floor_target_initial <= 0.0
+        or screening_config.admission_floor_steps <= 0
+    ):
+        zero = jnp.zeros((), dtype=jnp.float32)
+        return zero, zero
+    anneal = jnp.clip(
+        1.0
+        - jnp.asarray(training_step, dtype=jnp.float32)
+        / float(screening_config.admission_floor_steps),
+        0.0,
+        1.0,
+    )
+    empty_fraction = jax.lax.stop_gradient(
+        1.0 - jnp.asarray(slot_utilization, dtype=jnp.float32)
+    )
+    target = (
+        screening_config.admission_floor_target_initial
+        * anneal
+        * jnp.clip(empty_fraction, 0.0, 1.0)
+    )
+    loss = screening_config.admission_floor_weight * jnp.square(
+        jax.nn.relu(target - jnp.asarray(write_rate, dtype=jnp.float32))
+    )
+    return loss, target
+
+
 def nnx_model_loss(
     active_model,
     batch,
@@ -174,6 +213,8 @@ def nnx_model_loss(
     include_l2wrap,
     ce_loss_scale=1.0,
     l2_loss_scale=1.0,
+    aux_loss_scale=1.0,
+    training_step=None,
 ):
     """Run recurrent and LM-head chunks independently without truncated BPTT."""
 
@@ -210,6 +251,7 @@ def nnx_model_loss(
             chunk_screen,
             phase=phase,
             deterministic=deterministic,
+            training_step=training_step,
         )
         return (new_rwkv, new_screen), {"hidden": hidden, "stats": stats}
 
@@ -338,12 +380,27 @@ def nnx_model_loss(
     if include_l2wrap:
         total_loss += l2_loss * l2_loss_scale
     stats_total = {} if stats_total is None else stats_total
+    normalized_stats = {
+        key: value / jnp.asarray(token_count, dtype=jnp.float32)
+        for key, value in stats_total.items()
+    }
+    admission_floor_loss = jnp.zeros((), dtype=jnp.float32)
+    admission_floor_target = jnp.zeros((), dtype=jnp.float32)
+    if phase == "read_write" and "write_budget_rate" in normalized_stats:
+        admission_floor_loss, admission_floor_target = (
+            compute_v5_admission_floor_loss(
+                normalized_stats["write_budget_rate"],
+                normalized_stats["slot_utilization"],
+                active_model.config.screening,
+                training_step,
+            )
+        )
+        total_loss += admission_floor_loss * aux_loss_scale
     metrics = {
         "loss": ce_loss,
-        **{
-            key: value / jnp.asarray(token_count, dtype=jnp.float32)
-            for key, value in stats_total.items()
-        },
+        "admission_floor_loss": admission_floor_loss,
+        "admission_floor_target": admission_floor_target,
+        **normalized_stats,
     }
     for key in (
         "rel_read_mean",
@@ -370,6 +427,19 @@ def nnx_model_loss(
         "slot_utilization",
         "dead_slot_rate",
         "slot_cosine_redundancy",
+        "matched_erase_mass",
+        "matched_write_mass",
+        "novel_erase_mass",
+        "novel_write_mass",
+        "accepted_novel_rate",
+        "empty_allocation_rate",
+        "occupied_eviction_rate",
+        "read_energy_mean",
+        "write_saturation_rate",
+        "write_budget_rate",
+        "screening_residual_rms",
+        "base_residual_rms",
+        "screening_base_rms_ratio",
     ):
         metrics.setdefault(key, jnp.zeros(()))
     return total_loss, (metrics, current_rwkv, current_screen)
@@ -441,6 +511,8 @@ def _nnx_train_step(
                 include_l2wrap=True,
                 ce_loss_scale=ce_weight,
                 l2_loss_scale=position_weight,
+                aux_loss_scale=position_weight,
+                training_step=optimizer.step[...],
             )
 
         (loss, (metrics, new_rwkv, new_screen)), grads = nnx.value_and_grad(
@@ -499,6 +571,7 @@ def nnx_train_step(
 
 __all__ = [
     "NNXTrainState",
+    "compute_v5_admission_floor_loss",
     "create_nnx_train_state",
     "initialize_nnx_train_state",
     "nnx_model_loss",

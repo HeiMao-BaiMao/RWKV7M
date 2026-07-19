@@ -1,0 +1,33 @@
+{
+  "format": "rwkv7m-screening-semantic-golden",
+  "format_version": 1,
+  "semantics_version": "screening-v5-core",
+  "case": "all-empty-lowest-index-allocation",
+  "description": "One admitted novel token selects bank 0 and the lowest empty slot. The tied edit writes the candidate at unit mass without erasing content.",
+  "inputs": {
+    "q_read": [[[1.0, 0.0, 1.0, 0.0]]],
+    "q_write": [[[1.0, 0.0, 0.0, 0.0]]],
+    "admission_context_logit": [[10.0]],
+    "bank_logits": [[[3.0, 2.0, 1.0]]],
+    "initial_occupancy": [[0.0, 0.0, 0.0, 0.0]],
+    "selected_candidate": [1.0, 2.0, 3.0, 4.0]
+  },
+  "expected": {
+    "read_relevance": [0.0, 0.0, 0.0, 0.0],
+    "matched_route": [0.0, 0.0, 0.0, 0.0],
+    "novel_decision": 1.0,
+    "admission_decision": 1.0,
+    "victim_address": 0,
+    "erase_mass": [0.0, 0.0, 0.0, 0.0],
+    "write_mass": [1.0, 0.0, 0.0, 0.0],
+    "final_slots": [[[1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]],
+    "final_ages": [[0.0, 0.0, 0.0, 0.0]],
+    "final_usage": [[0.0, 0.0, 0.0, 0.0]],
+    "final_occupancy": [[1.0, 0.0, 0.0, 0.0]],
+    "admission_context_gradient_probe": {
+      "input": [[1.0]],
+      "objective": "sum(final_slots)",
+      "gradient": [[1.9661193]]
+    }
+  }
+}

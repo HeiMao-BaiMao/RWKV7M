@@ -5,8 +5,8 @@
 Naming note: "Screening v2" in this report is the implemented architecture
 called `screening-v4-competitive` by
 [`RWKV7M.paper.md`](../RWKV7M.paper.md) v5. None of the
-measurements in this report validate the design-only `screening-v5-core` or
-`screening-v5-retention` semantics.
+measurements in this report validate the portable-only `screening-v5-core`
+candidate or the design-only `screening-v5-retention` semantics.
 
 On 2026-07-14, the new TPU Pallas WKV implementation was compared with the
 portable `lax.scan` recurrence on a Google Cloud TPU v5e. For the tested

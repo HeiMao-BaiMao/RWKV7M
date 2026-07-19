@@ -254,17 +254,25 @@ new real-GPU gate. Mosaic GPU also requires Hopper/Blackwell validation.
 The Screening v2 revision is implemented behind explicit opt-in settings in the
 [State-Level Screening v2 engineering contract](docs/state_level_screening_v2_design.md).
 The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
-profiles `screening-v4-legacy` and `screening-v4-competitive`; the paper's
-`screening-v5-core` and `screening-v5-retention` profiles are design-only and
-are not implemented. Screening v2 adds value-space gating, a factorized
+  profiles `screening-v4-legacy` and `screening-v4-competitive`. A portable,
+  NNX-integrated `screening-v5-core` Phase 1 candidate now implements explicit
+  occupancy, empty-first allocation, capacity calibration, bounded reads, and
+  ambiguity-aware confidence. Its accelerator path, checkpoint redesign,
+  retention profile, and quality claims remain gated. See the
+  [Screening v5 implementation contract](docs/state_level_screening_v5_design.md).
+  Screening v2 adds value-space gating, a factorized
 candidate, confidence-preserving competitive writes,
 hard-forward/soft-backward novelty and admission with sparse bank-aware novel
 allocation, interval training-tape
 checkpointing, and fixed-total-dimension multi-read tiles. Existing configs
 continue to map to explicit legacy write modes; the tracked opt-in example is
-[`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example);
-the 0.3B experiment uses
-[`configs/rwkv7m-0.3b-screening-v2.json.example`](configs/rwkv7m-0.3b-screening-v2.json.example).
+  [`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example);
+  the 0.3B experiment uses
+  [`configs/rwkv7m-0.3b-screening-v2.json.example`](configs/rwkv7m-0.3b-screening-v2.json.example).
+  Phase 1 v5 candidates are tracked separately in
+  [`configs/rwkv7m-0.185b-screening-v5-core.json.example`](configs/rwkv7m-0.185b-screening-v5-core.json.example)
+  and
+  [`configs/rwkv7m-0.3b-screening-v5-core.json.example`](configs/rwkv7m-0.3b-screening-v5-core.json.example).
 Portable reference tests and CPU Pallas interpret-mode tests cover the v2
 forward and gradients for both backend-specific kernel bodies. Corrected commit
 `f35f6fc` passed real TPU v5e-4 lowering, all six outputs, all 17 input
@@ -801,9 +809,9 @@ Not yet included:
   the validated L40S shapes,
 - Hopper/Blackwell Mosaic screening validation and a non-duplicated model-axis
   screening recurrence,
-- the paper's design-only Screening v5 core and retention semantics, including
-  occupancy, capacity calibration, bounded read aggregation, ambiguity-aware
-  confidence, and erase/write separation,
+- v5 accelerator kernels, checkpoint redesign, retention semantics, and
+  completed multi-seed quality/causal-ablation gates; the portable Phase 1
+  candidate is implemented but is not production-qualified,
 - pretrained RWKV checkpoint conversion,
 - in-repository PyTorch/non-JAX runtime backend (intentionally out of scope),
 - fully tuned per-parameter TPU sharding rules,
@@ -820,4 +828,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-18, the current worktree suite completed with 200 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration, hard-forward/soft-backward admission and novelty gradients, checkpoint strength limits, fail-closed benchmark parity, sequence-chunk parity, explicit factorized-candidate sharding, and CPU Pallas interpret-mode GPU/TPU checkpointed-gradient parity. Real TPU evidence is recorded separately and is not part of this local test count.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-19, the current worktree suite completed with 223 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration and the v5 portable Phase 1 semantics: occupancy, capacity calibration, bounded reads, ambiguity-aware routing, finite empty-state gradients, chunk invariance, temporary anti-starvation curricula, a tiny full-model gradient pass, and a size-one Explicit-mesh screening call. It also covers checkpoint strength limits, fail-closed accelerator labeling, explicit factorized-candidate sharding, and CPU Pallas interpret-mode v4 GPU/TPU checkpointed-gradient parity. Real TPU/GPU evidence is recorded separately and is not part of this local test count; no v5 real-accelerator claim is made.

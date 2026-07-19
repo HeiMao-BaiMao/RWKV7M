@@ -34,6 +34,16 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--backend", default=None)
     parser.add_argument(
+        "--semantics-version",
+        choices=(
+            "screening-v4-legacy",
+            "screening-v4-competitive",
+            "screening-v5-core",
+            "screening-v5-retention",
+        ),
+        default=None,
+    )
+    parser.add_argument(
         "--write-mode",
         choices=(
             "disabled",
@@ -105,6 +115,36 @@ def parse_args(argv=None):
         parser.error("--value-size must be divisible by --read-tiles")
     if args.checkpoint_interval is not None and args.checkpoint_interval <= 0:
         parser.error("--checkpoint-interval must be positive")
+    if args.semantics_version in {
+        "screening-v5-core",
+        "screening-v5-retention",
+    }:
+        parser.error(
+            "v5 accelerator kernels are intentionally unavailable until the "
+            "portable semantic gate passes"
+        )
+    resolved_semantics = args.semantics_version
+    if resolved_semantics is None:
+        resolved_semantics = (
+            "screening-v4-competitive"
+            if args.write_mode == "competitive_novel"
+            else "screening-v4-legacy"
+        )
+    if (
+        resolved_semantics == "screening-v4-competitive"
+        and args.write_mode != "competitive_novel"
+    ):
+        parser.error(
+            "screening-v4-competitive requires --write-mode competitive_novel"
+        )
+    if (
+        resolved_semantics == "screening-v4-legacy"
+        and args.write_mode == "competitive_novel"
+    ):
+        parser.error(
+            "competitive_novel requires screening-v4-competitive semantics"
+        )
+    args.semantics_version = resolved_semantics
     return args
 
 
@@ -400,6 +440,7 @@ def main(argv=None):
             "vector_dtype": "bfloat16",
             "state_dtype": "float32",
             "write_mode": args.write_mode,
+            "semantics_version": args.semantics_version,
             "read_tiles": args.read_tiles,
             "route_power": args.route_power,
             "novelty_temperature": args.novelty_temperature,
