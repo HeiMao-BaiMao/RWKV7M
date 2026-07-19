@@ -106,8 +106,20 @@ def evaluate_binidx(args):
     if params is not None:
         load_runtime_params(runtime, params)
 
+    if args.memory_off_counterfactual and not config.use_screening:
+        raise ValueError(
+            "--memory-off-counterfactual requires screening to be enabled"
+        )
+
     @jax.jit
-    def eval_step(input_ids, target_ids, mask, rwkv_state, screen_state):
+    def eval_step(
+        input_ids,
+        target_ids,
+        mask,
+        rwkv_state,
+        screen_state,
+        residual_scale,
+    ):
         logits, _, _, stats = runtime.model.apply(
             runtime.variables,
             input_ids,
@@ -115,11 +127,19 @@ def evaluate_binidx(args):
             screen_state,
             phase=args.phase,
             deterministic=True,
+            screening_residual_scale=residual_scale,
         )
-        return cross_entropy_loss(logits, target_ids, mask), stats
+        return cross_entropy_loss(logits, target_ids, mask), stats, logits
 
     @jax.jit
-    def stateful_eval_step(input_ids, target_ids, mask, rwkv_state, screen_state):
+    def stateful_eval_step(
+        input_ids,
+        target_ids,
+        mask,
+        rwkv_state,
+        screen_state,
+        residual_scale,
+    ):
         logits, new_rwkv_state, new_screen_state, stats = runtime.model.apply(
             runtime.variables,
             input_ids,
@@ -127,43 +147,91 @@ def evaluate_binidx(args):
             screen_state,
             phase=args.phase,
             deterministic=True,
+            screening_residual_scale=residual_scale,
         )
         loss = cross_entropy_loss(logits, target_ids, mask)
-        return loss, new_rwkv_state, new_screen_state, stats
+        return loss, new_rwkv_state, new_screen_state, stats, logits
 
     losses = []
+    memory_off_losses = []
+    prediction_deltas = []
     rwkv_state = runtime.initial_rwkv_state
     screen_state = runtime.initial_screen_state
+    memory_off_rwkv_state = runtime.initial_rwkv_state
+    memory_off_screen_state = runtime.initial_screen_state
     try:
         for step in range(args.steps):
             if args.carry_state and dataset.should_reset_state_before_step(step):
                 rwkv_state = runtime.initial_rwkv_state
                 screen_state = runtime.initial_screen_state
+                memory_off_rwkv_state = runtime.initial_rwkv_state
+                memory_off_screen_state = runtime.initial_screen_state
             batch = dataset.get_batch(step)
             if args.carry_state:
-                loss, rwkv_state, screen_state, _ = stateful_eval_step(
+                loss, rwkv_state, screen_state, _, logits = stateful_eval_step(
                     batch["input_ids"],
                     batch["target_ids"],
                     batch["mask"],
                     rwkv_state,
                     screen_state,
+                    jnp.asarray(1.0, dtype=jnp.float32),
                 )
             else:
-                loss, _ = eval_step(
+                loss, _, logits = eval_step(
                     batch["input_ids"],
                     batch["target_ids"],
                     batch["mask"],
                     runtime.initial_rwkv_state,
                     runtime.initial_screen_state,
+                    jnp.asarray(1.0, dtype=jnp.float32),
                 )
             losses.append(float(loss))
+            if args.memory_off_counterfactual:
+                if args.carry_state:
+                    (
+                        off_loss,
+                        memory_off_rwkv_state,
+                        memory_off_screen_state,
+                        _,
+                        off_logits,
+                    ) = stateful_eval_step(
+                        batch["input_ids"],
+                        batch["target_ids"],
+                        batch["mask"],
+                        memory_off_rwkv_state,
+                        memory_off_screen_state,
+                        jnp.asarray(0.0, dtype=jnp.float32),
+                    )
+                else:
+                    off_loss, _, off_logits = eval_step(
+                        batch["input_ids"],
+                        batch["target_ids"],
+                        batch["mask"],
+                        runtime.initial_rwkv_state,
+                        runtime.initial_screen_state,
+                        jnp.asarray(0.0, dtype=jnp.float32),
+                    )
+                memory_off_losses.append(float(off_loss))
+                prediction_deltas.append(
+                    float(
+                        jnp.sqrt(
+                            jnp.mean(
+                                (
+                                    logits.astype(jnp.float32)
+                                    - off_logits.astype(jnp.float32)
+                                )
+                                ** 2
+                            )
+                        )
+                    )
+                )
             if args.print_every and (step % args.print_every == 0 or step == args.steps - 1):
                 print(f"eval step={step} loss={losses[-1]:.6f}")
     finally:
         dataset.close()
 
     mean_loss = sum(losses) / len(losses)
-    return {
+    result = {
         "steps": args.steps,
         "tokens": args.steps * args.batch_size * args.ctx_len,
         "loss": mean_loss,
@@ -171,6 +239,17 @@ def evaluate_binidx(args):
         "carry_state": bool(args.carry_state),
         "sampling_mode": args.sampling_mode,
     }
+    if memory_off_losses:
+        memory_off_loss = sum(memory_off_losses) / len(memory_off_losses)
+        result.update(
+            {
+                "memory_off_loss": memory_off_loss,
+                "memory_loss_delta": memory_off_loss - mean_loss,
+                "prediction_rms_delta": sum(prediction_deltas)
+                / len(prediction_deltas),
+            }
+        )
+    return result
 
 
 def parse_args(argv=None):
@@ -195,6 +274,14 @@ def parse_args(argv=None):
     parser.add_argument("--magic-prime", type=int, default=None)
     parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
     parser.add_argument("--carry-state", action="store_true")
+    parser.add_argument(
+        "--memory-off-counterfactual",
+        action="store_true",
+        help=(
+            "also evaluate with every Screening residual scaled to zero; "
+            "positive memory_loss_delta means memory improved CE"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
@@ -228,6 +315,13 @@ def main(argv=None):
         f"steps={metrics['steps']} tokens={metrics['tokens']} "
         f"loss={metrics['loss']:.6f} perplexity={metrics['perplexity']:.6f}"
     )
+    if "memory_off_loss" in metrics:
+        print(
+            "counterfactual "
+            f"memory_off_loss={metrics['memory_off_loss']:.6f} "
+            f"memory_loss_delta={metrics['memory_loss_delta']:.6f} "
+            f"prediction_rms_delta={metrics['prediction_rms_delta']:.6f}"
+        )
 
 
 if __name__ == "__main__":

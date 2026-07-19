@@ -21,6 +21,7 @@ from rwkv7m.model.screening import (
     bounded_non_amplifying_aggregate,
     capacity_calibrated_similarity_threshold,
     resolve_semantics_version,
+    smooth_trim_square,
 )
 from rwkv7m.model.screening_v5 import (
     ACCEPTED_NOVEL_RATE,
@@ -33,6 +34,7 @@ from rwkv7m.model.screening_v5 import (
     NOVEL_WRITE_MASS,
     OCCUPANCY_MEAN,
     READ_MAX,
+    SELF_INDEX_LOSS,
     Z_NORM,
     ScreeningV5RecurrenceConfig,
     ambiguity_aware_matched_routing,
@@ -46,6 +48,8 @@ from rwkv7m.model.state import (
 )
 from rwkv7m.train import (
     compute_v5_admission_floor_loss,
+    compute_v5_self_index_loss,
+    compute_v5_write_budget_loss,
     create_nnx_train_state,
     nnx_train_step,
 )
@@ -195,6 +199,15 @@ def test_v5_config_rejects_unsafe_or_incomplete_contracts():
         _v5_screening_config(tau_max=1.0)
     with pytest.raises(ValueError, match="requires write_mode"):
         _v5_screening_config(write_mode="legacy_threshold")
+    with pytest.raises(ValueError, match="read_soft_warmup_temperature"):
+        _v5_screening_config(read_soft_warmup_temperature=0.0)
+    with pytest.raises(ValueError, match="write_budget_target_max"):
+        _v5_screening_config(write_budget_target_max=1.1)
+    with pytest.raises(ValueError, match="self_index_loss_steps"):
+        _v5_screening_config(
+            self_index_loss_weight=0.1,
+            self_index_loss_steps=0,
+        )
 
 
 def test_v5_example_configs_roundtrip():
@@ -225,6 +238,36 @@ def test_capacity_calibration_increases_with_test_count():
     )
     assert large > small
     assert large < 1.0
+
+
+def test_capacity_calibration_uses_null_cdf_not_loose_tail_bound():
+    threshold = capacity_calibrated_similarity_threshold(
+        64,
+        16,
+        0.05,
+        tau_min=-0.95,
+        tau_max=0.95,
+    )
+    loose_bound = jnp.sqrt(2.0 * jnp.log(64.0 / 0.05) / 16.0)
+    assert jnp.allclose(threshold, 0.78887224, rtol=1e-5)
+    assert threshold < loose_bound
+
+
+def test_smooth_trim_square_keeps_a_finite_gradient_below_hard_threshold():
+    similarity = jnp.asarray(0.2, dtype=jnp.float32)
+    threshold = jnp.asarray(0.5, dtype=jnp.float32)
+
+    def relevance(active_similarity):
+        return smooth_trim_square(
+            active_similarity,
+            threshold,
+            0.1,
+        )
+
+    value, gradient = jax.value_and_grad(relevance)(similarity)
+    assert value > 0.0
+    assert jnp.isfinite(gradient)
+    assert gradient > 0.0
 
 
 def test_v5_learned_threshold_offsets_start_at_zero():
@@ -470,6 +513,68 @@ def test_v5_route_has_soft_admission_gradient():
     assert gradient[0, 0] > 0.0
 
 
+def test_v5_self_index_loss_trains_rejected_candidate_geometry():
+    inputs = list(_v5_inputs())
+    orthogonal_keys = jnp.zeros_like(inputs[10])
+    orthogonal_keys = orthogonal_keys.at[..., 1].set(1.0)
+    orthogonal_keys = orthogonal_keys.at[..., 3].set(1.0)
+    inputs[10] = orthogonal_keys
+    inputs[12] = orthogonal_keys
+    inputs[14] = orthogonal_keys[0]
+    inputs[16] = orthogonal_keys[0]
+    inputs[19] = jnp.ones_like(inputs[19])
+    config = _v5_recurrence_config(
+        self_index_margin=0.02,
+        target_false_write_rate=0.5,
+        target_false_match_rate=0.1,
+    )
+
+    def objective(candidate_keys):
+        values = list(inputs)
+        values[10] = candidate_keys
+        values[12] = candidate_keys
+        return jnp.sum(
+            screening_v5_recurrence_reference(
+                *values,
+                config,
+            )[5][..., SELF_INDEX_LOSS]
+        )
+
+    loss, gradient = jax.value_and_grad(objective)(orthogonal_keys)
+    assert loss > 0.0
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.linalg.norm(gradient) > 0.0
+
+    def threshold_objective(tau_write_offset):
+        values = list(inputs)
+        values[22] = tau_write_offset
+        return jnp.sum(
+            screening_v5_recurrence_reference(
+                *values,
+                config,
+            )[5][..., SELF_INDEX_LOSS]
+        )
+
+    threshold_gradient = jax.grad(threshold_objective)(inputs[22])
+    assert threshold_gradient == 0.0
+
+    def read_threshold_objective(tau_read_offset):
+        values = list(inputs)
+        values[21] = tau_read_offset
+        return jnp.sum(
+            screening_v5_recurrence_reference(
+                *values,
+                config,
+            )[5][..., SELF_INDEX_LOSS]
+        )
+
+    read_threshold_gradient = jax.grad(read_threshold_objective)(inputs[21])
+    assert jnp.array_equal(
+        read_threshold_gradient,
+        jnp.zeros_like(read_threshold_gradient),
+    )
+
+
 def test_admission_floor_is_temporary_and_only_uses_empty_capacity():
     config = _v5_screening_config(
         admission_floor_target_initial=0.1,
@@ -511,6 +616,38 @@ def test_admission_floor_is_temporary_and_only_uses_empty_capacity():
     assert expired_target == 0.0
     assert full_loss == 0.0
     assert full_target == 0.0
+
+
+def test_write_budget_penalizes_only_rates_above_the_ceiling():
+    config = _v5_screening_config(
+        write_budget_target_max=0.1,
+        write_budget_weight=0.5,
+    )
+
+    def budget(rate):
+        return compute_v5_write_budget_loss(rate, config)[0]
+
+    assert budget(jnp.asarray(0.05)) == 0.0
+    loss, gradient = jax.value_and_grad(budget)(jnp.asarray(0.5))
+    assert loss > 0.0
+    assert gradient > 0.0
+
+
+def test_self_index_curriculum_anneals_without_changing_raw_metric():
+    config = _v5_screening_config(
+        self_index_loss_weight=0.5,
+        self_index_loss_steps=100,
+    )
+    initial, initial_weight = compute_v5_self_index_loss(
+        jnp.asarray(2.0), config, jnp.asarray(0)
+    )
+    expired, expired_weight = compute_v5_self_index_loss(
+        jnp.asarray(2.0), config, jnp.asarray(100)
+    )
+    assert initial == 1.0
+    assert initial_weight == 0.5
+    assert expired == 0.0
+    assert expired_weight == 0.0
 
 
 def test_nnx_v5_sequence_chunks_preserve_state_and_output():
@@ -590,6 +727,82 @@ def test_nnx_v5_lambda_floor_only_applies_during_warmup():
     assert jnp.allclose(warm_stats["lambda_screen_floor"], 0.2 / tile_scale)
     assert expired_stats["lambda_screen_floor"] == 0.0
     assert warm_stats["lambda_screen"] > expired_stats["lambda_screen"]
+
+
+def test_nnx_v5_read_curriculum_is_training_only_and_expires():
+    config = _v5_screening_config(read_soft_warmup_steps=100)
+    module = NNXStateLevelScreening(config, rngs=nnx.Rngs(0))
+    state = LayerScreenState(
+        slots=jnp.ones((1, 4, 16), dtype=jnp.float32),
+        ages=jnp.zeros((1, 4), dtype=jnp.float32),
+        usage_ema=jnp.zeros((1, 4), dtype=jnp.float32),
+        occupancy=jnp.ones((1, 4), dtype=jnp.float32),
+    )
+    values = (
+        jnp.zeros((1, 1, 32), dtype=jnp.float32),
+        jnp.zeros((1, 1, 32), dtype=jnp.float32),
+        state,
+    )
+    _, _, warm = module(
+        *values,
+        phase="read_write",
+        deterministic=False,
+        training_step=jnp.asarray(0),
+    )
+    _, _, expired = module(
+        *values,
+        phase="read_write",
+        deterministic=False,
+        training_step=jnp.asarray(100),
+    )
+    _, _, evaluation = module(
+        *values,
+        phase="read_write",
+        deterministic=True,
+        training_step=jnp.asarray(0),
+    )
+    assert warm["read_soft_warmup_alpha"] == 1.0
+    assert expired["read_soft_warmup_alpha"] == 0.0
+    assert evaluation["read_soft_warmup_alpha"] == 0.0
+
+
+def test_nnx_v5_memory_off_override_zeroes_only_the_residual():
+    config = _v5_screening_config(
+        lambda_screen_init=0.2,
+        read_soft_warmup_steps=100,
+        read_soft_warmup_temperature=1.0,
+        target_false_read_rate=0.5,
+    )
+    module = NNXStateLevelScreening(config, rngs=nnx.Rngs(0))
+    state = LayerScreenState(
+        slots=jax.random.normal(jax.random.key(20), (1, 4, 16)),
+        ages=jnp.zeros((1, 4), dtype=jnp.float32),
+        usage_ema=jnp.zeros((1, 4), dtype=jnp.float32),
+        occupancy=jnp.ones((1, 4), dtype=jnp.float32),
+    )
+    x = jax.random.normal(jax.random.key(21), (1, 2, 32))
+    h_base = jax.random.normal(jax.random.key(22), (1, 2, 32))
+    enabled, enabled_state, _ = module(
+        x,
+        h_base,
+        state,
+        phase="read_write",
+        deterministic=False,
+        training_step=jnp.asarray(0),
+    )
+    disabled, disabled_state, disabled_stats = module(
+        x,
+        h_base,
+        state,
+        phase="read_write",
+        deterministic=False,
+        training_step=jnp.asarray(0),
+        screening_residual_scale=0.0,
+    )
+    assert jnp.array_equal(disabled, h_base)
+    assert jnp.allclose(enabled_state.slots, disabled_state.slots)
+    assert disabled_stats["screening_residual_scale"] == 0.0
+    assert not jnp.array_equal(enabled, disabled)
 
 
 def test_nnx_v5_rejects_state_without_occupancy_metadata():
@@ -672,10 +885,16 @@ def test_nnx_train_step_applies_enabled_admission_floor():
         head_size=8,
     )
     config.screening = _v5_screening_config(
-        admission_init=0.1,
+        admission_init=0.9,
         admission_floor_target_initial=1.0,
         admission_floor_weight=0.5,
         admission_floor_steps=10,
+        read_soft_warmup_steps=10,
+        write_budget_target_max=0.0,
+        write_budget_weight=0.5,
+        self_index_margin=0.1,
+        self_index_loss_weight=0.5,
+        self_index_loss_steps=10,
     )
     config.lm_head_init = "variance_scaled"
     model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(9))
@@ -693,6 +912,10 @@ def test_nnx_train_step_applies_enabled_admission_floor():
     )
     assert metrics["admission_floor_target"] > 0.0
     assert metrics["admission_floor_loss"] > 0.0
+    assert metrics["write_budget_loss"] > 0.0
+    assert metrics["self_index_weight"] > 0.0
+    assert jnp.isfinite(metrics["self_index_loss"])
+    assert metrics["read_soft_warmup_alpha"] == 1.0
     assert metrics["total_loss"] > metrics["loss"]
 
 

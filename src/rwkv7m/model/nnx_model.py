@@ -1255,6 +1255,7 @@ class NNXStateLevelScreening(nnx.Module):
         phase="read_screening_only",
         deterministic=True,
         training_step=None,
+        screening_residual_scale=1.0,
     ):
         cfg = self.config
         phase = normalize_phase(phase)
@@ -1482,6 +1483,20 @@ class NNXStateLevelScreening(nnx.Module):
                 value.astype(jnp.float32) for value in projected_inputs
             )
 
+            read_soft_warmup_alpha = jnp.zeros((), dtype=jnp.float32)
+            if (
+                not deterministic
+                and training_step is not None
+                and cfg.read_soft_warmup_steps > 0
+            ):
+                read_soft_warmup_alpha = jnp.clip(
+                    1.0
+                    - jnp.asarray(training_step, dtype=jnp.float32)
+                    / float(cfg.read_soft_warmup_steps),
+                    0.0,
+                    1.0,
+                )
+
             v5_config = ScreeningV5RecurrenceConfig(
                 use_value_unit_norm=cfg.use_value_unit_norm,
                 usage_ema_decay=cfg.usage_ema_decay,
@@ -1513,6 +1528,11 @@ class NNXStateLevelScreening(nnx.Module):
                 eta_ambiguity=cfg.eta_ambiguity,
                 edit_mode=cfg.edit_mode,
                 write_accounting_floor=cfg.write_accounting_floor,
+                read_soft_warmup_alpha=read_soft_warmup_alpha,
+                read_soft_warmup_temperature=(
+                    cfg.read_soft_warmup_temperature
+                ),
+                self_index_margin=cfg.self_index_margin,
             )
             recurrence_outputs = screening_v5_recurrence_reference(
                 v5_projected_inputs[0],
@@ -1622,7 +1642,15 @@ class NNXStateLevelScreening(nnx.Module):
             final_occupancy = state.occupancy
 
         u_seq = jnp.swapaxes(u_time, 0, 1)
-        effective_lambda = lambda_screen / math.sqrt(cfg.n_read_tiles)
+        residual_scale = jnp.asarray(
+            screening_residual_scale,
+            dtype=jnp.float32,
+        )
+        effective_lambda = (
+            lambda_screen
+            * residual_scale
+            / math.sqrt(cfg.n_read_tiles)
+        )
         if cfg.gate_space == "value":
             read_out_seq = self.out_proj(
                 u_seq * gate_seq.astype(u_seq.dtype)
@@ -1760,6 +1788,9 @@ class NNXStateLevelScreening(nnx.Module):
                 NOVEL_WRITE_MASS,
                 OCCUPIED_EVICTION_RATE,
                 READ_ENERGY_MEAN,
+                SELF_INDEX_LOSS,
+                SELF_READ_SIMILARITY,
+                SELF_WRITE_SIMILARITY,
                 TAU_NOVEL_MEAN,
                 TAU_READ_MEAN,
                 TAU_WRITE_MEAN,
@@ -1767,6 +1798,10 @@ class NNXStateLevelScreening(nnx.Module):
                 WRITE_SATURATION_RATE,
             )
 
+            accepted_count = jnp.sum(
+                step_statistics[..., ACCEPTED_NOVEL_RATE]
+            )
+            accepted_denominator = jnp.maximum(accepted_count, 1.0)
             stats.update(
                 {
                     "tau_r": jnp.mean(
@@ -1816,6 +1851,22 @@ class NNXStateLevelScreening(nnx.Module):
                     "write_budget_rate": jnp.mean(
                         step_statistics[..., WRITE_BUDGET_RATE]
                     ),
+                    "write_self_similarity": jnp.sum(
+                        step_statistics[..., SELF_WRITE_SIMILARITY]
+                    )
+                    / accepted_denominator,
+                    "read_self_similarity": jnp.sum(
+                        step_statistics[..., SELF_READ_SIMILARITY]
+                    )
+                    / accepted_denominator,
+                    "self_index_raw_loss": jnp.sum(
+                        step_statistics[..., SELF_INDEX_LOSS]
+                    )
+                    / jnp.asarray(
+                        step_statistics[..., SELF_INDEX_LOSS].size,
+                        dtype=jnp.float32,
+                    ),
+                    "read_soft_warmup_alpha": read_soft_warmup_alpha,
                     "screening_residual_rms": screening_residual_rms,
                     "base_residual_rms": base_residual_rms,
                     "screening_base_rms_ratio": screening_residual_rms
@@ -1824,6 +1875,7 @@ class NNXStateLevelScreening(nnx.Module):
                     / math.sqrt(cfg.n_read_tiles),
                     "lambda_screen_floor": lambda_screen_floor
                     / math.sqrt(cfg.n_read_tiles),
+                    "screening_residual_scale": residual_scale,
                 }
             )
         else:
@@ -1906,6 +1958,7 @@ class NNXScreenedRWKVLayer(nnx.Module):
         phase,
         deterministic,
         training_step=None,
+        screening_residual_scale=1.0,
     ):
         block = getattr(self, self._block_name)
         h_base, v_first, new_rwkv_state = block(x, v_first, rwkv_state)
@@ -1918,6 +1971,7 @@ class NNXScreenedRWKVLayer(nnx.Module):
                 phase=phase,
                 deterministic=deterministic,
                 training_step=training_step,
+                screening_residual_scale=screening_residual_scale,
             )
         else:
             h, new_screen, stats = h_base, screen_state, {}
@@ -1933,6 +1987,7 @@ def _call_screened_layer(
     phase,
     deterministic,
     training_step,
+    screening_residual_scale,
 ):
     return layer(
         x,
@@ -1942,6 +1997,7 @@ def _call_screened_layer(
         phase=phase,
         deterministic=deterministic,
         training_step=training_step,
+        screening_residual_scale=screening_residual_scale,
     )
 
 
@@ -2030,6 +2086,7 @@ class NNXScreenedRWKVModel(nnx.Module):
         phase="read_screening_only",
         deterministic=True,
         training_step=None,
+        screening_residual_scale=1.0,
     ):
         cfg = self.config
         phase = normalize_phase(phase)
@@ -2077,6 +2134,7 @@ class NNXScreenedRWKVModel(nnx.Module):
                 phase,
                 deterministic,
                 training_step,
+                screening_residual_scale,
             )
             new_rwkv_layers[layer_idx] = new_rwkv
             if layer_idx in screened_idx:
@@ -2183,6 +2241,7 @@ class NNXScreenedRWKVModel(nnx.Module):
         phase="read_screening_only",
         deterministic=True,
         training_step=None,
+        screening_residual_scale=1.0,
     ):
         hidden, new_rwkv, new_screen, stats = self.compute_recurrent_hidden(
             input_ids,
@@ -2191,6 +2250,7 @@ class NNXScreenedRWKVModel(nnx.Module):
             phase=phase,
             deterministic=deterministic,
             training_step=training_step,
+            screening_residual_scale=screening_residual_scale,
         )
         return (
             self.compute_logits(hidden),

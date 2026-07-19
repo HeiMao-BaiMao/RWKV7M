@@ -42,7 +42,7 @@
     "allocation_top_k": 1,
     "allocation_age_weight": 1.0,
     "allocation_usage_weight": 1.0,
-    "allocation_redundancy_weight": 0.0,
+    "allocation_redundancy_weight": 0.5,
     "capacity_calibration": "analytic",
     "tau_min": -0.95,
     "tau_max": 0.95,
@@ -59,6 +59,13 @@
     "admission_floor_target_initial": 0.05,
     "admission_floor_weight": 0.1,
     "admission_floor_steps": 2000,
+    "read_soft_warmup_steps": 2000,
+    "read_soft_warmup_temperature": 0.1,
+    "write_budget_target_max": 0.05,
+    "write_budget_weight": 0.1,
+    "self_index_margin": 0.02,
+    "self_index_loss_weight": 0.1,
+    "self_index_loss_steps": 2000,
     "checkpoint_interval": null,
     "n_read_tiles": 4
   }

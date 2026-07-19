@@ -117,9 +117,18 @@ def _linen_eval_step_data_parallel(train_state, batch, rwkv_state, screen_state,
         "read_energy_mean",
         "write_saturation_rate",
         "write_budget_rate",
+        "write_budget_loss",
+        "write_budget_target",
+        "write_self_similarity",
+        "read_self_similarity",
+        "self_index_raw_loss",
+        "self_index_loss",
+        "self_index_weight",
+        "read_soft_warmup_alpha",
         "screening_residual_rms",
         "base_residual_rms",
         "screening_base_rms_ratio",
+        "screening_residual_scale",
     ):
         metrics[key] = stats.get(key, jnp.zeros(()))
     return metrics, new_rwkv_state, new_screen_state

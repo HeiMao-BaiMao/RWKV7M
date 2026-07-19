@@ -261,8 +261,14 @@ The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
   compute and recurrent state/cotangents with BF16 stored parameters; this
   boundary passed post-training MI300X gradient diagnostics. Its Pallas path,
   checkpoint redesign, retention profile, numerical reproducibility, and
-  quality claims remain gated. The MI300X short runs still collapsed the
-  memory residual and produced high slot redundancy. See the
+  quality claims remain gated. The MI300X short runs collapsed the memory
+  residual and produced high slot redundancy. The tracked recovery configs
+  now replace the overly conservative read tail bound with a Gaussian-null
+  family-wise quantile, use a training-only soft-to-hard read curriculum,
+  bootstrap query/candidate geometry with a temporary self-index loss, cap
+  all-novel writes with an upper budget, and enable redundancy-aware victim
+  selection. These changes are implemented and locally tested, but have not
+  yet repeated the MI300X quality gate. See the
   [Screening v5 implementation contract](docs/state_level_screening_v5_design.md).
   Screening v2 adds value-space gating, a factorized
 candidate, confidence-preserving competitive writes,
@@ -433,6 +439,24 @@ uv run rwkv7m-eval-binidx `
   --steps 10 `
   --vocab-size 65536
 ```
+
+Screening must demonstrate causal prediction use, not only nonzero routing
+metrics. Evaluate the same checkpoint with every Screening residual zeroed:
+
+```powershell
+uv run rwkv7m-eval-binidx `
+  --data-file data/minipile `
+  --checkpoint out/screening-v5/ckpt-00002000 `
+  --ctx-len 512 `
+  --batch-size 1 `
+  --steps 10 `
+  --phase read_write `
+  --memory-off-counterfactual
+```
+
+`memory_loss_delta = memory_off_loss - loss`; a consistently positive value
+means the active memory path improved cross entropy for that evaluation.
+Near-zero prediction RMS delta means the model is still ignoring memory.
 
 Stateful stream validation uses the same sequential/carry-state contract as training:
 

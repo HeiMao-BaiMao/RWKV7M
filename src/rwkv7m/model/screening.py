@@ -3,6 +3,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import ndtri
 from flax import linen as nn
 
 
@@ -140,8 +141,25 @@ def capacity_calibrated_similarity_threshold(
     )
     dimension = jnp.asarray(key_dimension, dtype=jnp.float32)
     delta = jnp.asarray(false_positive_rate, dtype=jnp.float32)
-    threshold = jnp.sqrt(2.0 * jnp.log(tests / delta) / dimension)
+    # Approximate the paper's null-similarity CDF instead of using the much
+    # looser exponential tail bound.  The old sqrt(2 log(N/delta) / d)
+    # expression reaches 0.946 for the tracked 4-tile/16-slot read shape and
+    # starves virtually every learned read.  A unit-vector dot product has
+    # variance 1/d, so the Gaussian null approximation gives the family-wise
+    # quantile below.  It remains an initialization policy; empirical
+    # false-read calibration is still required for learned key distributions.
+    family_cdf = jnp.exp(jnp.log1p(-delta) / tests)
+    family_cdf = jnp.clip(family_cdf, 1e-6, 1.0 - 1e-6)
+    threshold = ndtri(family_cdf) / jnp.sqrt(dimension)
     return jnp.clip(threshold, tau_min, tau_max)
+
+
+def smooth_trim_square(sim, tau, temperature, eps=1e-6):
+    """Smooth training surrogate with the same normalized relevance scale."""
+
+    x = (sim - tau) / (1.0 - tau + eps)
+    positive = temperature * jax.nn.softplus(x / temperature)
+    return jnp.square(jnp.clip(positive, 0.0, 1.0))
 
 
 def bounded_non_amplifying_aggregate(z_sum):
@@ -459,6 +477,17 @@ class ScreeningConfig:
     admission_floor_target_initial: float = 0.0
     admission_floor_weight: float = 0.0
     admission_floor_steps: int = 0
+    # Training-only soft-to-hard read curriculum. Inference remains hard.
+    read_soft_warmup_steps: int = 0
+    read_soft_warmup_temperature: float = 0.1
+    # Upper write budget prevents the all-novel/all-write collapse.
+    write_budget_target_max: float = 1.0
+    write_budget_weight: float = 0.0
+    # Temporary self-indexing makes a newly written candidate retrievable by
+    # the query that admitted it. This bootstraps read/write key geometry.
+    self_index_margin: float = 0.0
+    self_index_loss_weight: float = 0.0
+    self_index_loss_steps: int = 0
 
     def __post_init__(self):
         self.screened_layers = tuple(self.screened_layers)
@@ -614,6 +643,24 @@ class ScreeningConfig:
             raise ValueError(
                 "an enabled admission floor requires admission_floor_steps > 0"
             )
+        if self.read_soft_warmup_steps < 0:
+            raise ValueError("read_soft_warmup_steps must be non-negative")
+        if self.read_soft_warmup_temperature <= 0.0:
+            raise ValueError("read_soft_warmup_temperature must be positive")
+        if not 0.0 <= self.write_budget_target_max <= 1.0:
+            raise ValueError("write_budget_target_max must be in [0, 1]")
+        if self.write_budget_weight < 0.0:
+            raise ValueError("write_budget_weight must be non-negative")
+        if not 0.0 <= self.self_index_margin < 1.0:
+            raise ValueError("self_index_margin must be in [0, 1)")
+        if self.self_index_loss_weight < 0.0:
+            raise ValueError("self_index_loss_weight must be non-negative")
+        if self.self_index_loss_steps < 0:
+            raise ValueError("self_index_loss_steps must be non-negative")
+        if self.self_index_loss_weight > 0.0 and self.self_index_loss_steps == 0:
+            raise ValueError(
+                "an enabled self-index loss requires self_index_loss_steps > 0"
+            )
         if semantics_version in {"screening-v5-core", "screening-v5-retention"}:
             if self.gate_space != "value":
                 raise ValueError("v5 semantics requires gate_space='value'")
@@ -640,6 +687,12 @@ class ScreeningConfig:
             or self.admission_floor_steps > 0
             or self.lambda_screen_warmup_floor > 0.0
             or self.lambda_screen_warmup_steps > 0
+            or self.read_soft_warmup_steps > 0
+            or self.write_budget_target_max != 1.0
+            or self.write_budget_weight > 0.0
+            or self.self_index_margin > 0.0
+            or self.self_index_loss_weight > 0.0
+            or self.self_index_loss_steps > 0
         ):
             raise ValueError(
                 "anti-starvation curricula are defined only for v5 semantics"

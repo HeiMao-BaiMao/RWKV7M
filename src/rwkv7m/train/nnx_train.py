@@ -202,6 +202,53 @@ def compute_v5_admission_floor_loss(
     return loss, target
 
 
+def compute_v5_write_budget_loss(write_rate, screening_config):
+    """Return the v5 upper write-budget penalty and configured ceiling."""
+
+    if (
+        getattr(screening_config, "semantics_version", None)
+        not in {"screening-v5-core", "screening-v5-retention"}
+        or screening_config.write_budget_weight <= 0.0
+    ):
+        zero = jnp.zeros((), dtype=jnp.float32)
+        return zero, zero
+    target = jnp.asarray(
+        screening_config.write_budget_target_max,
+        dtype=jnp.float32,
+    )
+    excess = jax.nn.relu(
+        jnp.asarray(write_rate, dtype=jnp.float32) - target
+    )
+    return screening_config.write_budget_weight * jnp.square(excess), target
+
+
+def compute_v5_self_index_loss(
+    raw_loss,
+    screening_config,
+    training_step,
+):
+    """Apply the temporary v5 self-index curriculum to its raw route loss."""
+
+    if (
+        training_step is None
+        or getattr(screening_config, "semantics_version", None)
+        not in {"screening-v5-core", "screening-v5-retention"}
+        or screening_config.self_index_loss_weight <= 0.0
+        or screening_config.self_index_loss_steps <= 0
+    ):
+        zero = jnp.zeros((), dtype=jnp.float32)
+        return zero, zero
+    anneal = jnp.clip(
+        1.0
+        - jnp.asarray(training_step, dtype=jnp.float32)
+        / float(screening_config.self_index_loss_steps),
+        0.0,
+        1.0,
+    )
+    coefficient = screening_config.self_index_loss_weight * anneal
+    return coefficient * jnp.asarray(raw_loss, dtype=jnp.float32), coefficient
+
+
 def nnx_model_loss(
     active_model,
     batch,
@@ -386,6 +433,10 @@ def nnx_model_loss(
     }
     admission_floor_loss = jnp.zeros((), dtype=jnp.float32)
     admission_floor_target = jnp.zeros((), dtype=jnp.float32)
+    write_budget_loss = jnp.zeros((), dtype=jnp.float32)
+    write_budget_target = jnp.zeros((), dtype=jnp.float32)
+    self_index_loss = jnp.zeros((), dtype=jnp.float32)
+    self_index_weight = jnp.zeros((), dtype=jnp.float32)
     if phase == "read_write" and "write_budget_rate" in normalized_stats:
         admission_floor_loss, admission_floor_target = (
             compute_v5_admission_floor_loss(
@@ -395,11 +446,26 @@ def nnx_model_loss(
                 training_step,
             )
         )
-        total_loss += admission_floor_loss * aux_loss_scale
+        write_budget_loss, write_budget_target = compute_v5_write_budget_loss(
+            normalized_stats["write_budget_rate"],
+            active_model.config.screening,
+        )
+        self_index_loss, self_index_weight = compute_v5_self_index_loss(
+            normalized_stats.get("self_index_raw_loss", jnp.zeros(())),
+            active_model.config.screening,
+            training_step,
+        )
+        total_loss += (
+            admission_floor_loss + write_budget_loss + self_index_loss
+        ) * aux_loss_scale
     metrics = {
         "loss": ce_loss,
         "admission_floor_loss": admission_floor_loss,
         "admission_floor_target": admission_floor_target,
+        "write_budget_loss": write_budget_loss,
+        "write_budget_target": write_budget_target,
+        "self_index_loss": self_index_loss,
+        "self_index_weight": self_index_weight,
         **normalized_stats,
     }
     for key in (
@@ -437,9 +503,14 @@ def nnx_model_loss(
         "read_energy_mean",
         "write_saturation_rate",
         "write_budget_rate",
+        "write_self_similarity",
+        "read_self_similarity",
+        "self_index_raw_loss",
+        "read_soft_warmup_alpha",
         "screening_residual_rms",
         "base_residual_rms",
         "screening_base_rms_ratio",
+        "screening_residual_scale",
     ):
         metrics.setdefault(key, jnp.zeros(()))
     return total_loss, (metrics, current_rwkv, current_screen)
@@ -572,6 +643,8 @@ def nnx_train_step(
 __all__ = [
     "NNXTrainState",
     "compute_v5_admission_floor_loss",
+    "compute_v5_self_index_loss",
+    "compute_v5_write_budget_loss",
     "create_nnx_train_state",
     "initialize_nnx_train_state",
     "nnx_model_loss",

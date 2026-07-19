@@ -92,6 +92,14 @@ Phase 1 quality gateを支持しない。したがってretentionやv5 Pallasを
 しても中心問題は解決しない。synthetic retrieval、memory-off counterfactual、
 anti-starvation/read curriculumの検証を先行する。
 
+この実測後、read starvationの直接要因として、4 tile、16 occupied slot、tile
+key次元16でanalytic近似が`tau_read=0.946`まで上昇することを確認した。実装は
+Gaussian null CDFのfamily-wise quantile（同条件で0.789）へ変更し、training
+限定soft-to-hard read、temporary self-index loss、upper write budget、
+redundancy-aware victim、memory-off評価を追加した。これらはローカルの意味論・
+gradientテストを対象とするfollow-upであり、本書のMI300X結果を上書きしない。
+新構成のmemory利用と品質改善は再測定するまで未検証である。
+
 ### fail-closed compute-only
 
 測定CLIは、prepared loss、prepared gradient、最終loss、更新後train stateの

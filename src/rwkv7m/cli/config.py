@@ -179,6 +179,41 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         type=int,
         default=0,
     )
+    parser.add_argument(
+        "--screening-read-soft-warmup-steps",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--screening-read-soft-warmup-temperature",
+        type=float,
+        default=0.1,
+    )
+    parser.add_argument(
+        "--screening-write-budget-target-max",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--screening-write-budget-weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--screening-self-index-margin",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--screening-self-index-loss-weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--screening-self-index-loss-steps",
+        type=int,
+        default=0,
+    )
 
 
 def screening_v2_kwargs(args):
@@ -271,6 +306,27 @@ def screening_v2_kwargs(args):
         ),
         "admission_floor_steps": getattr(
             args, "screening_admission_floor_steps", 0
+        ),
+        "read_soft_warmup_steps": getattr(
+            args, "screening_read_soft_warmup_steps", 0
+        ),
+        "read_soft_warmup_temperature": getattr(
+            args, "screening_read_soft_warmup_temperature", 0.1
+        ),
+        "write_budget_target_max": getattr(
+            args, "screening_write_budget_target_max", 1.0
+        ),
+        "write_budget_weight": getattr(
+            args, "screening_write_budget_weight", 0.0
+        ),
+        "self_index_margin": getattr(
+            args, "screening_self_index_margin", 0.0
+        ),
+        "self_index_loss_weight": getattr(
+            args, "screening_self_index_loss_weight", 0.0
+        ),
+        "self_index_loss_steps": getattr(
+            args, "screening_self_index_loss_steps", 0
         ),
     }
 

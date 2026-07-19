@@ -54,6 +54,50 @@ def test_eval_binidx_runs_one_step(tmp_path):
     assert metrics["perplexity"] > 1
 
 
+def test_eval_binidx_reports_memory_off_counterfactual(tmp_path):
+    prefix = write_eval_binidx(tmp_path)
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--ctx-len",
+            "4",
+            "--batch-size",
+            "1",
+            "--steps",
+            "1",
+            "--vocab-size",
+            "64",
+            "--d-model",
+            "32",
+            "--d-ffn",
+            "64",
+            "--n-layers",
+            "2",
+            "--n-heads",
+            "2",
+            "--head-size",
+            "16",
+            "--d-slot",
+            "16",
+            "--d-k",
+            "16",
+            "--d-v",
+            "16",
+            "--phase",
+            "read_write",
+            "--memory-off-counterfactual",
+            "--print-every",
+            "0",
+        ]
+    )
+    metrics = evaluate_binidx(args)
+    assert metrics["memory_off_loss"] > 0.0
+    assert np.isfinite(metrics["memory_loss_delta"])
+    assert np.isfinite(metrics["prediction_rms_delta"])
+    assert metrics["prediction_rms_delta"] >= 0.0
+
+
 def test_eval_binidx_can_carry_state_on_sequential_sampling(tmp_path):
     prefix = write_eval_binidx(tmp_path)
     args = parse_args(

@@ -25,9 +25,9 @@ screening-v5-retention
 * corrected v4 competitive GPU pathの実機検証は未実施
 * v5 coreのPhase 1 portable referenceおよびNNX統合は実装済みである
 * portable v5 coreはMI300X単基で0.185Bの50-step finite runとpost-training gradient gateを通過したが、0.3Bはrun間でNaNが再現せず、数値再現性は未確立である
-* tracked v5 configは`tied` editを用い、continuous editingとredundancy victim policyをheadline pathから外している
+* tracked v5 recovery configは`tied` edit、redundancy-aware victim、soft-to-hard read、temporary self-index loss、上下write curriculumを用いる
 * v5 Pallas、v5 checkpoint redesign、v5 retentionは未実装である
-* warm-up限定admission floorはopt-in実装済みだが、有効性は未実証である
+* warm-up限定admission floor、soft read、self-index loss、上限write budgetは実装済みだが、有効性は未実証である
 * 短時間MI300X runではmemory residualのcollapseと高いslot redundancyが観測され、v5のmodel quality改善は未実証である
 
 **主張の強さ**:
@@ -411,7 +411,22 @@ N_tests =
 
 一回のsimilarity testに使うkey次元を $d_{\mathrm{test}}$ とする。single-readでは
 $d_{\mathrm{test}}=d_k$、multi-readでは
-$d_{\mathrm{test}}=d_{k,\mathrm{tile}}$ である。高次元unit vectorの近似では、
+$d_{\mathrm{test}}=d_{k,\mathrm{tile}}$ である。高次元unit vectorのGaussian null
+近似では、family-wise CDFを
+
+$$
+q = (1-\delta_{\mathrm{read}})^{1/N_{\mathrm{tests}}}
+$$
+
+として、
+
+$$
+\tau^{\mathrm{base}}_{\mathrm{read}}
+\approx
+\frac{\Phi^{-1}(q)}{\sqrt{d_{\mathrm{test}}}}
+$$
+
+を用いる。より緩い上界として、
 
 $$
 \tau^{\mathrm{base}}_{\mathrm{read}}
@@ -425,7 +440,10 @@ d_{\mathrm{test}}
 }
 $$
 
-を初期値として利用できる。
+も書けるが、小さいtile次元と多いtest数では過度に保守的になるため、実装の
+既定値には用いない。実際、$N_{\mathrm{tests}}=64$、$d_{\mathrm{test}}=16$、
+$\delta=0.05$では上界が0.946、Gaussian CDF近似が0.789となる。前者はtracked
+MI300X runのread starvationを直接誘発し得る値だった。
 
 ただし、学習後のkey分布は等方的ではないため、analytic thresholdを保証として扱わない。
 
@@ -492,13 +510,26 @@ threshold_warmup:
     初期tauを低くし、学習中に校正値へ移行
 ```
 
-既定は、
+初期設計の既定は、
 
 ```text
 hard_read + threshold_warmup
 ```
 
-とする。
+だった。しかしMI300X短時間runでhard readが消失したため、tracked recovery
+profileではtraining中だけ、
+
+```text
+smooth forward / smooth backward
+    -> anneal
+hard forward / hard backward
+```
+
+へ移行する。smooth relevanceは正規化座標
+$x=(sim-\tau)/(1-\tau)$に対するsquared softplusとし、slot間で総和1へ正規化
+しない。deterministic evaluationとinferenceは常にhard readを使う。この
+curriculumはtraining semanticsを一時的に変更するため、hard-only ablationと
+区別して報告する。
 
 shadow surrogateは独立ablationとし、hard readと同じモデルとして報告しない。
 
@@ -1056,6 +1087,35 @@ L_admission_floor =
 residual scaleだけを0へ落とす退化解を抑えるためのcurriculumであり、warm-up終了後はlearned
 scaleだけを使用する。gate biasは飽和初期化せず、read RMS、base RMS、両者の比、learned scale、
 適用中のfloorを記録する。
+
+## 8.4 Temporary Self-Index Curriculum
+
+empty-first allocationだけでは、書き込まれたcandidate keyが、そのwriteを
+発生させたqueryから再検索可能であることを保証しない。query/key geometryが
+未学習のままでは、全tokenがnovelとなりslot置換だけが継続し得る。
+
+新規writeをhard-forwardで受理したtokenについて、選択されたcandidateの
+write keyとread keyへ一時的なmargin lossを課す。
+
+```text
+target_write = tau_novel_similarity + margin
+target_read_tile = tau_read_tile + margin
+
+L_self_index =
+    relu(target_write - sim(q_write, candidate_write_key))^2
+    + mean_tile(
+        relu(target_read_tile - sim(q_read_tile, candidate_read_key_tile))^2
+      )
+```
+
+admission、bank、victim addressはstop-gradientしたhard decisionとして扱い、
+query/key/candidate projectionへだけ幾何学習信号を流す。これによりloss回避の
+ためにadmissionを下げる経路を作らない。係数はwarm-up中にゼロへannealし、
+恒久的な同一query再構成目的にはしない。
+
+tracked recovery profileは同時にupper write budgetを有効化する。lower floorは
+never-writeだけ、upper budgetはall-novel/all-writeだけを抑えるため、両者を
+単一の固定write率として解釈しない。
 
 ---
 

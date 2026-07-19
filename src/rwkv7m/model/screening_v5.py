@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from .screening import (
     bounded_non_amplifying_aggregate,
     capacity_calibrated_similarity_threshold,
+    smooth_trim_square,
     tanh_norm,
     trim_square,
     unit_norm,
@@ -58,7 +59,10 @@ TAU_READ_MEAN = 32
 TAU_WRITE_MEAN = 33
 TAU_NOVEL_MEAN = 34
 WRITE_BUDGET_RATE = 35
-SCREENING_V5_STEP_STAT_COUNT = 36
+SELF_WRITE_SIMILARITY = 36
+SELF_READ_SIMILARITY = 37
+SELF_INDEX_LOSS = 38
+SCREENING_V5_STEP_STAT_COUNT = 39
 
 _SUPPORTED_VECTOR_DTYPES = (
     jnp.dtype(jnp.bfloat16),
@@ -92,6 +96,9 @@ class ScreeningV5RecurrenceConfig:
     eta_ambiguity: float
     edit_mode: str
     write_accounting_floor: float
+    read_soft_warmup_alpha: float | jax.Array = 0.0
+    read_soft_warmup_temperature: float = 0.1
+    self_index_margin: float = 0.0
 
 
 def _masked_softmax(logits, mask, *, temperature, eps):
@@ -390,6 +397,11 @@ def screening_v5_recurrence_reference(
 ):
     """Execute the complete v5-core recurrence with portable JAX."""
 
+    if config.read_soft_warmup_temperature <= 0.0:
+        raise ValueError("read_soft_warmup_temperature must be positive")
+    if not 0.0 <= config.self_index_margin < 1.0:
+        raise ValueError("self_index_margin must be in [0, 1)")
+
     inputs = (
         q_read,
         q_write,
@@ -417,6 +429,41 @@ def screening_v5_recurrence_reference(
     )
     _validate_inputs(*inputs, config=config)
     bank_ids = jnp.asarray(config.bank_ids, dtype=jnp.int32)
+    slot_count = initial_slots.shape[1]
+    key_size = q_read.shape[-1]
+    read_tiles = config.n_read_tiles
+    key_tile_size = key_size // read_tiles
+    occupancy_levels = jnp.arange(slot_count + 1, dtype=jnp.float32)
+    # Thresholds depend only on discrete occupancy and learned offsets. Build
+    # the complete table once per recurrence instead of evaluating the null
+    # quantile three times in every token step.
+    read_tau_lookup = _capacity_tau(
+        occupancy_levels,
+        tests_per_slot=float(read_tiles),
+        key_dimension=key_tile_size,
+        false_positive_rate=config.target_false_read_rate,
+        learned_offset=jnp.reshape(tau_read_offset, (read_tiles,)),
+        slot_count=slot_count,
+        config=config,
+    )
+    write_tau_lookup = _capacity_tau(
+        occupancy_levels,
+        tests_per_slot=1.0,
+        key_dimension=key_size,
+        false_positive_rate=config.target_false_write_rate,
+        learned_offset=jnp.reshape(tau_write_offset, (1,)),
+        slot_count=slot_count,
+        config=config,
+    )[..., 0]
+    novel_tau_lookup = _capacity_tau(
+        occupancy_levels,
+        tests_per_slot=1.0,
+        key_dimension=key_size,
+        false_positive_rate=config.target_false_match_rate,
+        learned_offset=jnp.reshape(tau_write_offset, (1,)),
+        slot_count=slot_count,
+        config=config,
+    )[..., 0]
 
     def step(carry, token_inputs):
         (
@@ -444,40 +491,36 @@ def screening_v5_recurrence_reference(
         ) = token_inputs
 
         batch, slot_count, key_size = read_keys.shape
-        read_tiles = config.n_read_tiles
-        key_tile_size = key_size // read_tiles
         value_size = values.shape[-1]
         value_tile_size = value_size // read_tiles
         occupied = jax.lax.stop_gradient((occupancy > 0.5).astype(jnp.float32))
         occupied_count = jnp.sum(occupied, axis=-1)
-
-        read_tau = _capacity_tau(
-            occupied_count,
-            tests_per_slot=float(read_tiles),
-            key_dimension=key_tile_size,
-            false_positive_rate=config.target_false_read_rate,
-            learned_offset=jnp.reshape(tau_read_offset, (read_tiles,)),
-            slot_count=slot_count,
-            config=config,
+        occupied_index = jnp.clip(
+            occupied_count.astype(jnp.int32),
+            0,
+            slot_count,
         )
-        write_tau = _capacity_tau(
-            occupied_count,
-            tests_per_slot=1.0,
-            key_dimension=key_size,
-            false_positive_rate=config.target_false_write_rate,
-            learned_offset=jnp.reshape(tau_write_offset, (1,)),
-            slot_count=slot_count,
-            config=config,
-        )[..., 0]
-        novel_similarity_tau = _capacity_tau(
-            occupied_count,
-            tests_per_slot=1.0,
-            key_dimension=key_size,
-            false_positive_rate=config.target_false_match_rate,
-            learned_offset=jnp.reshape(tau_write_offset, (1,)),
-            slot_count=slot_count,
-            config=config,
-        )[..., 0]
+        occupancy_selector = jax.nn.one_hot(
+            occupied_index,
+            slot_count + 1,
+            dtype=jnp.float32,
+        )
+        # A dynamic gather from a replicated lookup to a data-sharded batch
+        # has ambiguous output sharding under explicit meshes. The equivalent
+        # one-hot selection has an unambiguous data-sharded result and keeps
+        # the recurrence collective-free.
+        read_tau = jnp.sum(
+            occupancy_selector[..., None] * read_tau_lookup[None, ...],
+            axis=1,
+        )
+        write_tau = jnp.sum(
+            occupancy_selector * write_tau_lookup[None, :],
+            axis=1,
+        )
+        novel_similarity_tau = jnp.sum(
+            occupancy_selector * novel_tau_lookup[None, :],
+            axis=1,
+        )
 
         read_keys_tiled = read_keys.astype(jnp.float32).reshape(
             batch, slot_count, read_tiles, key_tile_size
@@ -491,10 +534,24 @@ def screening_v5_recurrence_reference(
             q_read_tiled,
             unit_norm(read_keys_tiled, eps=config.eps),
         )
-        read_relevance = trim_square(
+        hard_read_relevance = trim_square(
             read_similarity,
             read_tau[..., None],
             eps=config.eps,
+        )
+        soft_read_relevance = smooth_trim_square(
+            read_similarity,
+            read_tau[..., None],
+            config.read_soft_warmup_temperature,
+            eps=config.eps,
+        )
+        read_alpha = jnp.clip(
+            jnp.asarray(config.read_soft_warmup_alpha, dtype=jnp.float32),
+            0.0,
+            1.0,
+        )
+        read_relevance = hard_read_relevance + read_alpha * (
+            soft_read_relevance - hard_read_relevance
         )
         read_relevance *= occupied[:, None, :]
         normalized_values = (
@@ -546,6 +603,7 @@ def screening_v5_recurrence_reference(
         )
         novel_hard = (
             (occupied_count == 0)
+            | (jnp.max(eligibility, axis=-1) <= 0.0)
             | (matched_confidence < novelty_threshold)
         ).astype(jnp.float32)
         novel_soft = jax.nn.sigmoid(
@@ -773,6 +831,57 @@ def screening_v5_recurrence_reference(
         )
         accepted_novel = jnp.max(accepted_novel_hard, axis=-1)
         empty_allocation = accepted_novel * empty_selected
+        candidate_write_similarity = jnp.einsum(
+            "bk,bmk->bm",
+            q_write_t,
+            unit_norm(delta_write_keys_t.astype(jnp.float32), eps=config.eps),
+        )
+        candidate_read_keys = delta_read_keys_t.astype(jnp.float32).reshape(
+            batch, slot_count, read_tiles, key_tile_size
+        )
+        candidate_read_similarity = jnp.einsum(
+            "brk,bmrk->brm",
+            q_read_tiled,
+            unit_norm(candidate_read_keys, eps=config.eps),
+        )
+        selected_write_similarity = jnp.sum(
+            allocation_hard * candidate_write_similarity,
+            axis=-1,
+        )
+        selected_read_similarity = jnp.einsum(
+            "bm,brm->br",
+            allocation_hard,
+            candidate_read_similarity,
+        )
+        write_self_target = jax.lax.stop_gradient(
+            jnp.clip(
+                novel_similarity_tau + config.self_index_margin,
+                config.tau_min,
+                config.tau_max,
+            )
+        )
+        read_self_target = jax.lax.stop_gradient(
+            jnp.clip(
+                read_tau + config.self_index_margin,
+                config.tau_min,
+                config.tau_max,
+            )
+        )
+        self_index_loss = accepted_novel * (
+            jnp.square(
+                jax.nn.relu(
+                    write_self_target - selected_write_similarity
+                )
+            )
+            + jnp.mean(
+                jnp.square(
+                    jax.nn.relu(
+                        read_self_target - selected_read_similarity
+                    )
+                ),
+                axis=-1,
+            )
+        )
         saturated = jnp.max(
             jnp.maximum(erase_mass, write_mass),
             axis=-1,
@@ -813,6 +922,12 @@ def screening_v5_recurrence_reference(
                 write_tau,
                 novelty_threshold,
                 admission_soft * novel_soft,
+                accepted_novel * selected_write_similarity,
+                accepted_novel * jnp.mean(
+                    selected_read_similarity,
+                    axis=-1,
+                ),
+                self_index_loss,
             ),
             axis=-1,
         )
@@ -893,6 +1008,9 @@ __all__ = [
     "READ_ENERGY_MEAN",
     "READ_MAX",
     "READ_MEAN",
+    "SELF_INDEX_LOSS",
+    "SELF_READ_SIMILARITY",
+    "SELF_WRITE_SIMILARITY",
     "REJECTED_RATE",
     "ROUTE_ENTROPY",
     "ROUTE_TOP1",
