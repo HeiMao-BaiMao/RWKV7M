@@ -233,6 +233,7 @@ def main(argv=None):
     bundle_graphdef, bundle_state = nnx.split(
         (train_state.model, train_state.optimizer)
     )
+    phase_training_step = jnp.zeros((), dtype=jnp.uint32)
 
     def loss_function(active_params):
         model = nnx.merge(graphdef, active_params)
@@ -244,6 +245,7 @@ def main(argv=None):
             phase=phase,
             deterministic=False,
             include_l2wrap=True,
+            training_step=phase_training_step,
         )
         return loss
 
@@ -273,6 +275,7 @@ def main(argv=None):
                 phase=phase,
                 deterministic=False,
                 include_l2wrap=True,
+                training_step=optimizer.step[...],
             )
             return loss
 
@@ -425,6 +428,10 @@ def main(argv=None):
             "backward": "VJP pullback from one precomputed forward residual",
             "optimizer": "NNX optimizer update from fixed gradients",
             "full_step": "value_and_grad plus optimizer with no intermediate host barrier",
+            "training_step": (
+                "forward/backward use step zero; full_step uses the bundled "
+                "optimizer step so temporary curricula match real training"
+            ),
         },
         "optimizer": {
             "implementation": resolve_optimizer_backend(
