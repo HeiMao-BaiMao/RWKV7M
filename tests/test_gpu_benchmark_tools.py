@@ -138,6 +138,23 @@ def test_gradient_diagnostic_reports_nonfinite_values_and_largest_leaf():
     assert summary["largest_finite_gradients"][0]["path"] == "finite"
 
 
+def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
+    checkpoint = tmp_path / "ckpt-00000007"
+    args = DIAGNOSE.parse_args(
+        [
+            "--fixed-batch",
+            str(tmp_path / "batch.npz"),
+            "--model-config",
+            "config.json",
+            "--checkpoint",
+            str(checkpoint),
+            "--output",
+            str(tmp_path / "diagnostic.json"),
+        ]
+    )
+    assert args.checkpoint == checkpoint
+
+
 def test_nsight_rejects_conflicting_profile_mode():
     with pytest.raises(SystemExit, match="cuda_profiler_api"):
         PROFILE._ensure_profile_range(

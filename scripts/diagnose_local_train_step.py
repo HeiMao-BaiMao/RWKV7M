@@ -12,7 +12,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from rwkv7m.api import create_train_runtime
+from rwkv7m.distributed.checkpoint import (
+    load_distributed_checkpoint_metadata,
+    restore_distributed_train_state,
+)
 from rwkv7m.io import load_model_config
+from rwkv7m.io.config import model_config_to_dict
 from rwkv7m.train.nnx_train import nnx_model_loss
 
 
@@ -20,6 +25,15 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixed-batch", type=Path, required=True)
     parser.add_argument("--model-config", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional distributed checkpoint whose parameters should be "
+            "diagnosed."
+        ),
+    )
     parser.add_argument(
         "--variant",
         choices=("baseline", "screening", "read_write"),
@@ -115,12 +129,32 @@ def main(argv=None):
     if token_count > config.max_seq_len:
         raise SystemExit("fixed batch exceeds the model maximum sequence length")
     batch = jax.device_put(batch)
+    checkpoint_step = 0
+    checkpoint_path = None
+    if args.checkpoint is not None:
+        checkpoint_path = args.checkpoint.resolve()
+        checkpoint_metadata = load_distributed_checkpoint_metadata(
+            checkpoint_path
+        )
+        stored_config = model_config_to_dict(checkpoint_metadata.config)
+        if stored_config != model_config_to_dict(config):
+            raise SystemExit(
+                "--model-config does not match the configuration stored in "
+                "--checkpoint"
+            )
+        checkpoint_step = checkpoint_metadata.start_step
     runtime, train_state = create_train_runtime(
         jax.random.key(args.seed),
         config,
         batch_size=batch_size,
-        total_steps=2,
+        total_steps=max(checkpoint_step + 2, 2),
     )
+    if checkpoint_path is not None:
+        train_state, restored = restore_distributed_train_state(
+            checkpoint_path,
+            train_state,
+        )
+        checkpoint_step = restored.start_step
     graphdef, params = nnx.split(train_state.model, nnx.Param)
 
     def loss_function(active_params):
@@ -133,7 +167,7 @@ def main(argv=None):
             phase=phase,
             deterministic=False,
             include_l2wrap=True,
-            training_step=jnp.zeros((), dtype=jnp.uint32),
+            training_step=jnp.asarray(checkpoint_step, dtype=jnp.uint32),
         )
         return loss
 
@@ -147,6 +181,8 @@ def main(argv=None):
         "tokens": int(token_count),
         "variant": args.variant,
         "model_config": str(Path(args.model_config)),
+        "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
+        "training_step": int(checkpoint_step),
         "devices": [
             {
                 "platform": device.platform,
