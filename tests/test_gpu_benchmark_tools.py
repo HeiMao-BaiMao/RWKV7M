@@ -148,11 +148,14 @@ def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
             "config.json",
             "--checkpoint",
             str(checkpoint),
+            "--sequence-chunk-size",
+            "0",
             "--output",
             str(tmp_path / "diagnostic.json"),
         ]
     )
     assert args.checkpoint == checkpoint
+    assert args.sequence_chunk_size == 0
 
 
 def test_nsight_rejects_conflicting_profile_mode():

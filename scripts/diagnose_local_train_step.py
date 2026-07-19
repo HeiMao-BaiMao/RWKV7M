@@ -40,6 +40,15 @@ def parse_args(argv=None):
         default="read_write",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sequence-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Override recurrent chunking for diagnosis; use 0 to disable "
+            "chunking without changing checkpoint tensor shapes."
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -50,6 +59,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.top_k <= 0:
         parser.error("--top-k must be positive")
+    if args.sequence_chunk_size is not None and args.sequence_chunk_size < 0:
+        parser.error("--sequence-chunk-size must be non-negative")
     return args
 
 
@@ -143,6 +154,12 @@ def main(argv=None):
                 "--checkpoint"
             )
         checkpoint_step = checkpoint_metadata.start_step
+    if args.sequence_chunk_size is not None:
+        config.sequence_chunk_size = (
+            None
+            if args.sequence_chunk_size == 0
+            else args.sequence_chunk_size
+        )
     runtime, train_state = create_train_runtime(
         jax.random.key(args.seed),
         config,
@@ -183,6 +200,7 @@ def main(argv=None):
         "model_config": str(Path(args.model_config)),
         "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
         "training_step": int(checkpoint_step),
+        "sequence_chunk_size": config.sequence_chunk_size,
         "devices": [
             {
                 "platform": device.platform,
