@@ -1,4 +1,4 @@
-"""Persistent projected-screening recurrence for NVIDIA GPUs.
+"""Persistent projected-screening recurrence for Triton and Mosaic GPUs.
 
 One Pallas program owns one batch item's slot state. Dense projections are
 performed before and after this kernel, leaving only the sequential state
@@ -20,6 +20,8 @@ from rwkv7m.model.screening import competitive_write_routing
 
 GPULowering = Literal["mosaic", "triton"]
 _STEP_STAT_COUNT = 22
+_PUBLIC_BANK_COUNT = 3
+_TRITON_BANK_COUNT = 4
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,28 @@ def _validate_config(config: ScreeningGPUConfig) -> None:
         raise ValueError("num_warps must be a supported power of two")
     if config.num_stages <= 0:
         raise ValueError("num_stages must be positive")
+
+
+def _pad_bank_logits(bank_logits):
+    """Pad the public three-bank vector for Triton's power-of-two lowering."""
+
+    if bank_logits.shape[-1] != _PUBLIC_BANK_COUNT:
+        raise ValueError("bank_logits must have a three-element bank axis")
+    return jnp.pad(
+        bank_logits,
+        ((0, 0), (0, 0), (0, _TRITON_BANK_COUNT - _PUBLIC_BANK_COUNT)),
+        constant_values=jnp.asarray(-1e30, dtype=bank_logits.dtype),
+    )
+
+
+def _public_input_gradients(result):
+    """Remove the internal padded-bank gradient from Pallas outputs."""
+
+    return (
+        *result[:3],
+        result[3][..., :_PUBLIC_BANK_COUNT],
+        *result[4:14],
+    )
 
 
 def _load_time_vector(ref, index):
@@ -1067,7 +1091,7 @@ def screening_pallas_gpu_forward(
         ),
         name=f"rwkv7_screening_gpu_{lowering}_forward",
     )(
-        q_read, q_write, admission, bank_logits,
+        q_read, q_write, admission, _pad_bank_logits(bank_logits),
         delta_slots, delta_read_keys, delta_values,
         delta_write_keys, initial_slots, initial_read_keys,
         initial_values, initial_write_keys, initial_ages, initial_usage,
@@ -1092,7 +1116,7 @@ def _screening_gpu_specs(
         (time, 1), lambda batch_id: (0, batch_id)
     )
     bank_logits = pl.BlockSpec(
-        (time, 1, 3), lambda batch_id: (0, batch_id, 0)
+        (time, 1, _TRITON_BANK_COUNT), lambda batch_id: (0, batch_id, 0)
     )
 
     def time_matrix(feature_size):
@@ -1289,7 +1313,7 @@ def _screening_pallas_gpu_forward_with_checkpoints(
         q_read,
         q_write,
         admission,
-        bank_logits,
+        _pad_bank_logits(bank_logits),
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -1442,7 +1466,7 @@ def screening_pallas_gpu_forward_with_aux(
         q_read,
         q_write,
         admission,
-        bank_logits,
+        _pad_bank_logits(bank_logits),
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -1507,7 +1531,7 @@ def _screening_pallas_gpu_backward_with_checkpoints(
         q_read,
         q_write,
         admission,
-        bank_logits,
+        _pad_bank_logits(bank_logits),
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -1595,7 +1619,7 @@ def _screening_pallas_gpu_backward_with_checkpoints(
         name=f"rwkv7_screening_gpu_{lowering}_checkpoint_backward",
     )(*arrays)
     return (
-        *result[:14],
+        *_public_input_gradients(result),
         jnp.sum(result[14], axis=0).astype(mu.dtype),
         jnp.sum(result[15], axis=0).reshape(tau_read.shape).astype(tau_read.dtype),
         jnp.sum(result[16], axis=0).reshape(tau_write.shape).astype(tau_write.dtype),
@@ -1682,7 +1706,7 @@ def screening_pallas_gpu_backward(
         q_read,
         q_write,
         admission,
-        bank_logits,
+        _pad_bank_logits(bank_logits),
         delta_slots,
         delta_read_keys,
         delta_values,
@@ -1769,7 +1793,7 @@ def screening_pallas_gpu_backward(
         name=f"rwkv7_screening_gpu_{lowering}_backward",
     )(*arrays)
     return (
-        *result[:14],
+        *_public_input_gradients(result),
         jnp.sum(result[14], axis=0).astype(mu.dtype),
         jnp.sum(result[15], axis=0).reshape(tau_read.shape).astype(tau_read.dtype),
         jnp.sum(result[16], axis=0).reshape(tau_write.shape).astype(tau_write.dtype),

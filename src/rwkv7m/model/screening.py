@@ -224,12 +224,23 @@ def competitive_write_routing(
             admission_hard - admission_soft
         )
 
+    # GPU Triton kernels may pad the public three-bank vector to a power-of-two
+    # width. Padded banks have no matching slot IDs and are therefore masked
+    # out without changing the public three-bank routing semantics.
+    bank_count = bank_logits.shape[-1]
+    if bank_count < 3:
+        raise ValueError("bank_logits must contain at least three banks")
+
     # Mosaic TPU requires ``iota`` itself to have an integer/index dtype.
     # Convert only after materializing the tie-break indices.
-    bank_index = jnp.arange(3, dtype=jnp.int32).astype(jnp.float32)
-    available_banks = jnp.stack(
-        [jnp.any(bank_ids == bank_id) for bank_id in range(3)]
+    bank_index = jnp.arange(bank_count, dtype=jnp.int32).astype(jnp.float32)
+    bank_membership = (
+        bank_ids[:, None]
+        == jnp.arange(bank_count, dtype=jnp.int32)[None, :]
     )
+    available_banks = jnp.sum(
+        bank_membership.astype(jnp.int32), axis=0
+    ) > 0
     bank_scores = (
         bank_logits / bank_route_temperature - 1e-6 * bank_index
     )
@@ -250,7 +261,7 @@ def competitive_write_routing(
 
     slot_index = jnp.arange(slot_count, dtype=jnp.int32).astype(jnp.float32)
     victim_route = jnp.zeros_like(eligibility, dtype=jnp.float32)
-    for bank_id in range(3):
+    for bank_id in range(bank_count):
         mask = bank_ids == bank_id
         mask_broadcast = jnp.broadcast_to(mask, eligibility.shape)
         age_min = jnp.min(
@@ -287,7 +298,11 @@ def competitive_write_routing(
         slot_route = slot_soft + jax.lax.stop_gradient(
             slot_hard - slot_soft
         )
-        victim_route += bank_route[..., bank_id, None] * slot_route
+        bank_selector = (
+            jnp.arange(bank_count, dtype=jnp.int32) == bank_id
+        ).astype(jnp.float32)
+        bank_weight = jnp.sum(bank_route * bank_selector, axis=-1)
+        victim_route += bank_weight[..., None] * slot_route
 
     novel_route = (
         novel_gate[..., None] * admission[..., None] * victim_route

@@ -224,6 +224,10 @@ The real L40S correctness gate, four-shape WKV benchmark, complete train-step
 measurements, upstream RWKV comparison, TPU comparison, and two-GPU scaling
 record are in the
 [L40S Pallas performance report](docs/gpu_l40s_pallas_performance.md).
+The AMD MI300X ROCm/Triton lowering, compute-only throughput, and short
+MiniPile learning-behavior record for the 0.185B and 0.3B configurations are
+in the
+[MI300X training validation report](docs/gpu_mi300x_training_validation.md).
 WKV now dispatches to persistent Pallas forward/backward kernels by default on
 TPU and NVIDIA GPU, while CPU uses the reference recurrence. L40S/Ada selects
 the Triton Pallas lowering explicitly; recognized Hopper/Blackwell devices use
@@ -258,7 +262,9 @@ hard-forward/soft-backward novelty and admission with sparse bank-aware novel
 allocation, interval training-tape
 checkpointing, and fixed-total-dimension multi-read tiles. Existing configs
 continue to map to explicit legacy write modes; the tracked opt-in example is
-[`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example).
+[`configs/rwkv7m-0.185b-screening-v2.json.example`](configs/rwkv7m-0.185b-screening-v2.json.example);
+the 0.3B experiment uses
+[`configs/rwkv7m-0.3b-screening-v2.json.example`](configs/rwkv7m-0.3b-screening-v2.json.example).
 Portable reference tests and CPU Pallas interpret-mode tests cover the v2
 forward and gradients for both backend-specific kernel bodies. Corrected commit
 `f35f6fc` passed real TPU v5e-4 lowering, all six outputs, all 17 input
@@ -266,8 +272,12 @@ gradients, the tracked recurrence gate, checkpointed `T=512` parity, and
 four-device 0.185B model-axis optimizer steps at contexts 128 and 512 on
 2026-07-18. Direct single-kernel `T=2048` exceeds v5e scoped VMEM, so the
 production path remains chunked. The published L40S result still measures the
-legacy recurrence. Real GPU v2, measured checkpoint peak memory, steady-state
-complete-model throughput, and multi-host gates remain pending.
+legacy recurrence. On 2026-07-19 the Triton body lowered and ran on an AMD
+MI300X, and a small real-accelerator v2 parity test passed. The production
+0.3B recurrence shape did not pass the fail-closed loss/absolute-gradient
+gate, however, and the short training runs exposed admission/read collapse
+and a 0.3B v2 NaN. Production GPU v2 parity, measured checkpoint peak memory,
+stable long-run throughput, and multi-host gates therefore remain pending.
 
 Run the synchronized screening recurrence benchmark with:
 

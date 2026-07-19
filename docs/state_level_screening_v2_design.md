@@ -3,8 +3,9 @@
 Status: opt-in implementation complete. Corrected GPU/TPU Pallas equations
 pass CPU interpret parity, and the corrected TPU path passes real v5e-4
 lowering, all-output/all-input-gradient parity, recurrence timing, and a full
-four-way model-axis step at the tracked maximum context. Real GPU v2 and
-multi-host gates remain pending.
+four-way model-axis step at the tracked maximum context. The Triton GPU path
+also lowers and executes on AMD MI300X, but its production-shape fail-closed
+parity and stable-learning gates remain open. Multi-host gates remain pending.
 
 Here, "v2" names the second implemented Screening architecture. The
 accompanying paper is now `design-locked-draft-v5`; its
@@ -373,10 +374,16 @@ median latency was 0.578 ms forward and 4.888 ms forward plus backward, versus
 also completed finite forward and optimizer step 1 with `data=1, model=4` at
 contexts 128 and 512; context 512 exercised four configured 128-token chunks.
 Direct single-kernel `T=2048` exceeds v5e scoped VMEM, so long contexts must
-remain chunked on this device. Real GPU lowering, measured peak memory,
-steady-state complete-model throughput, and multi-host scaling remain
-unverified for the corrected v2 path. Full measurements and cleanup evidence
-are in [the TPU report](tpu_pallas_performance.md).
+remain chunked on this device. On 2026-07-19, the real MI300X Triton path
+passed the small accelerator test and ran complete 0.185B/0.3B steps. The
+production 0.3B recurrence diagnostic did not pass the absolute-gradient/loss
+parity gate, the 0.185B v2 training run collapsed to zero applied writes, and
+the longer 0.3B v2 attempt became non-finite at step 7. These results establish
+real ROCm lowering, not production v2 acceptance or a Screening quality gain.
+Full TPU measurements and cleanup evidence are in
+[the TPU report](tpu_pallas_performance.md); the GPU training behavior and
+limitations are in
+[the MI300X report](gpu_mi300x_training_validation.md).
 
 Every stage must pass:
 

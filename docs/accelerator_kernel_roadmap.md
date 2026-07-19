@@ -175,8 +175,11 @@ gradient parity, recurrence timing, checkpointed `T=512` parity, and full
 0.185B model-axis steps at contexts 128 and 512 on 2026-07-18. Direct
 single-kernel `T=2048` exceeds v5e scoped VMEM, while the production
 128-token-chunk path reaches the configured 512-token maximum. Current L40S
-records apply to the legacy projected recurrence, so real GPU v2 remains
-pending.
+records apply to the legacy projected recurrence. A 2026-07-19 AMD MI300X run
+proved Triton v2 lowering and small-shape accelerator parity, but the
+production 0.3B recurrence failed the fail-closed absolute-gradient/loss gate
+and the learning runs exposed admission/read collapse and a v2 NaN. Real GPU
+v2 production acceptance therefore remains pending.
 
 The backend boundary remains:
 
@@ -305,9 +308,10 @@ not accepted as proof of the limiting resource.
     `f35f6fc` passed real TPU v5e-4 lowering, six-output/17-input-gradient
     parity, tracked-shape and checkpointed-T=512 recurrence gates, and
     four-device 0.185B model-axis optimizer steps through context 512. Direct
-    single-kernel T=2048 exceeds v5e scoped VMEM. L40S and Mosaic v2, measured
-    peak memory, steady-state complete-step throughput, and multi-host records
-    remain required.
+    single-kernel T=2048 exceeds v5e scoped VMEM. MI300X Triton lowering and a
+    small real-accelerator test pass, but production-shape parity and stable
+    v2 learning do not. L40S/Mosaic v2, measured peak memory, stable
+    complete-step throughput, and multi-host records remain required.
 
 For a preset, omit execution flags to retain its tracked defaults. The following
 flags make comparison runs explicit:
@@ -349,6 +353,21 @@ baseline for read/write in the single current run. Profiling and fusion of the
 remaining projections, gradients, and optimizer work now precede further WKV
 replacement work on Ada. The unexpected read/write advantage is not treated as
 causal until repeated under a profiler.
+
+## AMD MI300X learning-behavior record
+
+The ROCm/Triton environment, production-shape parity diagnostic, compute-only
+batch scaling, and short MiniPile training trajectories are documented in
+[AMD MI300X training validation](gpu_mi300x_training_validation.md).
+
+The MI300X path ran WKV, Screening, the full-XLA head, and Optax on one device.
+At batch 32 it measured 35,312 token/s for the 0.185B v2 shape and 29,011
+token/s for the 0.3B legacy shape under the fixed device-resident complete-step
+boundary. These are capacity results, not evidence of Screening quality.
+During real MiniPile training, 0.185B v2 rejected every write by step 26,
+0.3B legacy stopped producing a measurable memory read by step 81, and the
+longer 0.3B v2 attempt first became non-finite at step 7. The next GPU work is
+therefore numerical and learning-dynamics diagnosis, not dispatch promotion.
 
 ## TPU v5e Pallas validation record
 
