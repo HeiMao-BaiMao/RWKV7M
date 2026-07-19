@@ -33,6 +33,7 @@ from rwkv7m.model.screening_v5 import (
     NOVEL_WRITE_MASS,
     OCCUPANCY_MEAN,
     READ_MAX,
+    Z_NORM,
     ScreeningV5RecurrenceConfig,
     ambiguity_aware_matched_routing,
     deterministic_lowest_argmax,
@@ -279,6 +280,22 @@ def test_empty_matched_route_has_finite_zero_gradient():
         )
 
     gradient = jax.grad(confidence)(jnp.zeros((1, 4), dtype=jnp.float32))
+    assert jnp.array_equal(gradient, jnp.zeros_like(gradient))
+
+
+def test_empty_read_diagnostic_norm_has_zero_finite_gradient():
+    inputs = list(_v5_inputs())
+
+    def objective(q_read):
+        values = list(inputs)
+        values[0] = q_read
+        statistics = screening_v5_recurrence_reference(
+            *values,
+            _v5_recurrence_config(),
+        )[5]
+        return statistics[0, 0, Z_NORM]
+
+    gradient = jax.grad(objective)(inputs[0])
     assert jnp.array_equal(gradient, jnp.zeros_like(gradient))
 
 
