@@ -231,6 +231,7 @@ def test_v5_learned_threshold_offsets_start_at_zero():
         _v5_screening_config(),
         rngs=nnx.Rngs(0),
     )
+    assert module.q_proj_r.precision == jax.lax.Precision.HIGH
     assert jnp.array_equal(
         module.tau_r_offset[...],
         jnp.zeros((2,), dtype=module.tau_r_offset[...].dtype),

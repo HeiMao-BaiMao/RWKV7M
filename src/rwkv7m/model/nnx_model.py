@@ -187,6 +187,7 @@ def _linear(
     sharding: NNXShardingConfig | None = None,
     dtype=None,
     param_dtype=jnp.float32,
+    precision=None,
 ) -> nnx.Linear:
     output_model_sharded = bool(
         sharding is not None
@@ -201,6 +202,7 @@ def _linear(
         use_bias=use_bias,
         dtype=dtype,
         param_dtype=param_dtype,
+        precision=precision,
         kernel_init=_partitioned_init(kernel_init, kernel_axes, sharding),
         bias_init=_partitioned_init(bias_init, bias_axes, sharding),
         rngs=rngs,
@@ -938,19 +940,37 @@ class NNXStateLevelScreening(nnx.Module):
     ):
         self.config = config
         self.semantics_version = resolve_semantics_version(config)
+        v5_enabled = is_v5_semantics(config)
         if self.semantics_version == "screening-v5-retention":
             raise NotImplementedError(
                 "screening-v5-retention is gated on v5-core evaluation"
             )
         self.sharding = sharding
         self.compute_dtype = compute_dtype
+        # The v5 slot state is carried across sequence chunks. ROCm may choose
+        # shape-dependent reduced-precision FP32 GEMM algorithms by default,
+        # which makes the same token projection depend on the chunk length and
+        # accumulates visible drift in the recurrent state. HIGH keeps the
+        # state-forming projections chunk-stable without changing the v4 fast
+        # path or forcing HIGHEST precision over the full model.
+        screening_precision = (
+            jax.lax.Precision.HIGH if v5_enabled else None
+        )
+
+        def screening_linear(*args, **kwargs):
+            return _linear(
+                *args,
+                precision=screening_precision,
+                **kwargs,
+            )
+
         C = config.d_model
         model = sharding.model_axis if sharding is not None else None
         row = (model, None) if model else None
         column = (None, model) if model else None
         vector = (model,) if model else None
         slot = (None, model) if model else None
-        self.q_proj_r = _linear(
+        self.q_proj_r = screening_linear(
             C,
             config.d_k,
             use_bias=False,
@@ -960,7 +980,7 @@ class NNXStateLevelScreening(nnx.Module):
             dtype=compute_dtype,
             param_dtype=param_dtype,
         )
-        self.k_proj_r = _linear(
+        self.k_proj_r = screening_linear(
             config.d_slot,
             config.d_k,
             use_bias=False,
@@ -970,7 +990,7 @@ class NNXStateLevelScreening(nnx.Module):
             dtype=compute_dtype,
             param_dtype=param_dtype,
         )
-        self.v_proj = _linear(
+        self.v_proj = screening_linear(
             config.d_slot,
             config.d_v,
             use_bias=False,
@@ -980,7 +1000,7 @@ class NNXStateLevelScreening(nnx.Module):
             dtype=compute_dtype,
             param_dtype=param_dtype,
         )
-        self.out_proj = _linear(
+        self.out_proj = screening_linear(
             config.d_v,
             C,
             use_bias=False,
@@ -991,7 +1011,7 @@ class NNXStateLevelScreening(nnx.Module):
             param_dtype=param_dtype,
         )
         gate_size = C if config.gate_space == "model" else config.d_v
-        self.gate_proj = _linear(
+        self.gate_proj = screening_linear(
             C,
             gate_size,
             kernel_axes=row,
@@ -1004,7 +1024,7 @@ class NNXStateLevelScreening(nnx.Module):
             # Keep the portable concatenated kernel shape, but shard its d_slot
             # output. Sharding the concatenated input would make x/h/slot
             # slices cross device boundaries and add avoidable collectives.
-            self.delta_proj = _linear(
+            self.delta_proj = screening_linear(
                 2 * C + config.d_slot,
                 config.d_slot,
                 kernel_axes=column,
@@ -1020,7 +1040,7 @@ class NNXStateLevelScreening(nnx.Module):
         else:
             rank = config.candidate_rank
             self.delta_proj = nnx.data(None)
-            self.delta_context_proj = _linear(
+            self.delta_context_proj = screening_linear(
                 2 * C,
                 rank,
                 use_bias=False,
@@ -1030,7 +1050,7 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
-            self.delta_slot_proj = _linear(
+            self.delta_slot_proj = screening_linear(
                 config.d_slot,
                 rank,
                 use_bias=False,
@@ -1040,7 +1060,7 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
-            self.delta_out_proj = _linear(
+            self.delta_out_proj = screening_linear(
                 rank,
                 config.d_slot,
                 kernel_axes=column,
@@ -1083,7 +1103,7 @@ class NNXStateLevelScreening(nnx.Module):
         self.slot_embed = _param(rngs, initializers.normal(0.02), (config.n_slots, config.d_slot), axes=slot, sharding=sharding, dtype=param_dtype)
         self.mu_by_bank_raw = _param(rngs, initializers.zeros_init(), (3,), sharding=sharding, dtype=param_dtype)
         if write_mode_uses_write_projection(config):
-            self.q_proj_w = _linear(
+            self.q_proj_w = screening_linear(
                 2 * C,
                 config.d_k,
                 use_bias=False,
@@ -1093,7 +1113,7 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
-            self.k_proj_w = _linear(
+            self.k_proj_w = screening_linear(
                 config.d_slot,
                 config.d_k,
                 use_bias=False,
@@ -1125,7 +1145,7 @@ class NNXStateLevelScreening(nnx.Module):
             admission_bias = math.log(
                 config.admission_init / (1.0 - config.admission_init)
             )
-            self.admission_proj = _linear(
+            self.admission_proj = screening_linear(
                 route_input_size,
                 1,
                 kernel_axes=row,
@@ -1135,7 +1155,7 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
-            self.bank_route_proj = _linear(
+            self.bank_route_proj = screening_linear(
                 route_input_size,
                 3,
                 kernel_axes=row,
@@ -1175,7 +1195,7 @@ class NNXStateLevelScreening(nnx.Module):
                     del key, shape
                     return jnp.asarray([erase_bias, write_bias], dtype=dtype)
 
-                self.matched_edit_proj = _linear(
+                self.matched_edit_proj = screening_linear(
                     route_input_size,
                     2 * config.n_slots,
                     kernel_axes=row,
@@ -1186,7 +1206,7 @@ class NNXStateLevelScreening(nnx.Module):
                     dtype=compute_dtype,
                     param_dtype=param_dtype,
                 )
-                self.novel_edit_proj = _linear(
+                self.novel_edit_proj = screening_linear(
                     route_input_size,
                     2,
                     kernel_axes=row,
