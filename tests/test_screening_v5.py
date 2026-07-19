@@ -283,6 +283,22 @@ def test_empty_matched_route_has_finite_zero_gradient():
     assert jnp.array_equal(gradient, jnp.zeros_like(gradient))
 
 
+def test_underflowed_matched_route_has_finite_zero_gradient():
+    def confidence(eligibility):
+        return jnp.sum(
+            ambiguity_aware_matched_routing(
+                eligibility,
+                route_power=2.0,
+                eta_ambiguity=0.5,
+            )[3]
+        )
+
+    eligibility = jnp.asarray([[1e-30, 0.0, 0.0, 0.0]], dtype=jnp.float32)
+    value, gradient = jax.value_and_grad(confidence)(eligibility)
+    assert value == 0.0
+    assert jnp.array_equal(gradient, jnp.zeros_like(gradient))
+
+
 def test_empty_read_diagnostic_norm_has_zero_finite_gradient():
     inputs = list(_v5_inputs())
 

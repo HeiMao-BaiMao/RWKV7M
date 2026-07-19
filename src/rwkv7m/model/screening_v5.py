@@ -214,13 +214,22 @@ def ambiguity_aware_matched_routing(
     if eta_ambiguity == 0.0:
         matched_confidence = absolute_confidence
     else:
-        has_match = absolute_confidence > 0.0
+        # A positive eligibility can still underflow to zero after the
+        # routing power. In that case the address distribution has no
+        # representable mass, so differentiating ``concentration ** eta`` at
+        # zero would produce an infinite derivative for 0 < eta < 1. Base
+        # the guard on the powered distribution that is actually routed.
+        has_distribution = powered_sum[..., 0] > 0.0
         # ``concentration ** eta`` has an infinite derivative at zero when
         # 0 < eta < 1.  JAX evaluates both sides of ``where`` during tracing,
         # so the semantically inactive branch must also be numerically safe.
-        safe_concentration = jnp.where(has_match, concentration, 1.0)
+        safe_concentration = jnp.where(
+            has_distribution,
+            concentration,
+            1.0,
+        )
         matched_confidence = jnp.where(
-            has_match,
+            has_distribution,
             absolute_confidence * safe_concentration**eta_ambiguity,
             0.0,
         )
