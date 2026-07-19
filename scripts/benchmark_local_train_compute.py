@@ -61,6 +61,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--benchmark-warmup", type=int, default=5)
     parser.add_argument("--benchmark-iterations", type=int, default=50)
+    parser.add_argument(
+        "--optimizer-total-steps",
+        type=int,
+        default=10_000,
+        help=(
+            "Training horizon used to construct the optimizer schedule; this "
+            "is intentionally independent of benchmark iteration count."
+        ),
+    )
     parser.add_argument("--disable-python-gc", action="store_true")
     parser.add_argument(
         "--profile-mode",
@@ -101,6 +110,8 @@ def parse_args(argv=None):
         parser.error("--ctx-len and --batch-size must be positive")
     if args.benchmark_warmup < 0 or args.benchmark_iterations <= 0:
         parser.error("benchmark warmup must be non-negative and iterations positive")
+    if args.optimizer_total_steps <= 0:
+        parser.error("--optimizer-total-steps must be positive")
     if args.profile_iterations <= 0:
         parser.error("--profile-iterations must be positive")
     if args.profile_mode == "xprof" and args.profile_output is None:
@@ -261,7 +272,7 @@ def main(argv=None):
         jax.random.key(args.seed),
         config,
         batch_size=args.batch_size,
-        total_steps=args.benchmark_warmup + args.benchmark_iterations + 1,
+        total_steps=args.optimizer_total_steps,
     )
     fixed_rwkv = jax.device_put(runtime.initial_rwkv_state)
     fixed_screen = jax.device_put(runtime.initial_screen_state)
@@ -472,6 +483,7 @@ def main(argv=None):
             iterations=args.benchmark_iterations,
             disable_python_gc=args.disable_python_gc,
         ),
+        "optimizer_total_steps": args.optimizer_total_steps,
         "profile": profile,
         "phase_details": {
             "forward": "loss forward from fixed params and fixed recurrent state",
@@ -480,7 +492,9 @@ def main(argv=None):
             "full_step": "value_and_grad plus optimizer with no intermediate host barrier",
             "training_step": (
                 "forward/backward use step zero; full_step uses the bundled "
-                "optimizer step so temporary curricula match real training"
+                "optimizer step so temporary curricula match real training; "
+                "the optimizer schedule uses optimizer_total_steps rather "
+                "than the measurement iteration count"
             ),
         },
         "optimizer": {

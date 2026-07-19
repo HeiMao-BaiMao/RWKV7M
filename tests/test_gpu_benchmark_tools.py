@@ -132,6 +132,30 @@ def test_local_benchmark_finite_gate_checks_every_inexact_leaf():
     )
 
 
+def test_local_benchmark_optimizer_horizon_is_independent_of_iterations(
+    tmp_path,
+):
+    args = LOCAL.parse_args(
+        [
+            "--fixed-batch",
+            str(tmp_path / "batch.npz"),
+            "--model-preset",
+            "0.185b",
+            "--ctx-len",
+            "512",
+            "--batch-size",
+            "1",
+            "--benchmark-warmup",
+            "2",
+            "--benchmark-iterations",
+            "5",
+            "--output",
+            str(tmp_path / "result.json"),
+        ]
+    )
+    assert args.optimizer_total_steps == 10_000
+
+
 def test_gradient_diagnostic_reports_nonfinite_values_and_largest_leaf():
     gradients = nnx.State(
         {
