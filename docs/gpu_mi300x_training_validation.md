@@ -12,12 +12,107 @@ Triton Pallas 経路が機能するかを、長期学習へ進む前に確認す
 | 0.185B Screening v2 | 400 step、6,553,600 tokenをfiniteで完走。lossは20.768から5.789へ低下 | RWKV主経路は学習できる。ただしstep 26までにwrite admissionがほぼゼロになり、Screeningは実質停止した |
 | 0.3B legacy read/write | 200 step、6,553,600 tokenをfiniteで完走。lossは18.686から6.091へ低下 | 学習は継続できる。ただしread activityはstep 107までにゼロになり、slotは高い重複を示した |
 | 0.3B Screening v2 | 20-step診断はfiniteで完走したが、別の200-step予定runはstep 7からNaN | 本格学習へ進めない。数値不安定性とrun間の再現性を先に解決する必要がある |
+| 0.185B Screening v5 core | FP32 recurrence/projection境界の修正後、50 step、819,200 tokenをfiniteで完走。lossは20.891から8.628へ低下 | 数値gateは改善。ただしmemory residual比は2.54e-7、slot redundancyは0.919で、memory利用の品質gateは未通過 |
+| 0.3B Screening v5 core | 30-step runの一方はstep 16からNaN、同条件の再runは245,760 tokenをfiniteで完走しloss 18.618から9.685へ低下 | 再現性を含む安定性は未確立。完走runでもnovel writeが100%、redundancyが0.987、memory residual比が1.97e-6 |
 | ROCm Triton Pallas | WKV、Screening、training head、optimizerが実機lowering・実行可能 | AMD GPU対応の基盤は成立。ただしproduction形状のScreening parity gateは未通過 |
 
 したがって、この測定は「MI300X上で現行JAX/Pallas学習スタックを実行できる」
 ことを支持するが、「Screeningが学習品質を改善する」ことは支持しない。
 0.185B v2と0.3B legacyの両方で、学習途中にmemory readが実質的に使われなく
 なったためである。
+
+## Screening v5 core follow-up
+
+この節は、上記v2/legacy測定後に実装したportable
+`screening-v5-core`を対象とする。v5は既存のv4 Pallas Screening kernelを
+呼ばず、WKVだけが`pallas_gpu_triton`、Screening recurrenceはportable JAXで
+動く。測定revisionは実装修正が`d6d169b`、fail-closed compute測定が
+`ad7edce`である。
+
+### 長context backwardの数値修正
+
+初期のv5実装は、空memoryのdiagnostic normを`has_aux`へ返すだけでも、ゼロ点
+の未定義VJPが`lax.scan` backwardを汚染した。diagnostic normを
+`stop_gradient`で学習経路から分離した後、初期0.185Bの32 x 512 gradientは
+423/423 leafがfiniteになった。
+
+しかし7 step学習後のfinite checkpointへ別の固定32 x 512 batchを与えると、
+loss 14.187はfiniteのまま、423 leaf中247 leaf、46,597,517値のgradientが
+non-finiteになった。context 1、16、128、256ではfiniteで、問題batchの先頭
+384 tokenでは再現した。全モデルをFP32にすると423/423 leafがfiniteになった
+ため、長区間v5 recurrenceのmixed-precision経路が原因と判断した。
+
+現在のv5 dtype境界は次である。
+
+```text
+RWKV主経路                       BF16 compute / BF16 parameter
+Screening v5 projection compute  FP32
+Screening v5 parameter storage   BF16
+Screening recurrence vector/state/cotangent FP32
+Screening出力から主経路への境界   BF16
+```
+
+この変更後、同じ修正前checkpointと同じ32 x 512 batchで423/423 leafがfiniteに
+なった。さらに、0.185Bの50-step checkpointへ別固定batchを与えた診断でも、
+loss 8.157、423/423 gradient leafがfiniteだった。曖昧度confidenceでは、正の
+eligibilityをroute powerへ通した後にFP32 underflowして分布massがゼロになる
+場合も安全に扱うguardを追加した。このguardは独立した未定義VJPを防ぐが、
+上記production failureの主因ではなかった。
+
+### v5 MiniPile短時間学習
+
+共通条件はMiniPile magic sampler、`carry_state=false`、BF16 model parameter、
+FP32 optimizer/gradient accumulation、full-logits XLA head、Optax、10-step
+warmup、seed 42である。compileを含むstep 1をsteady throughputから除外した。
+
+| model | batch x context | steps / tokens | loss first -> last | steady median | checkpoint gradient gate |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0.185B v5 | 32 x 512 | 50 / 819,200 | 20.891 -> 8.628 | 28,535 token/s | step 50、423/423 leaf finite |
+| 0.3B v5（完走run） | 8 x 1024 | 30 / 245,760 | 18.618 -> 9.685 | 5,433 token/s | step 14/30、480/480 leaf finite |
+
+0.3Bは同じ主要条件の先行runがstep 16からNaNになり、再runは30 stepをfiniteで
+完走した。step 14までの軌道もわずかに異なるため、単一の完走runを長時間安定性
+の証拠にはしない。ROCm/Pallasの非決定性、学習dynamics、残る数値境界のどれが
+分岐を起こしたかは未確定である。
+
+### v5 memory挙動
+
+| model / step | admission | accepted novel | rejected write | slot utilization | read relevance | residual/base RMS | redundancy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.185B / 1 | 0.572 | 0.105 | 0.302 | 0.324 | 5.35e-3 | 4.49e-3 | 0.151 |
+| 0.185B / 50 | 0.998 | 0.057 | 0.042 | 0.100 | 1.37e-5 | 2.54e-7 | 0.919 |
+| 0.3B / 1 | 0.579 | 0.173 | 0.351 | 0.403 | 4.89e-3 | 3.07e-3 | 0.138 |
+| 0.3B / 30 | 1.000 | 1.000 | 0.000 | 0.257 | 1.29e-2 | 1.97e-6 | 0.987 |
+
+0.185Bではwrite branchは完全停止しなかったが、read relevanceと主経路に対する
+memory residualが急減した。0.3Bではread relevance自体は残る一方、全tokenを
+novelとして受理するwrite saturationと高いslot重複が発生し、主経路に対する
+residualはほぼ消えた。どちらも「memory経路を品質改善に利用した」という
+Phase 1 quality gateを支持しない。したがってretentionやv5 Pallasを先に実装
+しても中心問題は解決しない。synthetic retrieval、memory-off counterfactual、
+anti-starvation/read curriculumの検証を先行する。
+
+### fail-closed compute-only
+
+測定CLIは、prepared loss、prepared gradient、最終loss、更新後train stateの
+全てをfinite gateへ含める。benchmark iteration数とoptimizer scheduleの全期間
+も分離し、固定batch比較では明示的にpeak LRを上書きできる。
+
+0.185B v5、32 x 512、warmup 2、測定5、optimizer horizon 10,000、peak LR
+1e-4では全finite gateを通過した。
+
+| phase | median |
+| --- | ---: |
+| forward | 126.797 ms |
+| backward | 432.916 ms |
+| optimizer | 20.245 ms |
+| complete step | 696.240 ms |
+| complete-step throughput | 23,532 token/s |
+
+同じ条件のbatch 8はprepared loss/gradientがfiniteだったが、固定batchを連続更新
+した最終loss/stateがnon-finiteになったため、表示された9,443 token/sを採用
+しない。実MiniPile runの28,535 token/sとcompute-onlyの23,532 token/sも、
+batch内容、学習率、反復境界が異なる別系列であり、直接比率を性能主張に使わない。
 
 ## 検証対象
 
@@ -30,7 +125,8 @@ Triton Pallas 経路が機能するかを、長期学習へ進む前に確認す
 - Optax: 0.2.8
 - 実行backend: ROCm GPU
 - WKV backend: pallas_gpu_triton
-- Screening backend: pallas_gpu_triton
+- v2/legacy Screening backend: pallas_gpu_triton
+- v5 core Screening backend: portable_jax_v5
 - training loss: full-logits XLA
 - optimizer: Optax
 - 基準revision: 069781cecb5e0b9e8fa95d0a1961b61d1b08180a
@@ -48,6 +144,9 @@ ncclCommWindowDeregisterの未定義symbolによりJAX pluginの初期化に失�
 ~~~bash
 export LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib:/opt/rocm/core-7.14/lib64
 ~~~
+
+v5 follow-upを実行した同系統ホストでは、実在するprefixに合わせて
+`/opt/rocm-7.0.2/core-7.14/lib{,64}`を指定した。
 
 これは当該レンタル環境固有の回避策であり、通常のROCm導入手順として一般化
 しない。

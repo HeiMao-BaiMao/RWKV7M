@@ -257,8 +257,12 @@ The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
   profiles `screening-v4-legacy` and `screening-v4-competitive`. A portable,
   NNX-integrated `screening-v5-core` Phase 1 candidate now implements explicit
   occupancy, empty-first allocation, capacity calibration, bounded reads, and
-  ambiguity-aware confidence. Its accelerator path, checkpoint redesign,
-  retention profile, and quality claims remain gated. See the
+  ambiguity-aware confidence. Its portable path uses FP32 Screening projection
+  compute and recurrent state/cotangents with BF16 stored parameters; this
+  boundary passed post-training MI300X gradient diagnostics. Its Pallas path,
+  checkpoint redesign, retention profile, numerical reproducibility, and
+  quality claims remain gated. The MI300X short runs still collapsed the
+  memory residual and produced high slot redundancy. See the
   [Screening v5 implementation contract](docs/state_level_screening_v5_design.md).
   Screening v2 adds value-space gating, a factorized
 candidate, confidence-preserving competitive writes,

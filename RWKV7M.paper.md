@@ -24,10 +24,11 @@ screening-v5-retention
 * 補正後v4 recurrenceはTPU v5e-4で実機parityおよび性能測定済み
 * corrected v4 competitive GPU pathの実機検証は未実施
 * v5 coreのPhase 1 portable referenceおよびNNX統合は実装済みである
+* portable v5 coreはMI300X単基で0.185Bの50-step finite runとpost-training gradient gateを通過したが、0.3Bはrun間でNaNが再現せず、数値再現性は未確立である
 * tracked v5 configは`tied` editを用い、continuous editingとredundancy victim policyをheadline pathから外している
 * v5 Pallas、v5 checkpoint redesign、v5 retentionは未実装である
 * warm-up限定admission floorはopt-in実装済みだが、有効性は未実証である
-* v5のmodel quality改善は未実証
+* 短時間MI300X runではmemory residualのcollapseと高いslot redundancyが観測され、v5のmodel quality改善は未実証である
 
 **主張の強さ**:
 
@@ -2249,7 +2250,7 @@ semantics_version:
 | --- | --- | --- |
 | `screening-v4-legacy` | `disabled`, `legacy_unconditional`, `legacy_threshold` | implemented compatibility contract |
 | `screening-v4-competitive` | `competitive_novel` | implemented predecessor contract |
-| `screening-v5-core` | `competitive_novel` | portable Phase 1 candidate; accelerator gate未通過 |
+| `screening-v5-core` | `competitive_novel` | portable Phase 1 candidate; MI300X partial finite gate通過、quality/Pallas accelerator gate未通過 |
 | `screening-v5-retention` | `competitive_novel` | design-only |
 
 同じ`write_mode=competitive_novel`でも、semantics versionが異なればoccupancy、

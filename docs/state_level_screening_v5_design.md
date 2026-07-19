@@ -34,6 +34,15 @@ The tracked 0.185B and 0.3B configs deliberately use `edit_mode="tied"` and
 `capacity_conserving`/`free_edit` and redundancy-aware victim branches, but
 they are not headline-enabled until Phase 1 clears the paper's quality gate.
 
+Long-context reverse scans use a stricter mixed-precision boundary than v4.
+The surrounding RWKV block and stored model parameters remain BF16, while v5
+Screening projection compute, recurrent vectors, slot state, and recurrent
+cotangents are FP32. The Screening output is converted back at the residual
+boundary. A real MI300X checkpoint exposed finite loss with 247/423 non-finite
+gradient leaves when BF16 projection results were transported through the
+long scan; the same checkpoint and batch passed 423/423 after this boundary
+was enforced. Pure diagnostic norms are detached from the learning graph.
+
 ## Anti-starvation curriculum
 
 An upper write budget cannot prevent the model from choosing never-write.
@@ -69,8 +78,9 @@ learned scale only. This blocks the easiest early escape through
 - v5 does not dispatch to the existing GPU or TPU Pallas kernels. Those kernels
   implement v4 semantics, and the accelerator benchmark rejects a v5 label.
 - the frozen Linen model rejects v5 rather than silently running v4 equations.
-- large-mesh TPU/GPU lowering, real-device parity, throughput, and memory use
-  have not been measured for v5.
+- large-mesh TPU lowering, multi-device GPU lowering, v5 Pallas parity, and
+  checkpoint peak memory have not been measured. Portable v5 has single-MI300X
+  loss/gradient, short-training, and throughput measurements only.
 
 ## Tracked configurations
 
@@ -84,9 +94,24 @@ Missing `semantics_version` retains the v4 migration rule. Explicit
 
 Local tests cover configuration round-trip and rejection, capacity threshold
 behavior, bounded aggregation, ambiguity suppression, finite empty-memory
-gradients, hard/soft admission gradients, empty allocation, rejected writes,
-chunk invariance, a full tiny-model loss/gradient pass, the temporary admission
-floor, and the first versioned golden vector.
+and underflowed-route gradients, hard/soft admission gradients, empty
+allocation, rejected writes, chunk invariance, the FP32-v5/BF16-parameter
+boundary, a full tiny-model loss/gradient pass, the temporary admission floor,
+and the first versioned golden vector.
+
+On one MI300X, the corrected 0.185B configuration completed 50 MiniPile steps
+(819,200 tokens) and a separate step-50 fixed-batch diagnostic passed 423/423
+gradient leaves. A 0.3B run completed 30 steps and its step-14/30 diagnostics
+passed 480/480 leaves, but another run with the same main settings became NaN
+at step 16. Numerical reproducibility is therefore still open.
+
+The quality gate failed more clearly than the finite gate. At the end of the
+0.185B run, memory residual/base RMS was 2.54e-7 and slot redundancy was 0.919.
+At the end of the finite 0.3B run, every token was admitted as novel, residual
+ratio was 1.97e-6, and redundancy was 0.987. These observations support neither
+memory use nor quality benefit. See
+[`gpu_mi300x_training_validation.md`](gpu_mi300x_training_validation.md) for
+the exact conditions and limitations.
 
 The complete paper acceptance matrix is still open: all boundary golden cases,
 five-seed synthetic memory tasks, three-seed matched language-model runs,
