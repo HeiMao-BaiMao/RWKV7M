@@ -70,6 +70,15 @@ def parse_args(argv=None):
             "is intentionally independent of benchmark iteration count."
         ),
     )
+    parser.add_argument(
+        "--benchmark-lr-init",
+        type=float,
+        default=None,
+        help=(
+            "Optional peak learning-rate override for a numerically stable "
+            "fixed-batch comparison; it does not change optimizer work."
+        ),
+    )
     parser.add_argument("--disable-python-gc", action="store_true")
     parser.add_argument(
         "--profile-mode",
@@ -112,6 +121,8 @@ def parse_args(argv=None):
         parser.error("benchmark warmup must be non-negative and iterations positive")
     if args.optimizer_total_steps <= 0:
         parser.error("--optimizer-total-steps must be positive")
+    if args.benchmark_lr_init is not None and args.benchmark_lr_init <= 0.0:
+        parser.error("--benchmark-lr-init must be positive")
     if args.profile_iterations <= 0:
         parser.error("--profile-iterations must be positive")
     if args.profile_mode == "xprof" and args.profile_output is None:
@@ -248,6 +259,8 @@ def main(argv=None):
     if config.use_screening:
         config.screening.use_write_screening = args.variant == "read_write"
     config = apply_execution_overrides(config, args)
+    if args.benchmark_lr_init is not None:
+        config.lr_init = args.benchmark_lr_init
     if args.ctx_len > config.max_seq_len:
         raise SystemExit("--ctx-len exceeds the model maximum sequence length")
     phase = "read_write" if args.variant == "read_write" else "read_screening_only"

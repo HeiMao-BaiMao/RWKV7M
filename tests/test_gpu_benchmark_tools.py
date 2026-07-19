@@ -149,11 +149,14 @@ def test_local_benchmark_optimizer_horizon_is_independent_of_iterations(
             "2",
             "--benchmark-iterations",
             "5",
+            "--benchmark-lr-init",
+            "0.0001",
             "--output",
             str(tmp_path / "result.json"),
         ]
     )
     assert args.optimizer_total_steps == 10_000
+    assert args.benchmark_lr_init == pytest.approx(1e-4)
 
 
 def test_gradient_diagnostic_reports_nonfinite_values_and_largest_leaf():
