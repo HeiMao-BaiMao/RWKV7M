@@ -618,9 +618,15 @@ def test_nnx_v5_full_train_step_has_finite_loss_and_gradients():
         head_size=8,
     )
     config.screening = _v5_screening_config()
+    config.dtype = "bfloat16"
+    config.param_dtype = "bfloat16"
     config.lm_head_init = "variance_scaled"
     config.remat_blocks = True
     model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(7))
+    screening = model.layer_0.screening_0
+    assert screening.compute_dtype == jnp.float32
+    assert screening.q_proj_r.dtype == jnp.float32
+    assert screening.q_proj_r.kernel[...].dtype == jnp.bfloat16
     graphdef, params = nnx.split(model, nnx.Param)
     input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
     targets = jnp.asarray([[2, 3, 4]], dtype=jnp.int32)

@@ -1874,6 +1874,11 @@ class NNXScreenedRWKVLayer(nnx.Module):
             config.use_screening and layer_idx in config.screening.screened_layers
         )
         if self._has_screening:
+            screening_compute_dtype = (
+                jnp.float32
+                if is_v5_semantics(config.screening)
+                else _get_model_dtype(config)
+            )
             setattr(
                 self,
                 self._screening_name,
@@ -1881,7 +1886,12 @@ class NNXScreenedRWKVLayer(nnx.Module):
                     config.screening,
                     rngs=rngs,
                     sharding=sharding,
-                    compute_dtype=_get_model_dtype(config),
+                    # v5 transports multiple learned state projections
+                    # through a long reverse scan. Keeping those projection
+                    # results in FP32 is required for finite production-length
+                    # gradients; parameters and the surrounding RWKV block
+                    # retain the configured storage/compute dtype.
+                    compute_dtype=screening_compute_dtype,
                     param_dtype=_dtype_from_name(config.param_dtype),
                 ),
             )
