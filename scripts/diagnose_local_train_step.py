@@ -109,6 +109,14 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--capture-wkv-layers",
+        default="",
+        help=(
+            "comma-separated layer indices to capture in one GPU pass; "
+            "may be combined with --capture-wkv-layer"
+        ),
+    )
+    parser.add_argument(
         "--capture-wkv-dir",
         type=Path,
         default=None,
@@ -179,20 +187,29 @@ def parse_args(argv=None):
         parser.error("--reference-wkv-layers must contain integer indices")
     if any(index < 0 for index in args.reference_wkv_layers):
         parser.error("--reference-wkv-layers indices must be non-negative")
-    if (args.capture_wkv_layer is None) != (args.capture_wkv_dir is None):
+    try:
+        capture_layers = {
+            int(value.strip())
+            for value in args.capture_wkv_layers.split(",")
+            if value.strip()
+        }
+    except ValueError:
+        parser.error("--capture-wkv-layers must contain integer indices")
+    if args.capture_wkv_layer is not None:
+        capture_layers.add(args.capture_wkv_layer)
+    args.capture_wkv_layers = tuple(sorted(capture_layers))
+    if bool(args.capture_wkv_layers) != (args.capture_wkv_dir is not None):
         parser.error(
-            "--capture-wkv-layer and --capture-wkv-dir must be used together"
+            "a WKV capture layer option and --capture-wkv-dir must be used "
+            "together"
         )
-    if args.capture_wkv_layer is not None and args.capture_wkv_layer < 0:
-        parser.error("--capture-wkv-layer must be non-negative")
-    if (
-        args.capture_wkv_layer is not None
-        and args.capture_wkv_layer in args.reference_wkv_layers
-    ):
+    if any(index < 0 for index in args.capture_wkv_layers):
+        parser.error("captured WKV layer indices must be non-negative")
+    if set(args.capture_wkv_layers) & set(args.reference_wkv_layers):
         parser.error(
             "a captured WKV layer cannot also use --reference-wkv-layers"
         )
-    if args.capture_wkv_layer is not None and args.checkify_floats:
+    if args.capture_wkv_layers and args.checkify_floats:
         parser.error("WKV capture cannot be combined with --checkify-floats")
     return args
 
@@ -314,9 +331,10 @@ def _make_optimizer_state_writable(optimizer):
     nnx.update(optimizer, copied)
 
 
-def _install_wkv_capture(capture_dir):
+def _install_wkv_capture(capture_dir, layer_index):
     """Capture exact Pallas primals/cotangents with a reference pullback."""
 
+    capture_dir = capture_dir / f"layer-{layer_index}"
     capture_dir.mkdir(parents=True, exist_ok=True)
     original_wkv7 = nnx_model_module.wkv7
     counter = iter(range(1_000_000))
@@ -386,7 +404,7 @@ def _install_wkv_capture(capture_dir):
         backend=None,
         interpret=False,
     ):
-        if backend == "diagnostic_capture":
+        if backend == f"diagnostic_capture_{layer_index}":
             return captured_wkv(r, w, k, v, neg_kk, kka, initial_state)
         return original_wkv7(
             r,
@@ -401,6 +419,7 @@ def _install_wkv_capture(capture_dir):
         )
 
     nnx_model_module.wkv7 = diagnostic_dispatch
+    return f"diagnostic_capture_{layer_index}"
 
 
 def main(argv=None):
@@ -456,11 +475,8 @@ def main(argv=None):
         raise SystemExit(
             "--reference-wkv-layers contains an index outside the model"
         )
-    if (
-        args.capture_wkv_layer is not None
-        and args.capture_wkv_layer >= config.n_layers
-    ):
-        raise SystemExit("--capture-wkv-layer is outside the model")
+    if any(index >= config.n_layers for index in args.capture_wkv_layers):
+        raise SystemExit("a captured WKV layer is outside the model")
     runtime, train_state = create_train_runtime(
         jax.random.key(args.seed),
         config,
@@ -486,17 +502,20 @@ def main(argv=None):
         layer = getattr(train_state.model, f"layer_{layer_index}")
         block = getattr(layer, f"rwkv_block_{layer_index}")
         block.att.wkv_backend = "reference"
-    if args.capture_wkv_layer is not None:
-        _install_wkv_capture(args.capture_wkv_dir)
+    for capture_layer_index in args.capture_wkv_layers:
+        capture_backend = _install_wkv_capture(
+            args.capture_wkv_dir,
+            capture_layer_index,
+        )
         layer = getattr(
             train_state.model,
-            f"layer_{args.capture_wkv_layer}",
+            f"layer_{capture_layer_index}",
         )
         block = getattr(
             layer,
-            f"rwkv_block_{args.capture_wkv_layer}",
+            f"rwkv_block_{capture_layer_index}",
         )
-        block.att.wkv_backend = "diagnostic_capture"
+        block.att.wkv_backend = capture_backend
     graphdef, params = nnx.split(train_state.model, nnx.Param)
 
     def loss_outputs(active_params):
@@ -594,7 +613,7 @@ def main(argv=None):
         "screening_eps": config.screening.eps,
         "screening_norm_eps": config.screening.norm_eps,
         "reference_wkv_layers": list(args.reference_wkv_layers),
-        "captured_wkv_layer": args.capture_wkv_layer,
+        "captured_wkv_layers": list(args.capture_wkv_layers),
         "wkv_capture_dir": (
             None
             if args.capture_wkv_dir is None

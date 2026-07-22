@@ -306,6 +306,7 @@ def test_gradient_diagnostic_accepts_wkv_capture_pair(tmp_path):
         ]
     )
     assert args.capture_wkv_layer == 6
+    assert args.capture_wkv_layers == (6,)
     assert args.capture_wkv_dir == capture_dir
 
 
@@ -323,6 +324,24 @@ def test_gradient_diagnostic_rejects_incomplete_wkv_capture_pair(tmp_path):
                 str(tmp_path / "diagnostic.json"),
             ]
         )
+
+
+def test_gradient_diagnostic_accepts_multiple_wkv_capture_layers(tmp_path):
+    args = DIAGNOSE.parse_args(
+        [
+            "--fixed-batch",
+            str(tmp_path / "batch.npz"),
+            "--model-config",
+            "config.json",
+            "--capture-wkv-layers",
+            "11,7,9",
+            "--capture-wkv-dir",
+            str(tmp_path / "captures"),
+            "--output",
+            str(tmp_path / "diagnostic.json"),
+        ]
+    )
+    assert args.capture_wkv_layers == (7, 9, 11)
 
 
 def test_wkv_capture_summary_counts_nonfinite_values():
