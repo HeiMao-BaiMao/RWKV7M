@@ -367,7 +367,7 @@ def run_training(args):
         total_steps=total_steps,
     )
     if args.resume:
-        train_state, cfg, _ = load_train_checkpoint(args.resume, train_state)
+        train_state, _, _ = load_train_checkpoint(args.resume, train_state)
         runtime.variables = {"params": train_state.nnx_params}
         if args.carry_state:
             runtime_state = load_train_runtime_state(

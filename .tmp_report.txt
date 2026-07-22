@@ -596,3 +596,264 @@ CLIのrequire-finiteはlossだけでなく、`*_all_finite < 0.5`でも停止す
 metric record許可リストへ診断名を追加していなかったため、JSONLへ記録されなかった。
 fail-closed判定はfilter前のhost metricsを使うため有効だったが、事後解析には不足した。
 許可リストと回帰テストを追加してから、checkpoint 180以降を再開する。
+
+
+19. 全aux runの非有限化境界をraw gradientまで特定
+=====================================================
+
+run:
+
+  /root/RWKV7M/out/retrieval-185m-resume180-allaux-gradientdiag2
+
+条件:
+
+- §18のcheckpoint 180から120 stepを要求
+- 全aux有効、activationはstep 201以降1.0
+- commit 5fb2ad4でgradient/parameter診断をJSONLへ保存
+- require-finite既定有効
+
+結果:
+
+- step 289まではloss、raw gradient、更新後parameterがfinite
+- step 290でloss=6.909214、total_loss=6.988863はfinite
+- 同じstep 290でgradient_all_finite=0、gradient norm/max=NaN
+- 非有限gradient適用後のparameter_all_finiteも0になり、CLIが即停止
+- 従ってforward/lossやoptimizer単独ではなく、backwardでraw gradientが先に
+  非有限化したことが確認された
+- 最後に保存された健全checkpointはstep 285
+
+非有限化直前の時系列:
+
+  step  hard write  novelty  floor loss  budget loss  self-index   grad L2       grad max
+  284   0.119385    0.125488 0           0            0.003957     24.73          1.70
+  285   0.011963    0.012207 2.87e-5     0            2.07e-5      24.10          1.34
+  286   0.118896    0.120361 0           0            0.002588     25.80          1.94
+  287   0.549072    0.551270 0           0.024907     0.016165     4.3279e8        4.9545e7
+  288   0.238770    0.242920 0           0.003563     0.006829     2.1978e10       2.0300e9
+  289   0.741455    0.747559 0           0.047811     0.023596     24.96          1.63
+  290   0.758789    0.767090 0           0.050238     0.023653     NaN            NaN
+
+その他の観測:
+
+- step 276--283ではhard writeは0.0085--0.0129で、grad L2は24.6--25.9。
+- step 284からhard routingが断続的に急増し、step 287でbudget/self-indexの
+  両方が明確に発火した。
+- step 287/288の巨大raw gradientにもかかわらず更新後parameterはfiniteだった。
+  optimizer内のgradient clippingが働いた可能性が高いが、現時点ではoptimizer
+  transform別の事後normを記録していないため推論に留める。
+- step 289でraw gradientが一度通常範囲へ戻っている。aux loss値の大きさだけで
+  gradient spikeを説明できず、hard/straight-through routing境界の離散的な
+  trajectory依存が疑われる。
+
+この結果による優先順位:
+
+1. self-index-onlyで同種のgradient spike/NaNが再現するか確認。
+2. write-budget-onlyも別に確認し、両者の単独効果と相互作用を分ける。
+3. self-index-onlyで再現した場合は、self-indexからtrunkへのgradientを
+   stop-gradientした対照へ進む。
+4. gradient clipはparameter破損を一時的に防いだ可能性があるが、原因を隠すため
+   根本修正としては扱わない。
+
+
+20. 有効なself-index-only ablation
+====================================
+
+run:
+
+  /root/RWKV7M/out/retrieval-185m-resume100-selfonly-valid2
+
+条件:
+
+- trunk-only checkpoint 100からstep 300まで200 step再開
+- activation_step=100、warmup=100
+- self-index weight=0.1
+- admission floor=0、write budget=0
+- raw gradient/更新後parameter finite診断を有効化
+
+有限性:
+
+- step 101--300の200 stepすべてでloss、gradient、parameterはfinite
+- ただし巨大なraw gradient spikeが7 stepで発生した
+- grad L2 > 1e3: step 112, 113, 115, 116, 117, 118, 119
+- grad L2 > 1e6: step 113, 115, 116, 117, 118
+- grad L2 > 1e9: step 113, 116, 117
+- 最大はstep 117のL2=5.5586e11、max abs=6.3351e10
+
+spike期の詳細:
+
+  step  hard write  admission  self-index loss  grad L2
+  112   0.999268    0.7860     0.006190         1.2422e5
+  113   0.998535    0.7936     0.005417         5.1303e10
+  114   0.997803    0.7816     0.005538         156.1
+  115   0.996582    0.7710     0.004212         1.3597e7
+  116   0.992920    0.7476     0.005421         3.1901e9
+  117   0.990234    0.7427     0.007577         5.5586e11
+  118   0.985107    0.7188     0.008083         2.5137e8
+  119   0.937744    0.5916     0.011455         8.7232e4
+  120   0.920166    0.4943     0.010615         323.2
+  121   0.039307    0.4219     0.000306         183.7
+
+その後のrouting collapse:
+
+- 200 step全体のhard write medianは0.000488 (=2/4096 token)
+- slot utilization medianは0.015625 (=1/64、層平均相当)
+- novelty medianは1.0
+- step 201: hard write=0.000244、slot utilization=0.0078125
+- step 284/287/291ではhard write=0、slot utilization=0
+- step 300: hard write=0.000244、slot utilization=0.0078125、
+  screening/base RMS ratio=1.10e-6
+
+解釈:
+
+- self-index-onlyはこのtrajectoryではNaNを起こさなかったため、self-index単独を
+  「必ずNaNを起こす唯一原因」とは断定できない。
+- 一方、self-index-onlyで最大5.56e11のraw gradientが観測されたため、
+  数値不安定化の十分強い寄与因子である。
+- clipping後の更新がfiniteだったためrunは継続したが、routingは全書き込み側から
+  ほぼ全拒否側へ急速に移り、その後self-index信号自体が消えた。
+- self-indexは安定した中間write率もmemory利用も作れていない。
+- 次はwrite-budget-onlyを実行し、全aux step 287--290のspikeがbudget単独でも
+  起きるか、self-indexとの相互作用かを分ける。
+
+
+21. 有効なwrite-budget-only ablation
+=====================================
+
+run:
+
+  /root/RWKV7M/out/retrieval-185m-resume100-budgetonly-valid
+
+条件:
+
+- trunk-only checkpoint 100から200 stepを要求
+- activation_step=100、warmup=100
+- write budget weight=0.1
+- admission floor=0、self-index=0
+- raw gradient/更新後parameter finite診断を有効化
+
+結果:
+
+- step 250までfinite、step 251でraw gradientが非有限化して即停止
+- step 251のloss=8.195102、total_loss=8.201452はfinite
+- gradient_all_finite=0、gradient L2/max=NaN
+- 非有限gradient適用後のparameter_all_finite=0
+- 最後の健全checkpointはstep 250
+
+重要な反証:
+
+- step 232--250のgrad L2は25.97--31.14、grad maxは1.67--2.36で正常範囲
+- step 251直前に巨大gradient spikeは記録されなかった
+- step 232--251ではhard write=0.0027--0.0098で、write budget target 0.05未満
+- そのためwrite_budget_lossはfailure stepを含めすべて0
+- self-index lossも常に0（設定で無効）
+- よって「failure stepのbudget/self-index penaltyが直接巨大勾配を作った」
+  という単純仮説は、このrunでは反証された
+
+全期間の特徴:
+
+- hard write median=0.05664、最大0.99976
+- slot utilization median=0.46484、最大1.0
+- novelty median=1.0
+- screening/base RMS ratio median=8.07e-5、最大1.87e-4
+- finite step中のraw grad L2最大は316.34（step 103）で、self-index-onlyの
+  5.56e11とは桁違いに小さい
+
+現在の解釈:
+
+- self-indexは巨大gradient spikeを作れるが、write-budget-onlyのstep 251 NaNを
+  直接説明しない。
+- budget lossは初期trajectoryを変えた後、failure時には無効だった。auxは原因そのもの
+  ではなく、Screening state/routingが危険領域へ入るtrajectoryを変えた可能性がある。
+- budget-onlyはself-index-onlyよりslot利用率とmemory residualが高く、
+  Screening recurrence backwardまたはstate reconstructionの数値安定性を再点検する
+  必要がある。
+- no-auxをstep 300--400まで延長し、auxがなくても同じfailureが出るかを先に確認する。
+
+
+22. no-auxのstep 400までの延長
+================================
+
+run:
+
+  /root/RWKV7M/out/retrieval-185m-resume220-noaux-valid-extended
+
+条件:
+
+- §15の有効なno-aux checkpoint 220からstep 400まで180 step再開
+- Screening recurrenceとmemory residualからCEへの経路は有効
+- admission floor/write budget/self-indexはいずれも0
+- raw gradient/更新後parameter finite診断を有効化
+
+結果:
+
+- step 221--400の180 stepをすべてfiniteで完走
+- 既存のNaN観測窓244/248と、budget-only failure step 251を越えた
+- raw grad L2 median=23.42、max=133.41（step 265）
+- raw grad max abs median=1.32、max=10.625
+- 診断付きsteady throughput median=8.85k token/s
+
+routing/state:
+
+- step 221ではhard write=0.9978、admission=0.9358
+- step 281までにhard write=0.0454、admission=0.0452へ低下
+- step 301--400ではhard writeは概ね0.040--0.046
+- noveltyは全step 1.0
+- slot utilizationはほぼ常時0.25で、実質1-slot解を維持
+- screening/base RMS ratio median=4.94e-6、max=4.69e-5
+
+結論:
+
+- no-auxは少なくともこの1 trajectoryでstep 400まで数値安定。
+- 従ってScreening recurrenceが入力によらず必ず壊れる、またはstep 250前後で
+  trunk自体が壊れる、という仮説は支持されない。
+- auxはgradientを直接非有限化する場合だけでなく、routing parameter/stateを
+  Pallas backwardが不安定になる領域へ移動させる可能性がある。
+- ただしno-auxはnovelty=1、1-slot、極小residualであり、品質解として不採用。
+
+次の判別実験:
+
+- budget-onlyの最後の健全checkpoint 250から、同じ1 stepを
+  Pallas Screening backendとreference Screening backendで比較する。
+- referenceだけfiniteならPallas backward correctness bug、両方non-finiteなら
+  数式/parameter trajectory側を第一原因とする。
+
+
+23. budget checkpoint 250のPallas/reference比較とmetadata bug
+=============================================================
+
+backend比較:
+
+- source checkpoint:
+  /root/RWKV7M/out/retrieval-185m-resume100-budgetonly-valid/ckpt-00000250
+- Pallas Screeningでstep 251:
+  loss=8.195102、raw gradient NaN
+- reference Screeningで同じstep 251:
+  loss=8.194990、raw gradient NaN
+- hard write=0.003418、slot utilization=0.091797、budget loss=0は一致
+- forward metricは小さなbackend丸め差以外ほぼ一致
+
+結論:
+
+- step 251 NaNはPallas Screening kernel固有ではない。
+- portable reference recurrence/backwardでも再現するため、数式、parameter/state
+  trajectory、またはScreeningを含む上位graphのgradientを調べる必要がある。
+
+固定batch診断で発見した別bug:
+
+- resume開始時はcheckpoint configへexecution overrideを適用してmodelを構築する。
+- しかしstate restore後にローカル`config`変数を元checkpoint configへ戻していた。
+- 実行中modelはoverride済みなので、§15--§22の実学習metric自体は有効。
+- 一方、resume後に保存したcheckpoint metadataとrun_configは古いactivation/aux設定を
+  記録しており、checkpoint単体から実験を再現できなかった。
+- このため最初のstandalone fixed-batch診断はScreening activationが無効になり、
+  screening gradientが0だった。この診断結果は原因分析から除外する。
+
+修正:
+
+- restore後も、model構築に使ったoverride済みconfigを保持する。
+- local CLIとdistributed CLIの両方を修正。
+- resume overrideが再保存checkpoint metadataにも残る回帰テストを追加。
+- 対象2テストはpass。
+
+修正後にcheckpoint 250からoverrideを保持した新しいdiagnostic checkpointを作り、
+parameter path別の非有限gradient診断をやり直す。

@@ -719,7 +719,6 @@ def run_distributed_training(args):
             args.resume,
             train_state,
         )
-        config = checkpoint_payload.config
         runtime.variables = {"params": train_state.nnx_params}
         if args.carry_state:
             runtime_state = restore_distributed_runtime_state(

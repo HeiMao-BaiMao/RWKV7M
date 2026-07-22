@@ -274,6 +274,8 @@ def test_distributed_binidx_training_cli_saves_and_resumes(tmp_path):
     assert int(resumed.train_state.step) == 2
     assert resumed.train_state.model.config.remat_blocks is True
     assert resumed_checkpoint == output_dir / "ckpt-00000002"
+    resumed_payload = load_distributed_checkpoint_metadata(resumed_checkpoint)
+    assert resumed_payload.config.remat_blocks is True
 
 
 def test_distributed_binidx_training_cli_carry_state_saves_and_restores_runtime_state(tmp_path):

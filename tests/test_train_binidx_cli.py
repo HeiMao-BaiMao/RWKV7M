@@ -76,10 +76,17 @@ def test_train_binidx_cli_saves_and_resumes(tmp_path):
     assert payload["dataset_position"] == {"step": 1}
 
     resumed_state, _, resumed_checkpoint = run_training(
-        base_args(prefix, output_dir, ["--resume", str(checkpoint)])
+        base_args(
+            prefix,
+            output_dir,
+            ["--resume", str(checkpoint), "--remat-blocks"],
+        )
     )
     assert int(resumed_state.step) == 2
+    assert resumed_state.model.config.remat_blocks is True
     assert resumed_checkpoint == output_dir / "ckpt-00000002"
+    resumed_config, _ = load_train_checkpoint_metadata(resumed_checkpoint)
+    assert resumed_config.remat_blocks is True
 
 
 def test_train_binidx_cli_carry_state_requires_sequential_sampling(tmp_path):
