@@ -826,10 +826,18 @@ def run_distributed_training(args):
                 if isinstance(value, (int, float, np.integer, np.floating))
                 and not math.isfinite(float(value))
             )
-            if args.require_finite and nonfinite_metrics:
+            failed_finite_flags = sorted(
+                name
+                for name, value in host_metrics.items()
+                if name.endswith("_all_finite") and float(value) < 0.5
+            )
+            failed_metrics = sorted(
+                set(nonfinite_metrics + failed_finite_flags)
+            )
+            if args.require_finite and failed_metrics:
                 raise FloatingPointError(
                     f"non-finite train metrics at step {completed_step}: "
-                    + ", ".join(nonfinite_metrics)
+                    + ", ".join(failed_metrics)
                 )
             if args.print_every and (
                 local_step % args.print_every == 0 or local_step == args.steps - 1

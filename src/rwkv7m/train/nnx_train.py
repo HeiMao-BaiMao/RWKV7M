@@ -221,6 +221,47 @@ def compute_v5_admission_floor_loss(
     return loss, target
 
 
+def _tree_finite_flag(tree):
+    leaves = [
+        value
+        for value in jax.tree.leaves(tree)
+        if hasattr(value, "dtype")
+        and jnp.issubdtype(value.dtype, jnp.inexact)
+    ]
+    if not leaves:
+        return jnp.ones((), dtype=jnp.float32)
+    return jnp.stack(
+        [jnp.all(jnp.isfinite(value)) for value in leaves]
+    ).all().astype(jnp.float32)
+
+
+def _tree_gradient_statistics(tree):
+    leaves = [
+        value.astype(jnp.float32)
+        for value in jax.tree.leaves(tree)
+        if hasattr(value, "dtype")
+        and jnp.issubdtype(value.dtype, jnp.inexact)
+    ]
+    if not leaves:
+        zero = jnp.zeros((), dtype=jnp.float32)
+        return jnp.ones((), dtype=jnp.float32), zero, zero
+    all_finite = jnp.stack(
+        [jnp.all(jnp.isfinite(value)) for value in leaves]
+    ).all()
+    squared_norm = sum(
+        (jnp.sum(jnp.square(value)) for value in leaves),
+        start=jnp.zeros((), dtype=jnp.float32),
+    )
+    max_abs = jnp.max(
+        jnp.stack([jnp.max(jnp.abs(value)) for value in leaves])
+    )
+    return (
+        all_finite.astype(jnp.float32),
+        jnp.sqrt(squared_norm),
+        max_abs,
+    )
+
+
 def compute_v5_write_budget_loss(
     write_rate,
     screening_config,
@@ -740,9 +781,20 @@ def _nnx_train_step(
         new_screen_states.append(new_screen)
 
     accumulated_grads = _cast_gradient_tree(accumulated_grads, update_dtype)
+    (
+        gradient_all_finite,
+        gradient_global_norm,
+        gradient_max_abs,
+    ) = _tree_gradient_statistics(accumulated_grads)
     optimizer.update(model, accumulated_grads)
     metrics = accumulated_metrics
     metrics["total_loss"] = accumulated_loss
+    metrics["gradient_all_finite"] = gradient_all_finite
+    metrics["gradient_global_norm"] = gradient_global_norm
+    metrics["gradient_max_abs"] = gradient_max_abs
+    metrics["parameter_all_finite"] = _tree_finite_flag(
+        nnx.state(model, nnx.Param)
+    )
     return (
         _concat_batch_trees(new_rwkv_states),
         _concat_batch_trees(new_screen_states),

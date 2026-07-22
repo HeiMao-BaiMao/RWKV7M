@@ -1,0 +1,585 @@
+RWKV7M Screening v5 / MI300X 調査中間報告
+更新日: 2026-07-22 (Asia/Tokyo)
+対象branch: agent/screening-pallas-benchmarks
+
+この文書の位置付け
+====================
+
+本書は、0.185B Screening v5 の synthetic retrieval 学習で観測された
+memory非利用・学習不安定性を切り分けるための作業記録である。アドバイザーへ
+共有できるように、確認済み事実、推論、反証された仮説、無効な実験、未検証事項を
+分けて記載する。
+
+重要な注意:
+
+- MiniPile magic sampler + carry_state=false はmemory品質ゲートとして不適切である。
+  今回の品質評価にはdocument単位のsynthetic delayed key-value retrievalを使った。
+- ROCm実行はbitwise deterministicではない。同じcheckpointとデータ位置からの再開でも
+  loss軌跡とNaN発生stepが一致しない。このため単一runの成否を原因証明に使わない。
+- 一部のresume ablationはCLIバグによりoverrideが適用されておらず、無効である。
+  該当結果は下記で明示する。
+
+
+1. 実験環境
+=============
+
+GPU:
+
+- AMD Instinct MI300X VF x1
+- VRAM 192 GB
+- ROCm 7.0.2 base + /opt/rocm/core-7.14/lib のruntime library
+- JAX 0.10.0 / jaxlib 0.10.0 / Flax 0.12.7 / Optax 0.2.8
+- JAX device: RocmDevice(id=0)
+
+ROCm JAXを正しく起動するため、全GPU commandで次のlibrary pathを明示した。
+
+  LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib:/opt/rocm/lib
+
+未指定時はNCCL symbol解決失敗によりJAXがGPUを使用できない。システム全体の
+/opt/rocmは変更していない。
+
+主なモデル/データ条件:
+
+- 0.185B preset
+- d_model=768, 12 layers, 12 heads, head size=64
+- BF16 compute、当初はBF16 parameter storage、FP32 optimizer state/update workspace
+- sequence length=512、global batch=8、4,096 token/step
+- Screening layer=6、16 slots、Screening v5 core
+- LR=1e-4 constant（lr_init=lr_final=1e-4）
+- Screening activation_step=100、activation_warmup_steps=100
+- Screening optimizer LR multiplier=0.1
+- fail-closed finite check有効
+
+Synthetic retrieval data:
+
+- train: 8,192 documents
+- eval: 1,024 documents
+- 1 document=4 chunks x 128 token=512 token
+- vocabulary=65,536、key count=256、distractor count=16
+- train sampling=document、carry_state=false、ctx=512
+- eval sampling=document_sequential、carry_state=true、ctx=128
+- answer loss maskはtoken 4以降
+
+
+2. 事前に反映済みの設計修正
+============================
+
+commit b808f4f "Stabilize screening activation and retrieval evaluation"
+
+- Screening v5 staged activation
+- layer別 hard-forward / soft-backward auxiliary metrics
+- document / document_sequential sampling
+- synthetic retrieval generator
+- memory-off causal evaluation
+- diagnosticsと文書更新
+
+この時点のローカル全suiteは253 passed, 5 skippedだった。
+
+
+3. write threshold warm-upの設計バグ
+==================================
+
+確認済み事実:
+
+低load時のpermissive threshold warm-upがreadだけでなくwrite/noveltyにも適用されていた。
+occupied slotが1個のときwrite tauが約-0.2まで下がり、最初のslotがほぼ全tokenへ
+matchするため、1-slot collapseを自己強化していた。
+
+修正:
+
+commit cc3e42c "Separate screening read and write warmups"
+
+- capacity tau helperへwarmup_by_loadを追加
+- low-load warm-upはread thresholdだけに適用
+- write/novelty thresholdは常にcapacity-calibrated値を使う
+- 回帰testを追加
+
+修正前0.185B run（/root/RWKV7M/out/retrieval-185m-run-s1001）:
+
+- step 104: slot利用はほぼ1 slot
+- step 236: 一時的にslot utilization約0.275、hard write約0.289
+- step 400: slot utilization=0.0625、hard write=1/512、soft write約0.494
+- 結果: 1-slot解へ再collapse
+
+修正後はslotが複数使われるようになり、この特定のcollapse原因は解消した。
+
+
+4. model-config使用時にoptimizer CLI overrideが無視された問題
+===========================================================
+
+確認済み事実:
+
+--model-config指定時、--lr-init 1e-4 --lr-final 1e-4を渡しても実測LRが
+step 45で約4.4e-4となった。optimizer-related CLI引数がpreset/configへ適用されて
+いなかった。
+
+修正:
+
+commit 828b9e7 "Honor optimizer overrides with model configs"
+
+- optimizer argumentの未指定defaultをNone化
+- 明示指定時だけmodel configへ上書き
+- 未指定時は保存config値を維持
+- warmup/schedule/clip/weight decay/Adam係数も同じ契約へ統一
+
+remote config resolutionでlr_init=lr_final=1e-4を確認した。
+
+
+5. 初期のNaN観測と再現性
+=========================
+
+write threshold修正後、誤って高LRのまま走ったrun:
+
+- /root/RWKV7M/out/retrieval-185m-run-s1001-writetau
+- first NaN: step 166
+- 直前はslot utilization 0.44--0.58、novelty 0.75--0.99、hard write 2.4--3.7%
+- LRは想定より高かったため、安定性判断には採用しない
+
+正しくLR=1e-4としたrun:
+
+- /root/RWKV7M/out/retrieval-185m-run-s1001-writetau-lr1e4-fixedcli
+- first NaN: step 205
+- step 175: base RMS=4.70、slot utilization=0.543、hard write=0.0295
+- step 200--204: base RMS=7.25 -> 7.69、utilization=0.37 -> 0.615、
+  admission=0.13 -> 0.198
+- step 204 self-index loss=1.44e-4
+
+checkpoint 200 + fixed batch step 204のcomponent gradient診断:
+
+- loss=11.433664、全423 gradient leafがfinite
+- total gradient L2=35.575
+- Screening gradient L2=0.03017
+- trunk gradient L2=35.575
+- CE: Screening=0.00197、trunk=35.5689
+- admission-floor loss=2.1658e-5:
+  Screening gradient=0.03206、trunk gradient=0.01751
+- self-index loss=4.0647e-5:
+  Screening gradient=0.001109、trunk gradient=0.00546
+- write-budgetは値/gradientとも0
+
+同checkpoint/batchでoptimizer updateも診断した。
+
+- updateのnonfinite leaf=0
+- total update L2=0.407702
+- Screening update L2=0.0006469
+- trunk update L2=0.4077018
+- max abs update=0.00048828125
+
+したがってcheckpoint 200自体や固定batchのAdam stateが決定論的に壊れているわけではない。
+
+checkpoint 200からstep 205まで3回resumeした結果:
+
+- prefetch=1を2回、prefetch=2を1回
+- 3回ともstep 205までfinite
+- lossは同一seed/checkpointでも約0.003--0.01異なる
+
+推論:
+
+- ROCm lowering/atomicsを含むtrain stackはbitwise deterministicではない
+- 元runのstep 205 NaNは固定checkpointから必ず再現する破損ではない
+- ただし「ROCmだから仕方ない」と結論する根拠にはならない
+
+
+6. held-out retrieval（step 205）
+================================
+
+checkpoint:
+
+  /root/RWKV7M/out/retrieval-185m-resume200-repro3-prefetch2/ckpt-00000205
+
+eval条件:
+
+- 128 eval steps、batch=8、ctx=128
+- document_sequential + carry_state=true
+- memory-on/offを同じbatch列で比較
+
+結果:
+
+- masked positions=256
+- loss=9.286619
+- accuracy=0.00390625 = 1/256（chance）
+- memory-off loss=9.286723
+- memory loss delta=+0.000104（正値はmemory-onが僅かに良い）
+- prediction RMS delta=0.002688
+- memory-off accuracyも同じ
+
+結論:
+
+- 旧dead branchと異なり、memoryはlogitへ非ゼロの因果効果を持った
+- しかしstep 205ではretrieval精度はchanceで、品質改善は未確認
+
+
+7. fail-closedとdiagnostic toolの修正
+====================================
+
+commit 0b26c99 "Fail closed on nonfinite training metrics"
+
+- train CLI / distributed train CLIへ--require-finite（default true）
+- numeric metricの非有限値で即時停止
+- restored optimizer arraysを独立所有へcopyし、read-only更新失敗を修正
+
+commit 45a61f1 "Snapshot parameters before diagnostic updates"
+
+- diagnosticのbefore paramsがlive NNX stateを参照してupdate delta=0になっていた問題を修正
+- update前parameterを独立copyする
+
+実機確認:
+
+- checkpoint 205からの長期runはstep 211のNaNを検出しexit=1で停止
+- fail-closed自体は正しく作動した
+
+
+8. Pallas WKV backwardの逆算バグ
+================================
+
+初期観測:
+
+- checkpoint 205からPallas/Triton WKVはstep 211でNaN
+- 同checkpointからreference lax.scan WKVはstep 215までfinite
+- Pallas約8.7k tok/s、reference約3.18k tok/s
+
+コード監査で、Pallas backwardが次式でprevious stateを逆算していた。
+
+  previous_state =
+      (current_state - rank_updates) / decay
+
+  decay = exp(-exp(w))
+
+adversarial最小再現:
+
+- T=32, B=1, H=1, N=64
+- 1 tokenのwだけ5.0に設定し、FP32 decayを0へroundさせた
+- reference: loss/全gradient finite
+- Pallas: r, w, neg_kk gradientがnonfinite
+
+これは実機で再現できるアルゴリズム上の欠陥である。ただし実モデルのwは
+softplus clampで負側へ制約されるため、このadversarial条件だけが実学習NaNの
+主因とは限らない。
+
+修正:
+
+commit 2599ad5 "Stabilize Pallas WKV backward state reconstruction"
+
+- primal forwardでは不安定なinverse-reconstruction tapeを保持しない
+- VJP内でforwardを再実行し、tokenごとのFP32 state tapeを作る
+- backwardはcheckpoint[t]からprevious stateを直接読む
+- GPU/TPU両Pallas backendへ同じcorrectness contractを適用
+- checkpoint_interval != 1のbackwardはfail-fast
+- decayが0へroundする回帰testをGPU/TPU両backendへ追加
+
+修正後MI300X:
+
+- adversarial real-accelerator test: GPU/TPU指定backendともpass
+- checkpoint 205からstep 225まで20 step全てfinite
+- steady Pallas throughput約8.16k tok/s
+- reference約3.18k tok/sに対し約2.6倍
+- 旧Pallas約8.7k tok/sから約6%低下
+
+ただし、その後の長期runはstep 244でNaNとなり、reference WKV対照もstep 248で
+NaNとなった。従ってinverse reconstruction bugは修正必須だが、長期NaNの唯一原因
+ではない。Pallas固有原因という仮説は反証された。
+
+
+9. parameter storage dtypeとcompute dtypeの分離
+================================================
+
+FP32 parameter storageを対照実験しようとしたところ、学習開始前に次の契約違反を
+検出した。
+
+- r: BF16
+- w: FP32
+- WKV input dtype validationで停止
+
+原因:
+
+- NNX Linearの多くはcompute dtypeを指定していた
+- しかしTimeMix/ChannelMixのraw parameterを直接使う加算・乗算がFP32 parameterに
+  よってactivationを暗黙にFP32へpromoteした
+- tiled LM headもFP32 storage kernelをそのままmatmulへ渡していた
+
+修正:
+
+commit 8e9b5a6 "Separate NNX parameter storage from compute dtype"
+
+- TimeMix raw parametersを演算前にcompute dtypeへcast
+- ChannelMix time-mix parameterも同様にcast
+- tiled LM head kernelをnormalized hidden dtypeへcast
+- BF16 compute + BF16/FP32 parameter storageの両方を回帰test化
+
+実機ではFP32 parameter storage + BF16 computeが約7.9--8.0k tok/sで動いたが、
+step 156でNaNとなった。FP32 storageはdtype契約として有効になったが、今回のNaNを
+解決しなかった。従ってpresetの既定値変更はまだ行っていない。
+
+
+10. Screening activationとtrunk対照
+===================================
+
+FP32 parameter runの失敗直前（step 147--156）:
+
+- activation: 0.46 -> 0.55
+- base RMS: 2.63 -> 2.96、step 156でNaN
+- Screening residual RMS: 3.45e-5 -> 1.47e-4
+- slot utilization: 0.78前後から0.50前後
+- hard write: 約3.4--5.1%
+- step 147--155ではadmission-floor loss=0
+- write-budget lossもほぼ0
+- 主に非ゼロだったauxはself-index loss（約5e-5--2.4e-4）
+
+Screening activationをstep 100000へ遅延したtrunk-only対照:
+
+  /root/RWKV7M/out/retrieval-185m-delayed-screening-s1001
+
+- 300 step完走、全metric finite
+- loss 20.234 -> 7.523
+- steady throughput約8.1k tok/s
+
+支持される結論:
+
+- LR=1e-4のRWKV trunk単独は少なくとも300 stepで安定
+- NaNはScreeningが学習lossへ接続された後にのみ観測されている
+
+まだ支持されない結論:
+
+- self-index loss単独が必ずNaNを作る
+- memory residual CE経路だけが安定
+
+
+11. 無効だったresume ablationとCLIバグ
+=======================================
+
+次のrunは、CLI上はactivation=100/100やaux weight=0/0.1を渡したが、resume時に
+保存configへexecution overrideが適用されていなかった。
+
+- retrieval-185m-resume100-noaux
+- retrieval-185m-resume100-selfonly
+- retrieval-185m-resume100-allaux
+- retrieval-185m-resume220-noaux-to500
+
+metricsを確認するとscreening_activationは全step 0、slot utilization 0、
+screening_base_rms_ratio 0だった。従ってこれらがstep 180/220/500までfiniteでも、
+memory/aux安定性の根拠には使えない。trunk-only長期安定性の追加証拠としてのみ扱う。
+
+修正:
+
+commit 8b761a0 "Apply execution overrides when resuming training"
+
+- resume checkpoint configへ明示execution overrideを適用
+- model-config/preset併用時は同じoverride適用後に互換性比較
+- Screening curriculum引数を未指定None化し、preset値を暗黙上書きしない
+- activation、lambda warm-up、admission floor、read warm-up、write budget、
+  self-index、Screening LR multiplierを明示override可能にした
+- local CLI tests pass
+
+現在、修正後の有効なmemory-residual-only ablationをMI300Xで再実行中である。
+
+
+12. 現時点の判断
+=================
+
+確認済み:
+
+1. magic sampler + carry_state=falseはmemory品質評価に不適切。
+2. synthetic document retrieval + streaming evalは必要な評価vehicleを提供する。
+3. write thresholdへread warm-upを流用したことが1-slot collapseを強めていた。
+4. memoryはstep 205時点でlogitへ非ゼロ効果を持つが、retrieval精度はchance。
+5. trunk-onlyはLR=1e-4で少なくとも300--500 step相当finite。
+6. Screeningがlossへ接続されたrunでのみ長期NaNを観測した。
+7. Pallas WKV inverse reconstructionには独立したcorrectness bugがあった。
+8. そのPallas bugを直してもreference WKVでNaNが出るため、長期NaNの主因は別。
+9. FP32 parameter storage対応は必要なdtype修正だが、NaN解決にはならなかった。
+10. ROCm trajectoryは非決定的で、NaN発生stepは再開ごとに変わる。
+
+最も妥当な現在仮説:
+
+- Screening recurrence/auxiliary objectiveから流れるgradientのどこかが、hard routing
+  境界とROCmの微小な数値差によって稀に非有限updateへ入る。
+- 特にactivation ramp中に失敗が集中するが、memory residualと各aux lossの寄与は
+  有効なablation完了前なので未確定。
+
+反証された、または証拠不足の仮説:
+
+- 「Pallas WKVだけが原因」: reference WKVでも失敗したため反証。
+- 「BF16 parameter storageだけが原因」: FP32 storageでも失敗したため反証。
+- 「checkpoint 200のoptimizer stateが既に壊れている」: fixed-step gradient/updateが
+  全finiteで、複数resumeがstep 205を通過したため反証。
+- 「self-index単独が原因」: 一見そう見える時系列はあるが、有効な単独ablationが
+  未完了なので未確定。
+
+
+13. 次の作業
+=============
+
+1. resume override修正後の有効なablation:
+   - memory residualのみ
+   - self-indexのみ追加
+   - admission floorのみ追加
+   - write budgetのみ追加
+   - 全aux
+2. gradient finite flag、global norm、可能ならScreening/trunk別normをtrain JSONLへ追加。
+3. 非有限gradientをparameterへ適用する前にfail-closedにする。
+4. 安定構成で500--1,000 stepまで学習し、held-out retrievalをmemory-on/offで評価。
+5. 0.185Bで設計ゲートを通過後にのみ0.3Bへ進む。
+6. v5 Pallas recurrence、v5 checkpoint redesign、retentionはcore quality/stability gate後。
+
+
+14. 現在push済みcommit
+=======================
+
+- b808f4f Stabilize screening activation and retrieval evaluation
+- cc3e42c Separate screening read and write warmups
+- 828b9e7 Honor optimizer overrides with model configs
+- 0b26c99 Fail closed on nonfinite training metrics
+- 45a61f1 Snapshot parameters before diagnostic updates
+- 2599ad5 Stabilize Pallas WKV backward state reconstruction
+- 8e9b5a6 Separate NNX parameter storage from compute dtype
+- 8b761a0 Apply execution overrides when resuming training
+
+この文書は実験進行中のため、最終結論ではない。
+
+
+15. resume override修正後の有効なno-aux ablation
+================================================
+
+run:
+
+  /root/RWKV7M/out/retrieval-185m-resume100-noaux-valid
+
+条件:
+
+- trunk-only checkpoint 100からresume
+- activation_step=100、warmup=100
+- admission-floor/write-budget/self-index weightはすべて0
+- memory residualからCEへのgradientは有効
+
+結果:
+
+- step 220までfinite
+- activationはstep 101の0からstep 201の1へ上昇
+- steady throughputは概ね7.7--9.0k tok/s
+- step 111: slot utilization=0.953、hard write=0.9990、novelty=0.9998
+- step 121: slot utilization=0.289、hard write=1.0、novelty=1.0
+- step 161: slot utilization=0.258、hard write=1.0、admission=0.988
+- step 201: slot utilization=0.266、hard write=0.985、novelty=1.0
+- step 220: slot utilization=0.250、hard write=0.9990、novelty=1.0
+- screening/base RMS ratioは約3e-5--5e-5
+
+この結果が支持する結論:
+
+- memory residualのCE経路だけでは、少なくともstep 220までNaNは出なかった。
+- しかし全tokenをnovelと判定してほぼ毎token書く退化解へ入った。
+- anti-starvation/upper-budget/self-index objectiveを全部外すことは安定化策として
+  採用できない。memory利用を維持しつつwrite率を制御する補助信号が必要である。
+
+同じcheckpoint 100から3 auxをすべて有効にした有効な対照runは、下記§16で
+step 176に非有限化した。
+
+
+16. resume override修正後の有効な全aux対照
+================================================
+
+run:
+
+  /root/RWKV7M/out/retrieval-185m-resume100-allaux-valid
+
+条件:
+
+- §15と同じtrunk-only checkpoint 100からresume
+- activation_step=100、warmup=100
+- admission-floor/write-budget/self-index weightはいずれも0.1
+- resume override修正後で、screening activationとaux lossが実際に有効であることを
+  metricsから確認
+
+結果:
+
+- step 175まではfinite、step 176でloss/total_lossおよびScreening統計がNaN
+- step 169--175のactivationは0.68--0.74
+- hard write rateは0.0374--0.0447、soft write budget rateは
+  0.0337--0.0379で、目標上限0.05未満
+- slot utilizationは0.730--0.801
+- admission meanは0.101--0.107
+- screening/base RMS ratioは2.42e-5--3.28e-5
+- admission floor loss=0、write budget loss=0
+- 非ゼロのaux項はself-index lossのみで、4.22e-4--6.93e-4
+- step 176ではslot utilization=0、hard write=0、その他のScreening統計はNaN
+
+この結果が支持する結論:
+
+- 有効な全aux構成はno-aux構成より早く非有限化した。
+- 直前にfloor/budget penaltyは0で、self-indexだけが非ゼロだったため、
+  次に最も判別力が高い実験はself-index-onlyである。
+- ただし相関であって因果確定ではない。self-index-onlyと、self-index targetへの
+  trunk gradientをstop-gradientした対照が必要。
+
+
+17. 外部評価を受けた§15の解釈修正
+====================================
+
+Fable 5による§15の評価を、以下のように採用する。
+
+確認された事実:
+
+- no-auxではhard writeが約0.997--0.999へ飽和し、noveltyもほぼ1.0である。
+- 同時にscreening/base RMS ratioは3e-5--5e-5程度で、memory branchの
+  trunk出力への寄与は非常に小さい。
+- 旧runでの全拒否と今回の全受理は鏡像の端点解であり、現在までに安定した
+  中間write率を長期維持した例はない。
+
+表現を弱めるべき点:
+
+- §15のstep 220 finiteだけから「aux無しなら安定」とは結論しない。
+- 既知のPallas/reference失敗例はstep 244/248にもあり、ROCm trajectoryも
+  非決定的である。§15が直接支持するのは「この1 runではstep 220までfinite」
+  および「activation ramp中の既往多発帯を一度通過した」までである。
+- no-aux runは最低step 300--400へ延長し、可能なら複数seed/resumeで失敗率を
+  見る必要がある。
+
+設計上の最も妥当な推論:
+
+- memory residualが極小の間、CEはrouting policyへ十分な監督信号を提供して
+  いない可能性が高い。現行のaux lossはroutingに対して実質的な主目的関数に
+  なっている。
+- softなfloor/budget lossだけでは、hard forwardの実現write率とのGoodhart gapを
+  閉じられない。
+- write率そのものを損失勾配だけで制御する方式には、端点飽和、弱すぎる制約、
+  急峻な制約による不安定化という共通リスクがある。
+
+次の実験優先順位:
+
+1. self-index-onlyをcheckpoint 100から有効にしてstep 300以上まで実行。
+2. self-index-onlyが失敗する場合、self-indexからtrunkへのgradientだけを
+   stop-gradientした対照を実装・実行。
+3. no-auxをstep 300--400以上へ延長し、有限性を再確認。
+4. admission-floor-only、write-budget-onlyを個別実行。
+5. 最終候補は複数seed/resumeで失敗率として比較。
+
+中期設計候補（まだ未実装・未検証）:
+
+- hard実測write率を入力とする勾配外のfeedback controllerで、admission biasまたは
+  thresholdを調整する。
+- 勾配学習は「どのtokenを書くか」の順位付けを担い、write率はcontrollerで
+  目標へ戻す。
+- gate logitを線形領域へ留める弱い中心化正則化をablation候補にする。
+
+PI制御は有望だが、積分wind-up、layer/bank別統計、分散環境での集約、
+checkpoint/resume時のcontroller state、microbatch間の更新時点を先に仕様化する
+必要がある。現時点では設計候補であり、採用確定とはしない。
+
+
+18. 追加中の非有限診断
+========================
+
+現在のローカル変更ではtrain stepへ次を追加している。
+
+- gradient_all_finite
+- gradient_global_norm
+- gradient_max_abs
+- parameter_all_finite（optimizer更新直後）
+
+CLIのrequire-finiteはlossだけでなく、`*_all_finite < 0.5`でも停止する。
+これにより次回のstep 176近傍の再開実験で、少なくとも次を区別する。
+
+- forward/lossが先に非有限化
+- raw gradientが先に非有限化
+- raw gradientはfiniteだがoptimizer update後のparameterが非有限化
+
+この診断コードはまだローカル未コミットであり、テスト後にGPUへ反映する。

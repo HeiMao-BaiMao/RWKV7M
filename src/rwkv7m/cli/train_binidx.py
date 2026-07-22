@@ -405,10 +405,18 @@ def run_training(args):
                 for name in ("loss", "total_loss")
                 if name in metrics and not math.isfinite(float(metrics[name]))
             ]
-            if args.require_finite and nonfinite_losses:
+            failed_finite_flags = [
+                name
+                for name, value in metrics.items()
+                if name.endswith("_all_finite") and float(value) < 0.5
+            ]
+            failed_metrics = sorted(
+                set(nonfinite_losses + failed_finite_flags)
+            )
+            if args.require_finite and failed_metrics:
                 raise FloatingPointError(
                     f"non-finite train metrics at step {completed_step}: "
-                    + ", ".join(nonfinite_losses)
+                    + ", ".join(failed_metrics)
                 )
             if args.print_every and (
                 local_step % args.print_every == 0 or local_step == args.steps - 1

@@ -966,6 +966,11 @@ def test_nnx_train_step_uses_hard_forward_write_rate_for_auxiliary_losses():
     assert jnp.isfinite(metrics["self_index_loss"])
     assert metrics["read_soft_warmup_alpha"] == 1.0
     assert metrics["total_loss"] > metrics["loss"]
+    assert metrics["gradient_all_finite"] == 1.0
+    assert jnp.isfinite(metrics["gradient_global_norm"])
+    assert metrics["gradient_global_norm"] > 0.0
+    assert jnp.isfinite(metrics["gradient_max_abs"])
+    assert metrics["parameter_all_finite"] == 1.0
 
 
 def test_nnx_v5_staged_activation_preserves_empty_state_then_ramps():
