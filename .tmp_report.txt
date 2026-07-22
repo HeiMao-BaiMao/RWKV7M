@@ -951,6 +951,25 @@ full FP32対照:
 - 次にparam保存だけをFP32へ昇格したexact fixed-batch診断を追加し、trunk computeとの
   効果を分離する。
 
+parameter-storageだけFP32へ昇格した結果:
+
+- output:
+  `/root/RWKV7M/out/diagnostics/budget250/float32-parameters-total-corrected.json`
+- compute/activationはBF16設定のまま、restored parameterだけFP32へ昇格した。
+- loss=8.2015162、finite
+- non-finite gradientは247 leaf / 48,508,683 valueで、BF16 parameter保存時と
+  完全に同数・同じparameter pathだった。
+- Screening 229,131 value、trunk 48,279,552 valueという内訳も同一。
+
+判定:
+
+- parameter storageのBF16量子化は、このfixed-batch NaNの原因ではない。
+- full FP32で有限化した差はtrunk compute/activationまたは、それによって変化する
+  hard routing trajectoryにある。
+- 次に既存`eps=1e-6`への感度を固定batchで測る。v5の`unit_norm`はゼロ近傍で
+  最大約`1 / eps = 1e6`のJacobianを持つため、write-side recurrent scan内での
+  勾配増幅候補である。ただし現時点では仮説であり、原因と断定しない。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================

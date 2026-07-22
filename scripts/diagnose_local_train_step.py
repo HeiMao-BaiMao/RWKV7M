@@ -51,6 +51,16 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--screening-eps",
+        type=float,
+        default=None,
+        help=(
+            "Override the Screening numerical epsilon after checkpoint "
+            "compatibility validation; intended only for fixed-batch "
+            "sensitivity diagnosis."
+        ),
+    )
+    parser.add_argument(
         "--float32-model",
         action="store_true",
         help=(
@@ -100,6 +110,8 @@ def parse_args(argv=None):
         parser.error("--top-k must be positive")
     if args.sequence_chunk_size is not None and args.sequence_chunk_size < 0:
         parser.error("--sequence-chunk-size must be non-negative")
+    if args.screening_eps is not None and args.screening_eps <= 0.0:
+        parser.error("--screening-eps must be positive")
     if args.optimizer_total_steps <= 0:
         parser.error("--optimizer-total-steps must be positive")
     if args.float32_model and args.float32_parameters:
@@ -268,6 +280,8 @@ def main(argv=None):
             if args.sequence_chunk_size == 0
             else args.sequence_chunk_size
         )
+    if args.screening_eps is not None:
+        config.screening.eps = args.screening_eps
     if args.float32_model:
         config.dtype = "float32"
         config.param_dtype = "float32"
@@ -377,6 +391,7 @@ def main(argv=None):
         "learning_rate": float(lr_schedule(checkpoint_step)),
         "optimizer_total_steps": int(args.optimizer_total_steps),
         "sequence_chunk_size": config.sequence_chunk_size,
+        "screening_eps": config.screening.eps,
         "float32_model": bool(args.float32_model),
         "float32_parameters": bool(args.float32_parameters),
         "devices": [
