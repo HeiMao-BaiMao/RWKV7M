@@ -110,20 +110,20 @@ def parse_args(argv=None):
     add_optimizer_backend_arg(parser)
     add_screening_v2_args(parser)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--lr-init", type=float, default=1e-3)
-    parser.add_argument("--lr-final", type=float, default=1e-5)
+    parser.add_argument("--lr-init", type=float, default=None)
+    parser.add_argument("--lr-final", type=float, default=None)
     parser.add_argument(
         "--warmup-steps",
         type=int,
         default=None,
         help="optimizer warmup override; model-config value is kept when omitted",
     )
-    parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default="optax_cosine")
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--weight-decay", type=float, default=0.001)
-    parser.add_argument("--adam-beta1", type=float, default=0.9)
-    parser.add_argument("--adam-beta2", type=float, default=0.999)
-    parser.add_argument("--adam-eps", type=float, default=1e-8)
+    parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default=None)
+    parser.add_argument("--max-grad-norm", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--adam-beta1", type=float, default=None)
+    parser.add_argument("--adam-beta2", type=float, default=None)
+    parser.add_argument("--adam-eps", type=float, default=None)
     parser.add_argument("--vocab-size", type=int, default=65536)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-ffn", type=int, default=256)

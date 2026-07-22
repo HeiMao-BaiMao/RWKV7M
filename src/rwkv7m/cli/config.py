@@ -438,6 +438,20 @@ def apply_execution_overrides(config, args):
         if warmup_steps < 0:
             raise ValueError("--warmup-steps must be non-negative")
         config.warmup_steps = int(warmup_steps)
+    optimizer_overrides = (
+        ("lr_init", "lr_init"),
+        ("lr_final", "lr_final"),
+        ("lr_schedule", "lr_schedule"),
+        ("max_grad_norm", "max_grad_norm"),
+        ("weight_decay", "weight_decay"),
+        ("adam_beta1", "adam_beta1"),
+        ("adam_beta2", "adam_beta2"),
+        ("adam_eps", "adam_eps"),
+    )
+    for argument_name, field_name in optimizer_overrides:
+        value = getattr(args, argument_name, None)
+        if value is not None:
+            setattr(config, field_name, value)
     if hasattr(args, "use_screening") and not args.use_screening:
         config.use_screening = False
     screening_overrides = (

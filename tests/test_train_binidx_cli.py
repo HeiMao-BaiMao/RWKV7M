@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 
 from rwkv7m import load_train_checkpoint_metadata
@@ -128,6 +131,16 @@ def test_model_config_allows_experiment_only_recovery_overrides(tmp_path):
             "configs/rwkv7m-0.185b-screening-v5-core.json.example",
             "--warmup-steps",
             "10",
+            "--lr-init",
+            "0.0001",
+            "--lr-final",
+            "0.0001",
+            "--lr-schedule",
+            "rwkv",
+            "--max-grad-norm",
+            "0.5",
+            "--weight-decay",
+            "0.0",
             "--screening-activation-step",
             "0",
             "--screening-activation-warmup-steps",
@@ -141,8 +154,50 @@ def test_model_config_allows_experiment_only_recovery_overrides(tmp_path):
     )
     config = build_config(args)
     assert config.warmup_steps == 10
+    assert config.lr_init == 1e-4
+    assert config.lr_final == 1e-4
+    assert config.lr_schedule == "rwkv"
+    assert config.max_grad_norm == 0.5
+    assert config.weight_decay == 0.0
     assert config.screening.activation_step == 0
     assert config.screening.activation_warmup_steps == 0
     assert config.screening.optimizer_lr_multiplier == 1.0
     assert config.screening.write_budget_min_slot_utilization == 0.0
     assert config.use_screening is False
+
+
+def test_model_config_preserves_optimizer_settings_without_cli_overrides(tmp_path):
+    payload = json.loads(
+        Path(
+            "configs/rwkv7m-0.185b-screening-v5-core.json.example"
+        ).read_text(encoding="utf-8")
+    )
+    payload.update(
+        {
+            "lr_init": 3e-4,
+            "lr_final": 2e-5,
+            "lr_schedule": "rwkv",
+            "max_grad_norm": 0.75,
+            "weight_decay": 0.002,
+        }
+    )
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = build_config(
+        parse_args(
+            [
+                "--data-file",
+                "unused",
+                "--ctx-len",
+                "512",
+                "--model-config",
+                str(path),
+            ]
+        )
+    )
+    assert config.lr_init == 3e-4
+    assert config.lr_final == 2e-5
+    assert config.lr_schedule == "rwkv"
+    assert config.max_grad_norm == 0.75
+    assert config.weight_decay == 0.002
