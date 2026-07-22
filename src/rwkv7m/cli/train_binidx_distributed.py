@@ -144,6 +144,12 @@ def parse_args(argv=None):
     parser.add_argument("--long-half-life-tokens", type=float, default=None)
     parser.add_argument("--usage-ema-decay", type=float, default=0.99)
     parser.add_argument("--print-every", type=int, default=10)
+    parser.add_argument(
+        "--require-finite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="stop immediately when a numeric train metric becomes non-finite",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument(
         "--checkpoint-dir",
@@ -813,6 +819,17 @@ def run_distributed_training(args):
                 summary["completed_steps"] * summary["tokens_per_step"]
             )
             summary["last_train"] = train_record
+            nonfinite_metrics = sorted(
+                name
+                for name, value in host_metrics.items()
+                if isinstance(value, (int, float, np.integer, np.floating))
+                and not math.isfinite(float(value))
+            )
+            if args.require_finite and nonfinite_metrics:
+                raise FloatingPointError(
+                    f"non-finite train metrics at step {completed_step}: "
+                    + ", ".join(nonfinite_metrics)
+                )
             if args.print_every and (
                 local_step % args.print_every == 0 or local_step == args.steps - 1
             ):

@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 
 import jax
@@ -214,6 +215,12 @@ def parse_args(argv=None):
     add_screening_v2_args(parser)
     parser.add_argument("--carry-state", action="store_true")
     parser.add_argument("--print-every", type=int, default=10)
+    parser.add_argument(
+        "--require-finite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="stop immediately when the train loss becomes non-finite",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--resume", default=None, help="Checkpoint directory to resume from")
@@ -392,6 +399,16 @@ def run_training(args):
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
             )
             completed_step = int(train_state.step)
+            nonfinite_losses = [
+                name
+                for name in ("loss", "total_loss")
+                if name in metrics and not math.isfinite(float(metrics[name]))
+            ]
+            if args.require_finite and nonfinite_losses:
+                raise FloatingPointError(
+                    f"non-finite train metrics at step {completed_step}: "
+                    + ", ".join(nonfinite_losses)
+                )
             if args.print_every and (
                 local_step % args.print_every == 0 or local_step == args.steps - 1
             ):

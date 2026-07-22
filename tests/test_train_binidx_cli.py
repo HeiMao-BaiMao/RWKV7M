@@ -201,3 +201,18 @@ def test_model_config_preserves_optimizer_settings_without_cli_overrides(tmp_pat
     assert config.lr_schedule == "rwkv"
     assert config.max_grad_norm == 0.75
     assert config.weight_decay == 0.002
+
+
+def test_train_cli_requires_finite_metrics_by_default():
+    args = parse_args(["--data-file", "unused", "--ctx-len", "4"])
+    assert args.require_finite is True
+    args = parse_args(
+        [
+            "--data-file",
+            "unused",
+            "--ctx-len",
+            "4",
+            "--no-require-finite",
+        ]
+    )
+    assert args.require_finite is False

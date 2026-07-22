@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 
 from flax import nnx
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -188,6 +189,14 @@ def test_gradient_diagnostic_separates_screening_and_trunk_groups():
     assert summary["groups"]["screening"]["l2_norm_finite"] == 3.0
     assert summary["groups"]["trunk"]["l2_norm_finite"] == 4.0
     assert summary["groups"]["all"]["l2_norm_finite"] == 5.0
+
+
+def test_gradient_diagnostic_copies_read_only_arrays_to_device():
+    source = np.asarray([1.0, 2.0], dtype=np.float32)
+    source.flags.writeable = False
+    copied = DIAGNOSE._writable_device_copy(source)
+    assert isinstance(copied, jax.Array)
+    assert np.array_equal(np.asarray(copied), source)
 
 
 def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):

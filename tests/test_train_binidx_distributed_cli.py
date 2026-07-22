@@ -173,6 +173,12 @@ def test_distributed_binidx_training_cli_carry_state_requires_sequential_samplin
         raise AssertionError("carry-state with magic sampling should fail")
 
 
+def test_distributed_train_requires_finite_metrics_by_default():
+    required = ["--data-file", "unused", "--ctx-len", "4"]
+    assert parse_args(required).require_finite is True
+    assert parse_args([*required, "--no-require-finite"]).require_finite is False
+
+
 def test_distributed_binidx_training_cli_saves_and_resumes(tmp_path):
     prefix = write_dp_train_data(tmp_path)
     output_dir = tmp_path / "out"

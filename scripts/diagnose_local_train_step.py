@@ -191,6 +191,28 @@ def _parameter_delta(before, after):
     )
 
 
+def _writable_device_copy(value):
+    return jax.device_put(np.array(jax.device_get(value), copy=True))
+
+
+def _make_optimizer_state_writable(optimizer):
+    """Detach restored NumPy buffers before an in-place NNX update.
+
+    Flax deserialization may retain read-only host arrays. Forward and
+    gradient diagnostics can consume them, but ``Optimizer.update`` mutates
+    the step variable and therefore requires independently owned buffers.
+    """
+
+    state = nnx.state(optimizer)
+    copied = jax.tree.map(
+        lambda value: _writable_device_copy(value)
+        if hasattr(value, "dtype")
+        else value,
+        state,
+    )
+    nnx.update(optimizer, copied)
+
+
 def main(argv=None):
     args = parse_args(argv)
     config = load_model_config(args.model_config)
@@ -311,6 +333,7 @@ def main(argv=None):
             raise SystemExit(
                 "--include-update cannot be combined with --float32-model"
             )
+        _make_optimizer_state_writable(train_state.optimizer)
         before_params = nnx.state(train_state.model, nnx.Param)
         train_state.optimizer.update(train_state.model, gradients)
         after_params = nnx.state(train_state.model, nnx.Param)
