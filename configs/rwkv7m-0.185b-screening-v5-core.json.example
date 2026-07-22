@@ -11,6 +11,7 @@
   "param_update_dtype": "float32",
   "optimizer_state_dtype": "float32",
   "gradient_accum_dtype": "float32",
+  "warmup_steps": 100,
   "lm_head_init": "variance_scaled",
   "vocab_parallel": false,
   "remat_blocks": true,
@@ -66,6 +67,10 @@
     "self_index_margin": 0.02,
     "self_index_loss_weight": 0.1,
     "self_index_loss_steps": 2000,
+    "activation_step": 100,
+    "activation_warmup_steps": 100,
+    "optimizer_lr_multiplier": 0.1,
+    "write_budget_min_slot_utilization": 0.5,
     "checkpoint_interval": null,
     "n_read_tiles": 4
   }

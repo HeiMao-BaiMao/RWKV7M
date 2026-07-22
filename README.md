@@ -463,6 +463,48 @@ uv run rwkv7m-eval-binidx `
 means the active memory path improved cross entropy for that evaluation.
 Near-zero prediction RMS delta means the model is still ignoring memory.
 
+For the primary delayed-retrieval gate, create document-aligned key/value
+episodes with distractors:
+
+```powershell
+uv run rwkv7m-prepare-retrieval `
+  --output-prefix data/bench/delayed-kv `
+  --documents 1024 `
+  --ctx-len 128 `
+  --chunks-per-document 4
+```
+
+Train each complete 512-token document inside one optimizer step so the answer
+loss can differentiate the earlier write path. `sequence_chunk_size` still
+creates recurrent boundaries without truncating BPTT:
+
+```powershell
+uv run rwkv7m-train-binidx-dp `
+  --data-file data/bench/delayed-kv `
+  --model-config configs/rwkv7m-0.185b-screening-v5-core.json.example `
+  --ctx-len 512 --global-batch-size 32 --steps 200 `
+  --sampling-mode document --loss-mask-after-token 4 `
+  --phase read_write --output-dir out/delayed-kv `
+  --save-every 200
+```
+
+Streaming evaluation then splits the same documents at 128 tokens and resets
+individual batch lanes at real document boundaries:
+
+```powershell
+uv run rwkv7m-eval-binidx `
+  --data-file data/bench/delayed-kv `
+  --checkpoint out/delayed-kv/ckpt-00000200 `
+  --ctx-len 128 --batch-size 1 --steps 4 `
+  --sampling-mode document_sequential --carry-state `
+  --loss-mask-after-token 4 --phase read_write `
+  --memory-off-counterfactual
+```
+
+This reports answer-only loss/accuracy and memory-on/off causal deltas. Flat
+MiniPile sequential sampling remains document-unaware; use
+`document_sequential` when state must not cross corpus document boundaries.
+
 Stateful stream validation uses the same sequential/carry-state contract as training:
 
 ```powershell

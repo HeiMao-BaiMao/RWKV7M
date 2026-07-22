@@ -2360,6 +2360,26 @@ occupancy/allocation curriculumを用い、empty capacityを各層で埋める�
 このgateを通るまでretention、checkpoint redesign、v5 Pallas最適化を品質改善の
 根拠として進めない。
 
+全step時系列の再解析では、0.185B/0.3Bとも最初の非ゼロoptimizer更新を反映する
+step 3でloss spikeを示し、memory collapseの主要部分は最初の数十stepで生じて
+いた。さらに、補助損失がsoft write率とscreened-layer平均に作用していたため、
+hard forwardではほぼwriteしないままsoft制約だけを満たす解と、片方の層が他方の
+floor不足を隠す解が可能だった。
+
+修正版では、write floorとupper budgetを層別に計算し、forward値をhard実現率、
+backwardをsoft novelty/admission経路とするstraight-through surrogateへ変更する。
+empty-memory bootstrap中はupper budgetを停止する。またtrunkの初期transient中は
+Screening recurrence、residual、補助損失、optimizer更新（weight decayを含む）を
+停止する。その後hard occupancyを維持したrecurrenceを開始し、residual、補助損失、
+optimizer更新を独立LR multiplierとともに線形起動する。
+
+MiniPile magic samplerかつ`carry_state=false`は数値健全性とthroughputのgateには
+使えるが、long-memory品質の主gateにはしない。主品質gateはdistractor付きdelayed
+key/value retrievalとし、学習時は文書全体を同一optimizer step内でrecurrent
+chunkingする。optimizer stepを跨ぐ単純なstate carryはBPTTを切断し、後段answer
+lossから前段write pathを学習できないためである。streaming評価では文書境界を
+認識した行別state resetを用い、memory-off loss/accuracy deltaを必須とする。
+
 ---
 
 # 18. Backend Validation Policy

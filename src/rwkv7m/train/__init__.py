@@ -8,6 +8,7 @@ from .nnx_train import (
     NNXTrainState,
     create_nnx_train_state,
     initialize_nnx_train_state,
+    nnx_model_loss,
     nnx_train_step,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "NNXTrainState",
     "create_nnx_train_state",
     "initialize_nnx_train_state",
+    "nnx_model_loss",
     "nnx_train_step",
 ]

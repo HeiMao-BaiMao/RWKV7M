@@ -32,6 +32,21 @@ def _optimizer_config(config):
             config, "optimizer_state_dtype", "float32"
         ),
         "optimizer_backend": getattr(config, "optimizer_backend", "optax"),
+        "screening_lr_multiplier": getattr(
+            getattr(config, "screening", None),
+            "optimizer_lr_multiplier",
+            1.0,
+        ),
+        "screening_activation_step": getattr(
+            getattr(config, "screening", None),
+            "activation_step",
+            0,
+        ),
+        "screening_activation_warmup_steps": getattr(
+            getattr(config, "screening", None),
+            "activation_warmup_steps",
+            0,
+        ),
     }
 
 
@@ -181,10 +196,14 @@ def compute_v5_admission_floor_loss(
     ):
         zero = jnp.zeros((), dtype=jnp.float32)
         return zero, zero
+    curriculum_step = jnp.maximum(
+        jnp.asarray(training_step, dtype=jnp.float32)
+        - float(screening_config.activation_step),
+        0.0,
+    )
     anneal = jnp.clip(
         1.0
-        - jnp.asarray(training_step, dtype=jnp.float32)
-        / float(screening_config.admission_floor_steps),
+        - curriculum_step / float(screening_config.admission_floor_steps),
         0.0,
         1.0,
     )
@@ -202,7 +221,11 @@ def compute_v5_admission_floor_loss(
     return loss, target
 
 
-def compute_v5_write_budget_loss(write_rate, screening_config):
+def compute_v5_write_budget_loss(
+    write_rate,
+    screening_config,
+    slot_utilization=None,
+):
     """Return the v5 upper write-budget penalty and configured ceiling."""
 
     if (
@@ -219,7 +242,23 @@ def compute_v5_write_budget_loss(write_rate, screening_config):
     excess = jax.nn.relu(
         jnp.asarray(write_rate, dtype=jnp.float32) - target
     )
-    return screening_config.write_budget_weight * jnp.square(excess), target
+    enabled = jnp.ones((), dtype=jnp.float32)
+    minimum_utilization = float(
+        screening_config.write_budget_min_slot_utilization
+    )
+    if slot_utilization is not None and minimum_utilization > 0.0:
+        enabled = jax.lax.stop_gradient(
+            (
+                jnp.asarray(slot_utilization, dtype=jnp.float32)
+                >= minimum_utilization
+            ).astype(jnp.float32)
+        )
+    return (
+        screening_config.write_budget_weight
+        * enabled
+        * jnp.square(excess),
+        target,
+    )
 
 
 def compute_v5_self_index_loss(
@@ -238,10 +277,14 @@ def compute_v5_self_index_loss(
     ):
         zero = jnp.zeros((), dtype=jnp.float32)
         return zero, zero
+    curriculum_step = jnp.maximum(
+        jnp.asarray(training_step, dtype=jnp.float32)
+        - float(screening_config.activation_step),
+        0.0,
+    )
     anneal = jnp.clip(
         1.0
-        - jnp.asarray(training_step, dtype=jnp.float32)
-        / float(screening_config.self_index_loss_steps),
+        - curriculum_step / float(screening_config.self_index_loss_steps),
         0.0,
         1.0,
     )
@@ -437,24 +480,105 @@ def nnx_model_loss(
     write_budget_target = jnp.zeros((), dtype=jnp.float32)
     self_index_loss = jnp.zeros((), dtype=jnp.float32)
     self_index_weight = jnp.zeros((), dtype=jnp.float32)
+    per_layer_aux_metrics = {}
     if phase == "read_write" and "write_budget_rate" in normalized_stats:
-        admission_floor_loss, admission_floor_target = (
-            compute_v5_admission_floor_loss(
-                normalized_stats["write_budget_rate"],
-                normalized_stats["slot_utilization"],
-                active_model.config.screening,
+        cfg = active_model.config.screening
+        layer_inputs = []
+        for layer_idx in cfg.screened_layers:
+            prefix = f"screening_layer_{layer_idx}_"
+            realized_key = prefix + "write_budget_realized_rate"
+            if realized_key in normalized_stats:
+                layer_inputs.append(
+                    (
+                        layer_idx,
+                        normalized_stats[realized_key],
+                        normalized_stats[prefix + "slot_utilization"],
+                        normalized_stats.get(
+                            prefix + "self_index_raw_loss",
+                            jnp.zeros((), dtype=jnp.float32),
+                        ),
+                    )
+                )
+        if not layer_inputs:
+            layer_inputs.append(
+                (
+                    None,
+                    normalized_stats.get(
+                        "write_budget_realized_rate",
+                        normalized_stats["write_budget_rate"],
+                    ),
+                    normalized_stats["slot_utilization"],
+                    normalized_stats.get(
+                        "self_index_raw_loss",
+                        jnp.zeros((), dtype=jnp.float32),
+                    ),
+                )
+            )
+
+        floor_losses = []
+        floor_targets = []
+        budget_losses = []
+        budget_targets = []
+        self_losses = []
+        self_weights = []
+        activation = normalized_stats.get(
+            "screening_activation",
+            jnp.ones((), dtype=jnp.float32),
+        )
+        for layer_idx, realized_rate, utilization, raw_self_loss in layer_inputs:
+            layer_floor_loss, layer_floor_target = (
+                compute_v5_admission_floor_loss(
+                    realized_rate,
+                    utilization,
+                    cfg,
+                    training_step,
+                )
+            )
+            layer_budget_loss, layer_budget_target = (
+                compute_v5_write_budget_loss(
+                    realized_rate,
+                    cfg,
+                    slot_utilization=utilization,
+                )
+            )
+            layer_self_loss, layer_self_weight = compute_v5_self_index_loss(
+                raw_self_loss,
+                cfg,
                 training_step,
             )
-        )
-        write_budget_loss, write_budget_target = compute_v5_write_budget_loss(
-            normalized_stats["write_budget_rate"],
-            active_model.config.screening,
-        )
-        self_index_loss, self_index_weight = compute_v5_self_index_loss(
-            normalized_stats.get("self_index_raw_loss", jnp.zeros(())),
-            active_model.config.screening,
-            training_step,
-        )
+            layer_floor_loss *= activation
+            layer_budget_loss *= activation
+            layer_self_loss *= activation
+            floor_losses.append(layer_floor_loss)
+            floor_targets.append(layer_floor_target * activation)
+            budget_losses.append(layer_budget_loss)
+            budget_targets.append(layer_budget_target * activation)
+            self_losses.append(layer_self_loss)
+            self_weights.append(layer_self_weight * activation)
+            if layer_idx is not None:
+                prefix = f"screening_layer_{layer_idx}_"
+                per_layer_aux_metrics.update(
+                    {
+                        prefix + "admission_floor_loss": layer_floor_loss,
+                        prefix + "admission_floor_target": (
+                            layer_floor_target * activation
+                        ),
+                        prefix + "write_budget_loss": layer_budget_loss,
+                        prefix + "write_budget_target": (
+                            layer_budget_target * activation
+                        ),
+                        prefix + "self_index_loss": layer_self_loss,
+                        prefix + "self_index_weight": (
+                            layer_self_weight * activation
+                        ),
+                    }
+                )
+        admission_floor_loss = jnp.mean(jnp.stack(floor_losses))
+        admission_floor_target = jnp.mean(jnp.stack(floor_targets))
+        write_budget_loss = jnp.mean(jnp.stack(budget_losses))
+        write_budget_target = jnp.mean(jnp.stack(budget_targets))
+        self_index_loss = jnp.mean(jnp.stack(self_losses))
+        self_index_weight = jnp.mean(jnp.stack(self_weights))
         total_loss += (
             admission_floor_loss + write_budget_loss + self_index_loss
         ) * aux_loss_scale
@@ -467,6 +591,7 @@ def nnx_model_loss(
         "self_index_loss": self_index_loss,
         "self_index_weight": self_index_weight,
         **normalized_stats,
+        **per_layer_aux_metrics,
     }
     for key in (
         "rel_read_mean",
@@ -492,6 +617,9 @@ def nnx_model_loss(
         "eviction_usage_mean",
         "slot_utilization",
         "dead_slot_rate",
+        "short_bank_slot_utilization",
+        "mid_bank_slot_utilization",
+        "long_bank_slot_utilization",
         "slot_cosine_redundancy",
         "matched_erase_mass",
         "matched_write_mass",
@@ -503,6 +631,8 @@ def nnx_model_loss(
         "read_energy_mean",
         "write_saturation_rate",
         "write_budget_rate",
+        "hard_write_budget_rate",
+        "write_budget_realized_rate",
         "write_self_similarity",
         "read_self_similarity",
         "self_index_raw_loss",
@@ -511,6 +641,7 @@ def nnx_model_loss(
         "base_residual_rms",
         "screening_base_rms_ratio",
         "screening_residual_scale",
+        "screening_activation",
     ):
         metrics.setdefault(key, jnp.zeros(()))
     return total_loss, (metrics, current_rwkv, current_screen)

@@ -5,15 +5,29 @@ import jax.numpy as jnp
 from flax import nnx
 
 from ..model.screened_rwkv import cross_entropy_loss
+from ..model.state import reset_state_rows
 from ..train.train_step import train_step
 from ..train.nnx_train import NNXTrainState, nnx_model_loss
 from .metrics import aggregate_metrics
 from .sharding import host_batch_to_global_arrays
 
 
-def _state_inputs(dist, carry_state):
+def _state_inputs(dist, carry_state, batch=None):
     if carry_state:
-        return dist.rwkv_state, dist.screen_state
+        rwkv_state, screen_state = dist.rwkv_state, dist.screen_state
+        reset_mask = None if batch is None else batch.get("state_reset_mask")
+        if reset_mask is not None:
+            rwkv_state = reset_state_rows(
+                rwkv_state,
+                dist.initial_rwkv_state,
+                reset_mask,
+            )
+            screen_state = reset_state_rows(
+                screen_state,
+                dist.initial_screen_state,
+                reset_mask,
+            )
+        return rwkv_state, screen_state
     return dist.initial_rwkv_state, dist.initial_screen_state
 
 
@@ -36,7 +50,7 @@ def train_global_batch_data_parallel(
     carry_state=False,
     gradient_accumulation_steps=1,
 ):
-    rwkv_state, screen_state = _state_inputs(dist, carry_state)
+    rwkv_state, screen_state = _state_inputs(dist, carry_state, global_batch)
     train_state, rwkv_state, screen_state, metrics = train_step(
         dist.train_state,
         global_batch,
@@ -184,7 +198,7 @@ def evaluate_global_batch_data_parallel(
     phase="read_screening_only",
     carry_state=False,
 ):
-    rwkv_state, screen_state = _state_inputs(dist, carry_state)
+    rwkv_state, screen_state = _state_inputs(dist, carry_state, global_batch)
     metrics, _, _ = eval_step_data_parallel(
         dist.train_state,
         global_batch,

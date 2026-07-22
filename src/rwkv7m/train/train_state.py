@@ -69,24 +69,61 @@ def rwkv_w0_mask_fn(params):
     return flax.traverse_util.unflatten_dict(mask)
 
 
-def create_optimizer(config, total_steps=10000):
+def screening_mask_fn(params):
+    """Select parameters owned by versioned per-layer Screening modules."""
+
+    def is_screening_path(path):
+        return any("screening_" in str(part) for part in path)
+
+    if isinstance(params, nnx.State):
+        return nnx.from_flat_state(
+            (path, is_screening_path(path))
+            for path, _ in nnx.to_flat_state(params)
+        )
+    flat = flax.traverse_util.flatten_dict(params)
+    mask = {path: is_screening_path(path) for path in flat}
+    return flax.traverse_util.unflatten_dict(mask)
+
+
+def screening_optimizer_scale(config):
+    multiplier = float(config.get("screening_lr_multiplier", 1.0))
+    activation_step = int(config.get("screening_activation_step", 0))
+    warmup_steps = int(config.get("screening_activation_warmup_steps", 0))
+
+    def schedule(count):
+        progress = jnp.asarray(count, dtype=jnp.float32) - float(
+            activation_step
+        )
+        if warmup_steps > 0:
+            activation = jnp.clip(progress / float(warmup_steps), 0.0, 1.0)
+        else:
+            activation = (progress >= 0.0).astype(jnp.float32)
+        return multiplier * activation
+
+    return schedule
+
+
+def create_learning_rate_schedule(config, total_steps=10000):
     total_steps = max(int(total_steps), 1)
     warmup_steps = min(config.get("warmup_steps", 100), max(total_steps - 1, 0))
     if config.get("lr_schedule", "optax_cosine") == "rwkv":
-        lr_schedule = rwkv_warmup_cosine_schedule(
+        return rwkv_warmup_cosine_schedule(
             config.get("lr_init", 6e-4),
             config.get("lr_final", 1e-5),
             warmup_steps,
             total_steps,
         )
-    else:
-        lr_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=config.get("lr_init", 6e-4),
-            warmup_steps=warmup_steps,
-            decay_steps=total_steps,
-            end_value=config.get("lr_final", 1e-5),
-        )
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config.get("lr_init", 6e-4),
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,
+        end_value=config.get("lr_final", 1e-5),
+    )
+
+
+def create_optimizer(config, total_steps=10000):
+    lr_schedule = create_learning_rate_schedule(config, total_steps)
 
     optimizer_state_dtype = jnp.dtype(
         config.get("optimizer_state_dtype", "float32")
@@ -106,6 +143,16 @@ def create_optimizer(config, total_steps=10000):
             moment_dtype=optimizer_state_dtype,
             decay_mask_fn=decay_mask_fn,
             w0_mask_fn=rwkv_w0_mask_fn,
+            screening_mask_fn=screening_mask_fn,
+            screening_learning_rate_multiplier=config.get(
+                "screening_lr_multiplier", 1.0
+            ),
+            screening_activation_step=config.get(
+                "screening_activation_step", 0
+            ),
+            screening_activation_warmup_steps=config.get(
+                "screening_activation_warmup_steps", 0
+            ),
             lowering=lowering,
         )
     adamw = optax.adamw(
@@ -140,5 +187,9 @@ def create_optimizer(config, total_steps=10000):
         optax.clip_by_global_norm(config.get("max_grad_norm", 1.0)),
         adamw_with_state_dtype,
         optax.masked(optax.scale(2.0), rwkv_w0_mask_fn),
+        optax.masked(
+            optax.scale_by_schedule(screening_optimizer_scale(config)),
+            screening_mask_fn,
+        ),
     )
     return tx

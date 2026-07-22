@@ -16,7 +16,7 @@ from .model.nnx_model import (
     initialize_nnx_model,
 )
 from .model.nnx_conversion import load_linen_params_into_nnx
-from .model.state import init_screen_state
+from .model.state import init_screen_state, reset_state_rows
 from .tokenizer import RWKVTokenizer
 from .io.config import load_model_config
 from .train.train_step import train_step
@@ -196,6 +196,18 @@ def train_batch(
     if carry_state:
         rwkv_state = runtime.rwkv_state
         screen_state = runtime.screen_state
+        reset_mask = batch.get("state_reset_mask")
+        if reset_mask is not None:
+            rwkv_state = reset_state_rows(
+                rwkv_state,
+                runtime.initial_rwkv_state,
+                reset_mask,
+            )
+            screen_state = reset_state_rows(
+                screen_state,
+                runtime.initial_screen_state,
+                reset_mask,
+            )
     else:
         batch_size = int(batch["input_ids"].shape[0])
         if batch_size == runtime.batch_size:
@@ -232,11 +244,18 @@ def train_binidx(
     phase="read_screening_only",
     carry_state: bool = False,
     sampling_mode: str = "magic",
+    loss_mask_after_token: int | None = None,
     print_every: int | None = None,
     gradient_accumulation_steps: int = 1,
 ):
-    if carry_state and sampling_mode != "sequential":
-        raise ValueError("carry_state training requires sampling_mode='sequential'")
+    if carry_state and sampling_mode not in {
+        "sequential",
+        "document_sequential",
+    }:
+        raise ValueError(
+            "carry_state training requires sequential or "
+            "document_sequential sampling"
+        )
     dataset = create_binidx_dataset(
         data_file,
         ctx_len=ctx_len,
@@ -244,6 +263,7 @@ def train_binidx(
         magic_prime=magic_prime,
         epoch_steps=num_steps,
         sampling_mode=sampling_mode,
+        loss_mask_after_token=loss_mask_after_token,
     )
     runtime, train_state = create_train_runtime(
         rng_key,

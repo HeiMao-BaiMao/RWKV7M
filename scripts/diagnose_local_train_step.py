@@ -19,6 +19,7 @@ from rwkv7m.distributed.checkpoint import (
 from rwkv7m.io import load_model_config
 from rwkv7m.io.config import model_config_to_dict
 from rwkv7m.train.nnx_train import nnx_model_loss
+from rwkv7m.train.train_state import create_learning_rate_schedule
 
 
 def parse_args(argv=None):
@@ -58,6 +59,27 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument(
+        "--component-gradients",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "also differentiate CE, admission floor, write budget, and "
+            "self-index losses independently"
+        ),
+    )
+    parser.add_argument(
+        "--include-update",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="apply one diagnostic optimizer update and summarize its norm",
+    )
+    parser.add_argument(
+        "--optimizer-total-steps",
+        type=int,
+        default=10000,
+        help="optimizer horizon used to report LR and perform the optional update",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--require-finite",
@@ -69,6 +91,8 @@ def parse_args(argv=None):
         parser.error("--top-k must be positive")
     if args.sequence_chunk_size is not None and args.sequence_chunk_size < 0:
         parser.error("--sequence-chunk-size must be non-negative")
+    if args.optimizer_total_steps <= 0:
+        parser.error("--optimizer-total-steps must be positive")
     return args
 
 
@@ -115,6 +139,27 @@ def summarize_gradient_state(gradients, *, top_k):
         key=lambda record: record["max_abs_finite"],
         reverse=True,
     )[:top_k]
+    group_records = {}
+    for group_name, predicate in (
+        ("all", lambda _: True),
+        ("screening", lambda path: "screening_" in path),
+        ("trunk", lambda path: "screening_" not in path),
+    ):
+        selected = [record for record in records if predicate(record["path"])]
+        group_records[group_name] = {
+            "leaf_count": len(selected),
+            "nonfinite_value_count": sum(
+                record["nonfinite_count"] for record in selected
+            ),
+            "l2_norm_finite": float(
+                sum(record["l2_norm_finite"] ** 2 for record in selected)
+                ** 0.5
+            ),
+            "max_abs_finite": max(
+                (record["max_abs_finite"] for record in selected),
+                default=0.0,
+            ),
+        }
     return {
         "leaf_count": len(records),
         "nonfinite_leaf_count": len(nonfinite_records),
@@ -123,7 +168,27 @@ def summarize_gradient_state(gradients, *, top_k):
         ),
         "nonfinite_gradients": nonfinite_records,
         "largest_finite_gradients": largest,
+        "groups": group_records,
     }
+
+
+def _optimizer_config(config):
+    return {
+        "lr_init": config.lr_init,
+        "lr_final": config.lr_final,
+        "warmup_steps": config.warmup_steps,
+        "lr_schedule": config.lr_schedule,
+    }
+
+
+def _parameter_delta(before, after):
+    return jax.tree.map(
+        lambda left, right: (
+            right.astype(jnp.float32) - left.astype(jnp.float32)
+        ),
+        before,
+        after,
+    )
 
 
 def main(argv=None):
@@ -175,7 +240,7 @@ def main(argv=None):
         jax.random.key(args.seed),
         config,
         batch_size=batch_size,
-        total_steps=max(checkpoint_step + 2, 2),
+        total_steps=args.optimizer_total_steps,
     )
     if checkpoint_path is not None:
         train_state, restored = restore_distributed_train_state(
@@ -194,9 +259,9 @@ def main(argv=None):
         nnx.update(train_state.model, promoted_params)
     graphdef, params = nnx.split(train_state.model, nnx.Param)
 
-    def loss_function(active_params):
+    def loss_outputs(active_params):
         model = nnx.merge(graphdef, active_params)
-        loss, _ = nnx_model_loss(
+        loss, (metrics, _, _) = nnx_model_loss(
             model,
             batch,
             runtime.initial_rwkv_state,
@@ -206,11 +271,60 @@ def main(argv=None):
             include_l2wrap=True,
             training_step=jnp.asarray(checkpoint_step, dtype=jnp.uint32),
         )
+        return loss, metrics
+
+    def loss_function(active_params):
+        loss, _ = loss_outputs(active_params)
         return loss
 
     loss, gradients = jax.jit(jax.value_and_grad(loss_function))(params)
     jax.block_until_ready((loss, gradients))
     summary = summarize_gradient_state(gradients, top_k=args.top_k)
+    component_summaries = None
+    if args.component_gradients:
+        component_summaries = {}
+        for component_name, metric_name in (
+            ("cross_entropy", "loss"),
+            ("admission_floor", "admission_floor_loss"),
+            ("write_budget", "write_budget_loss"),
+            ("self_index", "self_index_loss"),
+        ):
+            def component_loss(active_params, metric_name=metric_name):
+                _, metrics = loss_outputs(active_params)
+                return metrics[metric_name]
+
+            component_value, component_gradient = jax.jit(
+                jax.value_and_grad(component_loss)
+            )(params)
+            jax.block_until_ready((component_value, component_gradient))
+            component_summaries[component_name] = {
+                "value": float(component_value),
+                "gradients": summarize_gradient_state(
+                    component_gradient,
+                    top_k=args.top_k,
+                ),
+            }
+
+    update_summary = None
+    if args.include_update:
+        if args.float32_model:
+            raise SystemExit(
+                "--include-update cannot be combined with --float32-model"
+            )
+        before_params = nnx.state(train_state.model, nnx.Param)
+        train_state.optimizer.update(train_state.model, gradients)
+        after_params = nnx.state(train_state.model, nnx.Param)
+        parameter_delta = _parameter_delta(before_params, after_params)
+        jax.block_until_ready(parameter_delta)
+        update_summary = summarize_gradient_state(
+            parameter_delta,
+            top_k=args.top_k,
+        )
+
+    lr_schedule = create_learning_rate_schedule(
+        _optimizer_config(config),
+        args.optimizer_total_steps,
+    )
     payload = {
         "loss": float(loss),
         "loss_finite": bool(jnp.isfinite(loss)),
@@ -220,6 +334,8 @@ def main(argv=None):
         "model_config": str(Path(args.model_config)),
         "checkpoint": None if checkpoint_path is None else str(checkpoint_path),
         "training_step": int(checkpoint_step),
+        "learning_rate": float(lr_schedule(checkpoint_step)),
+        "optimizer_total_steps": int(args.optimizer_total_steps),
         "sequence_chunk_size": config.sequence_chunk_size,
         "float32_model": bool(args.float32_model),
         "devices": [
@@ -231,6 +347,8 @@ def main(argv=None):
             for device in jax.devices()
         ],
         "gradients": summary,
+        "component_gradients": component_summaries,
+        "parameter_update": update_summary,
     }
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)

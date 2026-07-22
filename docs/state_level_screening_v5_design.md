@@ -64,12 +64,15 @@ An upper write budget cannot prevent the model from choosing never-write.
 The NNX training loss therefore supports an opt-in temporary lower floor:
 
 ```text
-target(step) =
+target(layer, step) =
     initial_target
     * max(1 - step / warmup_steps, 0)
-    * remaining_empty_fraction
+    * remaining_empty_fraction(layer)
 
-loss = weight * relu(target(step) - mean(novel_soft * admission_soft))^2
+realized_rate = soft_rate + stop_gradient(hard_rate - soft_rate)
+loss = mean_layer(
+    weight * relu(target(layer, step) - realized_rate(layer))^2
+)
 ```
 
 The loss is zero after warm-up and when the memory is full. It does not impose
@@ -77,7 +80,26 @@ a permanent write quota. The tracked examples use an initial target of 0.05,
 weight 0.1, and 2,000 steps; these are experiment defaults, not validated
 optima. `admission_floor_loss`, `admission_floor_target`, accepted novel rate,
 read/write rates, residual RMS, and memory-on/off causal deltas must be reported
-together. A nonzero admission rate alone is not evidence that memory helps.
+together. The forward constraint now observes actual hard allocations while
+its gradient follows the continuous novelty/admission path. Applying the
+hinge before the layer reduction prevents one active layer from satisfying the
+floor for a collapsed layer. A nonzero admission rate alone is not evidence
+that memory helps.
+
+The upper write budget is also evaluated per layer with the same
+hard-forward/soft-backward rate. A configurable occupied-slot threshold keeps
+that upper penalty disabled during empty-memory bootstrap. The tracked
+profiles use 50% utilization; this is an experiment setting, not a validated
+optimum.
+
+The tracked profiles now keep Screening recurrence, residual, auxiliary
+losses, and optimizer updates disabled for the first 100 trunk steps. The
+recurrence starts after that boundary with hard occupancy intact, while the
+residual, auxiliary loss, and optimizer update scales ramp linearly over 100
+steps. Screening optimizer updates additionally use a 0.1 multiplier. The
+optimizer gate includes AdamW decay, so "disabled" does not silently modify
+Screening kernels through weight decay. Curriculum clocks start at Screening
+activation rather than at global step zero.
 
 During the same 2,000-step interval, the tracked configs keep the effective
 screening residual scale at or above 0.01 (before the read-tile scaling). The
@@ -99,10 +121,10 @@ margin. Selection and admission are stopped hard decisions for this loss, so
 the objective trains query/key geometry without rewarding admission collapse.
 It anneals to zero after 2,000 steps.
 
-An independent upper write budget penalizes
-`mean(admission_soft * novel_soft)` above the configured ceiling. This is
-required by the 0.3B all-novel/all-write observation; the lower admission floor
-alone cannot distinguish healthy writes from saturation.
+An independent upper write budget penalizes the per-layer realized hard-write
+surrogate above the configured ceiling. This is required by the 0.3B
+all-novel/all-write observation; the lower admission floor alone cannot
+distinguish healthy writes from saturation.
 
 ## Deliberately gated paths
 
@@ -134,7 +156,9 @@ allocation, rejected writes, chunk invariance, the FP32-v5/BF16-parameter
 boundary, a full tiny-model loss/gradient pass, the temporary admission floor,
 the Gaussian-null threshold value, below-threshold smooth-read gradients,
 self-index geometry gradients, the upper write budget, the memory-off residual
-override, and the first versioned golden vector.
+override, hard-forward layerwise budgets, staged recurrence/optimizer
+activation, document-aligned state reset, answer-only loss masks, and the first
+versioned golden vector.
 
 On 2026-07-22, the tracked recovery profile was repeated on one MI300X. The
 0.185B configuration completed all 2,000 curriculum steps (32.77M tokens), and
@@ -162,8 +186,19 @@ counterfactual memory ablation, parameter/compute-matched controls, and real
 accelerator gates must pass before this path is called beneficial or
 production-ready.
 
-The next recovery iteration must expose and constrain write/read behavior per
-screened layer and bank, and must bootstrap empty-capacity allocation without
-forcing permanent writes. Retention, v5 checkpoint reconstruction, and v5
-Pallas optimization remain gated until multi-slot use and a positive causal
-counterfactual are demonstrated.
+The next recovery iteration now exposes and constrains write/read behavior per
+screened layer and bank and bootstraps empty capacity without enabling the
+upper budget prematurely. GPU validation remains pending. Retention, v5
+checkpoint reconstruction, and v5 Pallas optimization remain gated until
+multi-slot use and a positive causal counterfactual are demonstrated.
+
+## Retrieval evaluation vehicle
+
+`rwkv7m-prepare-retrieval` creates document-aligned delayed key/value data with
+distractors. Training uses one complete document in one optimizer step with
+recurrent chunking and an answer-only mask. This is necessary because merely
+carrying state between optimizer steps truncates the gradient from a later
+answer back to an earlier write. Streaming evaluation separately uses
+`document_sequential` sampling, row-selective state resets, and the same
+answer-only mask. It reports retrieval accuracy and memory-off deltas in
+addition to loss.

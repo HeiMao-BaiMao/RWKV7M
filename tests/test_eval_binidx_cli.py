@@ -4,6 +4,10 @@ import numpy as np
 from rwkv7m import create_runtime, save_model_safetensors, tiny_config
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 from rwkv7m.cli.eval_binidx import evaluate_binidx, parse_args
+from rwkv7m.cli.prepare_retrieval import (
+    ANSWER_MARKER_TOKEN,
+    build_retrieval_dataset,
+)
 
 
 def write_eval_binidx(tmp_path):
@@ -222,3 +226,62 @@ def test_eval_binidx_carry_state_requires_sequential_sampling(tmp_path):
         assert "--carry-state requires --sampling-mode sequential" in str(exc)
     else:
         raise AssertionError("carry-state eval with magic sampling should fail")
+
+
+def test_eval_binidx_reports_answer_only_streaming_retrieval_metrics(tmp_path):
+    prefix = str(tmp_path / "retrieval")
+    build_retrieval_dataset(
+        prefix,
+        documents=2,
+        ctx_len=16,
+        chunks_per_document=3,
+        vocab_size=128,
+        key_count=32,
+        distractors=2,
+        seed=8,
+    )
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--ctx-len",
+            "16",
+            "--batch-size",
+            "1",
+            "--steps",
+            "3",
+            "--vocab-size",
+            "128",
+            "--d-model",
+            "32",
+            "--d-ffn",
+            "64",
+            "--n-layers",
+            "2",
+            "--n-heads",
+            "2",
+            "--head-size",
+            "16",
+            "--d-slot",
+            "16",
+            "--d-k",
+            "16",
+            "--d-v",
+            "16",
+            "--sampling-mode",
+            "document_sequential",
+            "--carry-state",
+            "--loss-mask-after-token",
+            str(ANSWER_MARKER_TOKEN),
+            "--phase",
+            "read_write",
+            "--memory-off-counterfactual",
+            "--print-every",
+            "0",
+        ]
+    )
+    metrics = evaluate_binidx(args)
+    assert metrics["loss_mask_positions"] == 1
+    assert 0.0 <= metrics["masked_accuracy"] <= 1.0
+    assert 0.0 <= metrics["memory_off_masked_accuracy"] <= 1.0
+    assert np.isfinite(metrics["memory_accuracy_delta"])

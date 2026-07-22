@@ -51,6 +51,7 @@ from rwkv7m.train import (
     compute_v5_self_index_loss,
     compute_v5_write_budget_loss,
     create_nnx_train_state,
+    nnx_model_loss,
     nnx_train_step,
 )
 
@@ -208,6 +209,12 @@ def test_v5_config_rejects_unsafe_or_incomplete_contracts():
             self_index_loss_weight=0.1,
             self_index_loss_steps=0,
         )
+    with pytest.raises(ValueError, match="activation_step"):
+        _v5_screening_config(activation_step=-1)
+    with pytest.raises(ValueError, match="optimizer_lr_multiplier"):
+        _v5_screening_config(optimizer_lr_multiplier=0.0)
+    with pytest.raises(ValueError, match="write_budget_min_slot_utilization"):
+        _v5_screening_config(write_budget_min_slot_utilization=1.1)
 
 
 def test_v5_example_configs_roundtrip():
@@ -633,6 +640,26 @@ def test_write_budget_penalizes_only_rates_above_the_ceiling():
     assert gradient > 0.0
 
 
+def test_write_budget_waits_for_per_layer_bootstrap_utilization():
+    config = _v5_screening_config(
+        write_budget_target_max=0.1,
+        write_budget_weight=0.5,
+        write_budget_min_slot_utilization=0.5,
+    )
+    waiting, _ = compute_v5_write_budget_loss(
+        jnp.asarray(0.8),
+        config,
+        slot_utilization=jnp.asarray(0.25),
+    )
+    enabled, _ = compute_v5_write_budget_loss(
+        jnp.asarray(0.8),
+        config,
+        slot_utilization=jnp.asarray(0.5),
+    )
+    assert waiting == 0.0
+    assert enabled > 0.0
+
+
 def test_self_index_curriculum_anneals_without_changing_raw_metric():
     config = _v5_screening_config(
         self_index_loss_weight=0.5,
@@ -876,7 +903,7 @@ def test_nnx_v5_full_train_step_has_finite_loss_and_gradients():
     assert statistics["write_saturation_rate"] >= 0.0
 
 
-def test_nnx_train_step_applies_enabled_admission_floor():
+def test_nnx_train_step_uses_hard_forward_write_rate_for_auxiliary_losses():
     config = tiny_config(
         vocab_size=16,
         d_model=32,
@@ -911,12 +938,88 @@ def test_nnx_train_step_applies_enabled_admission_floor():
         phase="read_write",
     )
     assert metrics["admission_floor_target"] > 0.0
-    assert metrics["admission_floor_loss"] > 0.0
+    assert metrics["write_budget_realized_rate"] == metrics[
+        "hard_write_budget_rate"
+    ]
+    assert metrics["admission_floor_loss"] == 0.0
     assert metrics["write_budget_loss"] > 0.0
     assert metrics["self_index_weight"] > 0.0
     assert jnp.isfinite(metrics["self_index_loss"])
     assert metrics["read_soft_warmup_alpha"] == 1.0
     assert metrics["total_loss"] > metrics["loss"]
+
+
+def test_nnx_v5_staged_activation_preserves_empty_state_then_ramps():
+    config = _v5_screening_config(
+        activation_step=2,
+        activation_warmup_steps=2,
+    )
+    module = NNXStateLevelScreening(config, rngs=nnx.Rngs(13))
+    state = LayerScreenState(
+        slots=jnp.zeros((1, 4, 16), dtype=jnp.float32),
+        ages=jnp.zeros((1, 4), dtype=jnp.float32),
+        usage_ema=jnp.zeros((1, 4), dtype=jnp.float32),
+        occupancy=jnp.zeros((1, 4), dtype=jnp.float32),
+    )
+    x = jax.random.normal(jax.random.key(14), (1, 2, 32))
+    h = jax.random.normal(jax.random.key(15), (1, 2, 32))
+    disabled, disabled_state, disabled_stats = module(
+        x,
+        h,
+        state,
+        phase="read_write",
+        deterministic=False,
+        training_step=jnp.asarray(1),
+    )
+    _, _, ramp_stats = module(
+        x,
+        h,
+        state,
+        phase="read_write",
+        deterministic=False,
+        training_step=jnp.asarray(3),
+    )
+    assert jnp.array_equal(disabled, h)
+    assert jnp.array_equal(disabled_state.slots, state.slots)
+    assert jnp.array_equal(disabled_state.occupancy, state.occupancy)
+    assert disabled_stats["screening_activation"] == 0.0
+    assert ramp_stats["screening_activation"] == 0.5
+
+
+def test_nnx_v5_exposes_layer_metrics_and_layerwise_auxiliary_losses():
+    config = tiny_config(
+        vocab_size=16,
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        head_size=8,
+    )
+    config.screening = _v5_screening_config(
+        screened_layers=(0, 1),
+        admission_floor_target_initial=0.5,
+        admission_floor_weight=0.5,
+        admission_floor_steps=10,
+    )
+    config.lm_head_init = "variance_scaled"
+    model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(16))
+    _, (metrics, _, _) = nnx_model_loss(
+        model,
+        {
+            "input_ids": jnp.asarray([[1, 2]], dtype=jnp.int32),
+            "target_ids": jnp.asarray([[2, 3]], dtype=jnp.int32),
+        },
+        init_rwkv_state(1, config),
+        init_screen_state(1, config.screening),
+        phase="read_write",
+        deterministic=False,
+        include_l2wrap=False,
+        training_step=jnp.asarray(0),
+    )
+    for layer_idx in (0, 1):
+        prefix = f"screening_layer_{layer_idx}_"
+        assert prefix + "slot_utilization" in metrics
+        assert prefix + "write_budget_realized_rate" in metrics
+        assert prefix + "admission_floor_loss" in metrics
 
 
 def test_nnx_v5_size_one_explicit_mesh_forward():

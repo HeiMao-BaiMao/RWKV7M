@@ -187,6 +187,7 @@ def create_host_binidx_dataset(
     data_axis_size=None,
     data_shard_indices=None,
     sampling_mode="magic",
+    loss_mask_after_token=None,
 ):
     process_index = jax.process_index() if process_index is None else int(process_index)
     process_count = jax.process_count() if process_count is None else int(process_count)
@@ -218,6 +219,7 @@ def create_host_binidx_dataset(
                         rank=data_shard_index,
                         world_size=layout.data_axis_size,
                         sampling_mode=sampling_mode,
+                        loss_mask_after_token=loss_mask_after_token,
                     )
                 )
         except Exception:
@@ -235,6 +237,7 @@ def create_host_binidx_dataset(
             rank=process_index,
             world_size=process_count,
             sampling_mode=sampling_mode,
+            loss_mask_after_token=loss_mask_after_token,
         )
     return HostBinIdxDataset(
         dataset=dataset,

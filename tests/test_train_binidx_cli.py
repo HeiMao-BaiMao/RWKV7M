@@ -1,7 +1,7 @@
 import numpy as np
 
 from rwkv7m import load_train_checkpoint_metadata
-from rwkv7m.cli.train_binidx import parse_args, run_training
+from rwkv7m.cli.train_binidx import build_config, parse_args, run_training
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 
 
@@ -114,3 +114,35 @@ def test_train_binidx_cli_carry_state_saves_runtime_state(tmp_path):
     _, payload = load_train_checkpoint_metadata(checkpoint)
     assert payload["metadata"]["carry_state"] is True
     assert payload["metadata"]["sampling_mode"] == "sequential"
+
+
+def test_model_config_allows_experiment_only_recovery_overrides(tmp_path):
+    prefix = write_train_binidx(tmp_path)
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--ctx-len",
+            "4",
+            "--model-config",
+            "configs/rwkv7m-0.185b-screening-v5-core.json.example",
+            "--warmup-steps",
+            "10",
+            "--screening-activation-step",
+            "0",
+            "--screening-activation-warmup-steps",
+            "0",
+            "--screening-optimizer-lr-multiplier",
+            "1.0",
+            "--screening-write-budget-min-slot-utilization",
+            "0.0",
+            "--no-screening",
+        ]
+    )
+    config = build_config(args)
+    assert config.warmup_steps == 10
+    assert config.screening.activation_step == 0
+    assert config.screening.activation_warmup_steps == 0
+    assert config.screening.optimizer_lr_multiplier == 1.0
+    assert config.screening.write_budget_min_slot_utilization == 0.0
+    assert config.use_screening is False

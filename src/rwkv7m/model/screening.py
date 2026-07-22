@@ -488,6 +488,16 @@ class ScreeningConfig:
     self_index_margin: float = 0.0
     self_index_loss_weight: float = 0.0
     self_index_loss_steps: int = 0
+    # Keep Screening inert while the RWKV trunk crosses its initial optimizer
+    # transient. At activation, recurrence, residual, and v5 auxiliary losses
+    # become live together.
+    activation_step: int = 0
+    activation_warmup_steps: int = 0
+    # Independent optimizer update multiplier for Screening parameters.
+    optimizer_lr_multiplier: float = 1.0
+    # Delay the upper write budget until each screened layer has bootstrapped
+    # this occupied-slot fraction.
+    write_budget_min_slot_utilization: float = 0.0
 
     def __post_init__(self):
         self.screened_layers = tuple(self.screened_layers)
@@ -661,7 +671,21 @@ class ScreeningConfig:
             raise ValueError(
                 "an enabled self-index loss requires self_index_loss_steps > 0"
             )
+        if self.activation_step < 0:
+            raise ValueError("activation_step must be non-negative")
+        if self.activation_warmup_steps < 0:
+            raise ValueError("activation_warmup_steps must be non-negative")
+        if not 0.0 < self.optimizer_lr_multiplier <= 1.0:
+            raise ValueError(
+                "optimizer_lr_multiplier must be in (0, 1]"
+            )
+        if not 0.0 <= self.write_budget_min_slot_utilization <= 1.0:
+            raise ValueError(
+                "write_budget_min_slot_utilization must be in [0, 1]"
+            )
         if semantics_version in {"screening-v5-core", "screening-v5-retention"}:
+            if len(self.bank_ids) != self.n_slots:
+                raise ValueError("v5 semantics requires explicit bank_ids")
             if self.gate_space != "value":
                 raise ValueError("v5 semantics requires gate_space='value'")
             if self.candidate_rank is None:
@@ -693,6 +717,10 @@ class ScreeningConfig:
             or self.self_index_margin > 0.0
             or self.self_index_loss_weight > 0.0
             or self.self_index_loss_steps > 0
+            or self.activation_step > 0
+            or self.activation_warmup_steps > 0
+            or self.optimizer_lr_multiplier != 1.0
+            or self.write_budget_min_slot_utilization > 0.0
         ):
             raise ValueError(
                 "anti-starvation curricula are defined only for v5 semantics"

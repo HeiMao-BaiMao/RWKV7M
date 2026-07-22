@@ -247,6 +247,7 @@ class ScreenedRWKVModel(nn.Module):
         v_first = jnp.zeros_like(x)
 
         all_stats = []
+        layer_stats = {}
         new_rwkv_layers = list(rwkv_state)
         new_screen_layers = list(screen_state.layers)
 
@@ -273,6 +274,12 @@ class ScreenedRWKVModel(nn.Module):
             new_rwkv_layers[l_idx] = new_rwkv_s
             if l_idx in screened_idx:
                 new_screen_layers[screened_idx[l_idx]] = new_scr_s
+                layer_stats.update(
+                    {
+                        f"screening_layer_{l_idx}_{key}": value
+                        for key, value in stats.items()
+                    }
+                )
             all_stats.append(stats)
 
         x = self.final_ln(x.astype(jnp.float32))
@@ -291,6 +298,7 @@ class ScreenedRWKVModel(nn.Module):
             vals = [s[key] for s in all_stats if s and key in s]
             if vals:
                 agg_stats[key] = jnp.mean(jnp.array(vals))
+        agg_stats.update(layer_stats)
 
         return logits, new_rwkv_state, new_screen_state, agg_stats
 

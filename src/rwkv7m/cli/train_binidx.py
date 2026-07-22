@@ -86,7 +86,9 @@ def build_config(args):
         screening=screening,
         lr_init=args.lr_init,
         lr_final=args.lr_final,
-        warmup_steps=args.warmup_steps,
+        warmup_steps=(
+            10 if args.warmup_steps is None else args.warmup_steps
+        ),
         lr_schedule=args.lr_schedule,
         max_grad_norm=args.max_grad_norm,
         weight_decay=args.weight_decay,
@@ -129,7 +131,17 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--magic-prime", type=int, default=None)
-    parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
+    parser.add_argument(
+        "--loss-mask-after-token",
+        type=int,
+        default=None,
+        help="train only targets immediately following this input token",
+    )
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["magic", "sequential", "document", "document_sequential"],
+        default="magic",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
@@ -162,7 +174,12 @@ def parse_args(argv=None):
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)
-    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="optimizer warmup override; model-config value is kept when omitted",
+    )
     parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default="optax_cosine")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.001)
@@ -266,6 +283,10 @@ def _run_eval(args, checkpoint_dir, step):
         eval_argv.append("--carry-state")
     if args.magic_prime is not None:
         eval_argv.extend(["--magic-prime", str(args.magic_prime)])
+    if args.loss_mask_after_token is not None:
+        eval_argv.extend(
+            ["--loss-mask-after-token", str(args.loss_mask_after_token)]
+        )
     eval_args = parse_eval_args(eval_argv)
     metrics = evaluate_binidx(eval_args)
     print(
@@ -276,8 +297,14 @@ def _run_eval(args, checkpoint_dir, step):
 
 
 def run_training(args):
-    if args.carry_state and args.sampling_mode != "sequential":
-        raise ValueError("--carry-state requires --sampling-mode sequential")
+    if args.carry_state and args.sampling_mode not in {
+        "sequential",
+        "document_sequential",
+    }:
+        raise ValueError(
+            "--carry-state requires --sampling-mode sequential or "
+            "document_sequential"
+        )
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
     if args.batch_size % args.gradient_accumulation_steps != 0:
@@ -313,6 +340,7 @@ def run_training(args):
         magic_prime=args.magic_prime,
         epoch_steps=max(args.steps, 1),
         sampling_mode=args.sampling_mode,
+        loss_mask_after_token=args.loss_mask_after_token,
     )
     total_steps = max(start_step + args.steps, 1)
     runtime, train_state = create_train_runtime(

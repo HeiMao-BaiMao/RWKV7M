@@ -152,3 +152,58 @@ def test_optimizer_applies_upstream_two_x_learning_rate_to_w0():
     assert float(updates["att"]["w0"][0]) == pytest.approx(
         2.0 * float(updates["att"]["a0"][0]), rel=1e-6
     )
+
+
+def test_optimizer_can_lower_screening_parameter_learning_rate():
+    params = {
+        "layer_0": {
+            "screening_0": {"kernel": jnp.ones((1,), dtype=jnp.float32)},
+            "rwkv_block_0": {"kernel": jnp.ones((1,), dtype=jnp.float32)},
+        }
+    }
+    gradients = jax.tree.map(jnp.ones_like, params)
+    optimizer = create_optimizer(
+        {
+            "lr_schedule": "rwkv",
+            "lr_init": 1e-3,
+            "lr_final": 1e-3,
+            "warmup_steps": 0,
+            "weight_decay": 0.0,
+            "max_grad_norm": 100.0,
+            "screening_lr_multiplier": 0.1,
+        },
+        total_steps=1,
+    )
+    updates, _ = optimizer.update(gradients, optimizer.init(params), params)
+    screening_update = updates["layer_0"]["screening_0"]["kernel"][0]
+    trunk_update = updates["layer_0"]["rwkv_block_0"]["kernel"][0]
+    assert float(screening_update) == pytest.approx(
+        0.1 * float(trunk_update),
+        rel=1e-6,
+    )
+
+
+def test_optimizer_freezes_screening_updates_before_activation():
+    params = {
+        "layer_0": {
+            "screening_0": {"kernel": jnp.ones((1,), dtype=jnp.float32)},
+            "rwkv_block_0": {"kernel": jnp.ones((1,), dtype=jnp.float32)},
+        }
+    }
+    gradients = jax.tree.map(jnp.ones_like, params)
+    optimizer = create_optimizer(
+        {
+            "lr_schedule": "rwkv",
+            "lr_init": 1e-3,
+            "lr_final": 1e-3,
+            "warmup_steps": 0,
+            "weight_decay": 0.1,
+            "max_grad_norm": 100.0,
+            "screening_activation_step": 2,
+        },
+        total_steps=3,
+    )
+    state = optimizer.init(params)
+    first_updates, state = optimizer.update(gradients, state, params)
+    assert first_updates["layer_0"]["screening_0"]["kernel"][0] == 0.0
+    assert first_updates["layer_0"]["rwkv_block_0"]["kernel"][0] != 0.0

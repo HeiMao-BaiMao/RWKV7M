@@ -1,4 +1,5 @@
 from flax import struct
+import jax
 import jax.numpy as jnp
 
 from .screening import is_v5_semantics
@@ -68,3 +69,25 @@ def init_rwkv_state(batch_size, config):
 
 def tuple_set(xs, i, x):
     return xs[:i] + (x,) + xs[i + 1 :]
+
+
+def reset_state_rows(current_state, initial_state, reset_mask):
+    """Reset selected batch rows without disturbing other stream lanes."""
+
+    reset_mask = jnp.asarray(reset_mask, dtype=jnp.bool_)
+    if reset_mask.ndim != 1:
+        raise ValueError("reset_mask must have shape [batch]")
+
+    def reset_leaf(current, initial):
+        if current is None:
+            return None
+        if current.ndim == 0 or current.shape[0] != reset_mask.shape[0]:
+            return current
+        broadcast_shape = (reset_mask.shape[0],) + (1,) * (current.ndim - 1)
+        return jnp.where(
+            reset_mask.reshape(broadcast_shape),
+            initial,
+            current,
+        )
+
+    return jax.tree.map(reset_leaf, current_state, initial_state)

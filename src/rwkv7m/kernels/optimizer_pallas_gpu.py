@@ -223,6 +223,10 @@ def fused_adamw_optimizer(
     moment_dtype,
     decay_mask_fn,
     w0_mask_fn,
+    screening_mask_fn=None,
+    screening_learning_rate_multiplier: float = 1.0,
+    screening_activation_step: int = 0,
+    screening_activation_warmup_steps: int = 0,
     lowering: GPULowering,
     config: FusedAdamWGPUConfig = FusedAdamWGPUConfig(),
     interpret: bool = False,
@@ -243,6 +247,20 @@ def fused_adamw_optimizer(
         count = optax.safe_increment(state.count)
         count_f32 = count.astype(jnp.float32)
         learning_rate_value = jnp.asarray(schedule(state.count), dtype=jnp.float32)
+        screening_progress = state.count.astype(jnp.float32) - float(
+            screening_activation_step
+        )
+        if screening_activation_warmup_steps > 0:
+            screening_activation = jnp.clip(
+                screening_progress
+                / float(screening_activation_warmup_steps),
+                0.0,
+                1.0,
+            )
+        else:
+            screening_activation = (
+                screening_progress >= 0.0
+            ).astype(jnp.float32)
         mu_correction = 1.0 - jnp.power(beta1, count_f32)
         nu_correction = 1.0 - jnp.power(beta2, count_f32)
         global_norm = optax.tree.norm(updates).astype(jnp.float32)
@@ -258,6 +276,11 @@ def fused_adamw_optimizer(
         nu_leaves = jax.tree.leaves(state.nu)
         decay_leaves = jax.tree.leaves(decay_mask_fn(params))
         w0_leaves = jax.tree.leaves(w0_mask_fn(params))
+        screening_leaves = jax.tree.leaves(
+            jax.tree.map(lambda _: False, params)
+            if screening_mask_fn is None
+            else screening_mask_fn(params)
+        )
         results = [
             fused_adamw_update_gpu(
                 parameter,
@@ -265,7 +288,13 @@ def fused_adamw_optimizer(
                 mu,
                 nu,
                 clip_scale,
-                learning_rate_value,
+                (
+                    learning_rate_value
+                    * screening_learning_rate_multiplier
+                    * screening_activation
+                    if bool(is_screening)
+                    else learning_rate_value
+                ),
                 mu_correction,
                 nu_correction,
                 beta1=beta1,
@@ -273,18 +302,29 @@ def fused_adamw_optimizer(
                 epsilon=epsilon,
                 weight_decay=weight_decay,
                 apply_weight_decay=bool(apply_decay),
-                learning_rate_multiplier=2.0 if bool(is_w0) else 1.0,
+                learning_rate_multiplier=(
+                    (2.0 if bool(is_w0) else 1.0)
+                ),
                 lowering=lowering,
                 config=config,
                 interpret=interpret,
             )
-            for parameter, gradient, mu, nu, apply_decay, is_w0 in zip(
+            for (
+                parameter,
+                gradient,
+                mu,
+                nu,
+                apply_decay,
+                is_w0,
+                is_screening,
+            ) in zip(
                 parameter_leaves,
                 gradient_leaves,
                 mu_leaves,
                 nu_leaves,
                 decay_leaves,
                 w0_leaves,
+                screening_leaves,
                 strict=True,
             )
         ]

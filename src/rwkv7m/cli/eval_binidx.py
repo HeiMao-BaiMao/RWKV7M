@@ -11,6 +11,7 @@ from ..data import create_binidx_dataset
 from ..io import load_model_config, load_model_safetensors
 from ..model import MODEL_PRESET_NAMES, ModelConfig, ScreeningConfig, model_preset
 from ..model.screened_rwkv import cross_entropy_loss
+from ..model.state import reset_state_rows
 from .config import parse_args_with_config
 
 
@@ -81,8 +82,14 @@ def resolve_checkpoint_file(checkpoint):
 
 
 def evaluate_binidx(args):
-    if args.carry_state and args.sampling_mode != "sequential":
-        raise ValueError("--carry-state requires --sampling-mode sequential")
+    if args.carry_state and args.sampling_mode not in {
+        "sequential",
+        "document_sequential",
+    }:
+        raise ValueError(
+            "--carry-state requires --sampling-mode sequential or "
+            "document_sequential"
+        )
     if args.checkpoint:
         params, config, _ = load_model_safetensors(resolve_checkpoint_file(args.checkpoint))
         if config is None:
@@ -98,6 +105,7 @@ def evaluate_binidx(args):
         magic_prime=args.magic_prime,
         epoch_steps=args.steps,
         sampling_mode=args.sampling_mode,
+        loss_mask_after_token=args.loss_mask_after_token,
     )
     runtime = create_runtime(
         jax.random.PRNGKey(args.seed),
@@ -154,8 +162,12 @@ def evaluate_binidx(args):
         return loss, new_rwkv_state, new_screen_state, stats, logits
 
     losses = []
+    loss_counts = []
+    correct_counts = []
     memory_off_losses = []
-    prediction_deltas = []
+    memory_off_correct_counts = []
+    prediction_squared_error_sums = []
+    prediction_value_counts = []
     rwkv_state = runtime.initial_rwkv_state
     screen_state = runtime.initial_screen_state
     memory_off_rwkv_state = runtime.initial_rwkv_state
@@ -168,6 +180,28 @@ def evaluate_binidx(args):
                 memory_off_rwkv_state = runtime.initial_rwkv_state
                 memory_off_screen_state = runtime.initial_screen_state
             batch = dataset.get_batch(step)
+            if args.carry_state and "state_reset_mask" in batch:
+                reset_mask = batch["state_reset_mask"]
+                rwkv_state = reset_state_rows(
+                    rwkv_state,
+                    runtime.initial_rwkv_state,
+                    reset_mask,
+                )
+                screen_state = reset_state_rows(
+                    screen_state,
+                    runtime.initial_screen_state,
+                    reset_mask,
+                )
+                memory_off_rwkv_state = reset_state_rows(
+                    memory_off_rwkv_state,
+                    runtime.initial_rwkv_state,
+                    reset_mask,
+                )
+                memory_off_screen_state = reset_state_rows(
+                    memory_off_screen_state,
+                    runtime.initial_screen_state,
+                    reset_mask,
+                )
             if args.carry_state:
                 loss, rwkv_state, screen_state, _, logits = stateful_eval_step(
                     runtime.model,
@@ -189,6 +223,18 @@ def evaluate_binidx(args):
                     jnp.asarray(1.0, dtype=jnp.float32),
                 )
             losses.append(float(loss))
+            loss_counts.append(float(jnp.sum(batch["mask"])))
+            correct_counts.append(
+                float(
+                    jnp.sum(
+                        (
+                            jnp.argmax(logits, axis=-1)
+                            == batch["target_ids"]
+                        ).astype(jnp.float32)
+                        * batch["mask"]
+                    )
+                )
+            )
             if args.memory_off_counterfactual:
                 if args.carry_state:
                     (
@@ -217,25 +263,53 @@ def evaluate_binidx(args):
                         jnp.asarray(0.0, dtype=jnp.float32),
                     )
                 memory_off_losses.append(float(off_loss))
-                prediction_deltas.append(
+                memory_off_correct_counts.append(
                     float(
-                        jnp.sqrt(
-                            jnp.mean(
-                                (
-                                    logits.astype(jnp.float32)
-                                    - off_logits.astype(jnp.float32)
-                                )
-                                ** 2
-                            )
+                        jnp.sum(
+                            (
+                                jnp.argmax(off_logits, axis=-1)
+                                == batch["target_ids"]
+                            ).astype(jnp.float32)
+                            * batch["mask"]
                         )
                     )
+                )
+                delta_mask = (
+                    batch["mask"]
+                    if args.loss_mask_after_token is not None
+                    else jnp.ones_like(batch["mask"])
+                )
+                prediction_squared_error_sums.append(
+                    float(
+                        jnp.sum(
+                            (
+                                logits.astype(jnp.float32)
+                                - off_logits.astype(jnp.float32)
+                            )
+                            ** 2
+                            * delta_mask[..., None]
+                        )
+                    )
+                )
+                prediction_value_counts.append(
+                    float(jnp.sum(delta_mask) * logits.shape[-1])
                 )
             if args.print_every and (step % args.print_every == 0 or step == args.steps - 1):
                 print(f"eval step={step} loss={losses[-1]:.6f}")
     finally:
         dataset.close()
 
-    mean_loss = sum(losses) / len(losses)
+    masked_count = sum(loss_counts)
+    if args.loss_mask_after_token is None:
+        mean_loss = sum(losses) / len(losses)
+    else:
+        if masked_count <= 0.0:
+            raise ValueError(
+                "loss mask selected no target positions in the evaluation run"
+            )
+        mean_loss = sum(
+            loss * count for loss, count in zip(losses, loss_counts, strict=True)
+        ) / masked_count
     result = {
         "steps": args.steps,
         "tokens": args.steps * args.batch_size * args.ctx_len,
@@ -243,17 +317,48 @@ def evaluate_binidx(args):
         "perplexity": math.exp(min(mean_loss, 20.0)),
         "carry_state": bool(args.carry_state),
         "sampling_mode": args.sampling_mode,
+        "loss_mask_after_token": args.loss_mask_after_token,
+        "loss_mask_positions": int(masked_count),
     }
+    if args.loss_mask_after_token is not None:
+        result["masked_accuracy"] = sum(correct_counts) / masked_count
     if memory_off_losses:
-        memory_off_loss = sum(memory_off_losses) / len(memory_off_losses)
+        memory_off_loss = (
+            sum(memory_off_losses) / len(memory_off_losses)
+            if args.loss_mask_after_token is None
+            else sum(
+                loss * count
+                for loss, count in zip(
+                    memory_off_losses,
+                    loss_counts,
+                    strict=True,
+                )
+            )
+            / masked_count
+        )
+        prediction_rms_delta = math.sqrt(
+            sum(prediction_squared_error_sums)
+            / max(sum(prediction_value_counts), 1.0)
+        )
         result.update(
             {
                 "memory_off_loss": memory_off_loss,
                 "memory_loss_delta": memory_off_loss - mean_loss,
-                "prediction_rms_delta": sum(prediction_deltas)
-                / len(prediction_deltas),
+                "prediction_rms_delta": prediction_rms_delta,
             }
         )
+        if args.loss_mask_after_token is not None:
+            memory_off_accuracy = (
+                sum(memory_off_correct_counts) / masked_count
+            )
+            result.update(
+                {
+                    "memory_off_masked_accuracy": memory_off_accuracy,
+                    "memory_accuracy_delta": (
+                        result["masked_accuracy"] - memory_off_accuracy
+                    ),
+                }
+            )
     return result
 
 
@@ -277,7 +382,17 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--magic-prime", type=int, default=None)
-    parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["magic", "sequential", "document", "document_sequential"],
+        default="magic",
+    )
+    parser.add_argument(
+        "--loss-mask-after-token",
+        type=int,
+        default=None,
+        help="evaluate only targets immediately following this input token",
+    )
     parser.add_argument("--carry-state", action="store_true")
     parser.add_argument(
         "--memory-off-counterfactual",
@@ -320,6 +435,12 @@ def main(argv=None):
         f"steps={metrics['steps']} tokens={metrics['tokens']} "
         f"loss={metrics['loss']:.6f} perplexity={metrics['perplexity']:.6f}"
     )
+    if "masked_accuracy" in metrics:
+        print(
+            "retrieval "
+            f"masked_positions={metrics['loss_mask_positions']} "
+            f"accuracy={metrics['masked_accuracy']:.6f}"
+        )
     if "memory_off_loss" in metrics:
         print(
             "counterfactual "
@@ -327,6 +448,14 @@ def main(argv=None):
             f"memory_loss_delta={metrics['memory_loss_delta']:.6f} "
             f"prediction_rms_delta={metrics['prediction_rms_delta']:.6f}"
         )
+        if "memory_off_masked_accuracy" in metrics:
+            print(
+                "retrieval_counterfactual "
+                f"memory_off_accuracy="
+                f"{metrics['memory_off_masked_accuracy']:.6f} "
+                f"memory_accuracy_delta="
+                f"{metrics['memory_accuracy_delta']:.6f}"
+            )
 
 
 if __name__ == "__main__":

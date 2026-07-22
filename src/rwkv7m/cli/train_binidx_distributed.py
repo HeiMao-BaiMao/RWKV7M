@@ -37,6 +37,7 @@ from ..distributed import (
 from ..io import model_config_to_dict
 from ..model import MODEL_PRESET_NAMES
 from ..model.nnx_model import NNXShardingConfig
+from ..train.train_state import create_learning_rate_schedule
 from .config import (
     add_optimizer_backend_arg,
     add_screening_v2_args,
@@ -67,7 +68,17 @@ def parse_args(argv=None):
     parser.add_argument("--global-batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--magic-prime", type=int, default=None)
-    parser.add_argument("--sampling-mode", choices=["magic", "sequential"], default="magic")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["magic", "sequential", "document", "document_sequential"],
+        default="magic",
+    )
+    parser.add_argument(
+        "--loss-mask-after-token",
+        type=int,
+        default=None,
+        help="train only targets immediately following this input token",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase", choices=["read_screening_only", "read_write"], default="read_screening_only")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
@@ -101,7 +112,12 @@ def parse_args(argv=None):
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--lr-init", type=float, default=1e-3)
     parser.add_argument("--lr-final", type=float, default=1e-5)
-    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="optimizer warmup override; model-config value is kept when omitted",
+    )
     parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default="optax_cosine")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=0.001)
@@ -207,13 +223,22 @@ def _print_once(info, message):
         print(message)
 
 
-def _metric_record(args, split, step, metrics, *, elapsed=None):
+def _metric_record(
+    args,
+    split,
+    step,
+    metrics,
+    *,
+    elapsed=None,
+    learning_rate=None,
+):
     tokens = args.global_batch_size * args.ctx_len
     record = {
         "split": split,
         "step": int(step),
         "tokens": tokens,
         "tokens_per_sec": None,
+        "learning_rate": learning_rate,
         "loss": metrics.get("loss"),
         "total_loss": metrics.get("total_loss"),
         "perplexity": metrics.get("perplexity"),
@@ -240,6 +265,9 @@ def _metric_record(args, split, step, metrics, *, elapsed=None):
         "eviction_usage_mean",
         "slot_utilization",
         "dead_slot_rate",
+        "short_bank_slot_utilization",
+        "mid_bank_slot_utilization",
+        "long_bank_slot_utilization",
         "slot_cosine_redundancy",
         "matched_erase_mass",
         "matched_write_mass",
@@ -251,6 +279,8 @@ def _metric_record(args, split, step, metrics, *, elapsed=None):
         "read_energy_mean",
         "write_saturation_rate",
         "write_budget_rate",
+        "hard_write_budget_rate",
+        "write_budget_realized_rate",
         "write_budget_loss",
         "write_budget_target",
         "admission_floor_loss",
@@ -264,11 +294,15 @@ def _metric_record(args, split, step, metrics, *, elapsed=None):
         "lambda_screen_learned",
         "lambda_screen_floor",
         "screening_residual_scale",
+        "screening_activation",
         "screening_residual_rms",
         "base_residual_rms",
         "screening_base_rms_ratio",
     ):
         record[key] = metrics.get(key)
+    for key, value in metrics.items():
+        if key.startswith("screening_layer_"):
+            record[key] = value
     if elapsed is not None and elapsed > 0:
         record["tokens_per_sec"] = tokens / elapsed
     return record
@@ -550,8 +584,14 @@ def run_distributed_training(args):
             f"param_axis_name {args.param_axis_name!r} is not present in "
             f"mesh_axis_names={mesh_axis_names!r}"
         )
-    if args.carry_state and args.sampling_mode != "sequential":
-        raise ValueError("--carry-state requires --sampling-mode sequential")
+    if args.carry_state and args.sampling_mode not in {
+        "sequential",
+        "document_sequential",
+    }:
+        raise ValueError(
+            "--carry-state requires --sampling-mode sequential or "
+            "document_sequential"
+        )
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be positive")
     if args.global_batch_size % args.gradient_accumulation_steps != 0:
@@ -621,6 +661,7 @@ def run_distributed_training(args):
         data_axis_size=data_axis_size,
         data_shard_indices=data_shard_indices,
         sampling_mode=args.sampling_mode,
+        loss_mask_after_token=args.loss_mask_after_token,
     )
     eval_dataset = None
     if args.eval_every > 0 and args.eval_data_file is not None:
@@ -637,6 +678,7 @@ def run_distributed_training(args):
             data_axis_size=data_axis_size,
             data_shard_indices=data_shard_indices,
             sampling_mode=args.sampling_mode,
+            loss_mask_after_token=args.loss_mask_after_token,
         )
     if args.param_axis_name == "data":
         data_axis_index = tuple(mesh.axis_names).index("data")
@@ -694,6 +736,15 @@ def run_distributed_training(args):
     _write_run_config(args, config, info, params=train_state.params, mesh=mesh)
     summary = _initial_run_summary(args, info, start_step)
     best_eval = None
+    learning_rate_schedule = create_learning_rate_schedule(
+        {
+            "lr_init": config.lr_init,
+            "lr_final": config.lr_final,
+            "warmup_steps": config.warmup_steps,
+            "lr_schedule": config.lr_schedule,
+        },
+        max(start_step + args.steps, 1),
+    )
     _write_run_summary(args, info, summary)
     try:
         _print_once(
@@ -746,6 +797,9 @@ def run_distributed_training(args):
                 completed_step,
                 host_metrics,
                 elapsed=elapsed,
+                learning_rate=float(
+                    learning_rate_schedule(max(completed_step - 1, 0))
+                ),
             )
             write_metric_record(
                 log_jsonl,

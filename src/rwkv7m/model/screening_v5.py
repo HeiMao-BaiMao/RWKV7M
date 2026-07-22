@@ -99,6 +99,7 @@ class ScreeningV5RecurrenceConfig:
     read_soft_warmup_alpha: float | jax.Array = 0.0
     read_soft_warmup_temperature: float = 0.1
     self_index_margin: float = 0.0
+    training_activation: float | jax.Array = 1.0
 
 
 def _masked_softmax(logits, mask, *, temperature, eps):
@@ -489,6 +490,14 @@ def screening_v5_recurrence_reference(
             delta_values_t,
             delta_write_keys_t,
         ) = token_inputs
+        training_activation = jnp.clip(
+            jnp.asarray(config.training_activation, dtype=jnp.float32),
+            0.0,
+            1.0,
+        )
+        training_enabled = jax.lax.stop_gradient(
+            (training_activation > 0.0).astype(jnp.float32)
+        )
 
         batch, slot_count, key_size = read_keys.shape
         value_size = values.shape[-1]
@@ -553,7 +562,7 @@ def screening_v5_recurrence_reference(
         read_relevance = hard_read_relevance + read_alpha * (
             soft_read_relevance - hard_read_relevance
         )
-        read_relevance *= occupied[:, None, :]
+        read_relevance *= occupied[:, None, :] * training_enabled
         normalized_values = (
             unit_norm(values_tiled, eps=config.eps)
             if config.use_value_unit_norm
@@ -721,6 +730,7 @@ def screening_v5_recurrence_reference(
             (1.0 - novel_st[:, None])
             * matched_confidence[:, None]
             * address_distribution
+            * training_enabled
         )
         matched_base = mu[None, :] * matched_address
         matched_erase_gate = jax.nn.sigmoid(matched_erase_logits_t)
@@ -736,12 +746,16 @@ def screening_v5_recurrence_reference(
             matched_write = matched_base * matched_write_gate
 
         novel_base = (
-            novel_st[:, None] * admission_st[:, None] * allocation_st
+            novel_st[:, None]
+            * admission_st[:, None]
+            * allocation_st
+            * training_enabled
         )
         accepted_novel_hard = jax.lax.stop_gradient(
             novel_hard[:, None]
             * admission_hard[:, None]
             * allocation_hard
+            * training_enabled
         )
         novel_erase_gate = jax.nn.sigmoid(novel_erase_logit_t)[:, None]
         novel_write_gate = jax.nn.sigmoid(novel_write_logit_t)[:, None]
@@ -921,7 +935,7 @@ def screening_v5_recurrence_reference(
                 jnp.mean(read_tau, axis=-1),
                 write_tau,
                 novelty_threshold,
-                admission_soft * novel_soft,
+                training_enabled * admission_soft * novel_soft,
                 accepted_novel * selected_write_similarity,
                 accepted_novel * jnp.mean(
                     selected_read_similarity,

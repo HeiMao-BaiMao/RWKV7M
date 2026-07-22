@@ -12,6 +12,7 @@ from rwkv7m.data import (
 )
 from rwkv7m.cli.bench_binidx import parse_args as parse_bench_args
 from rwkv7m.cli.make_binidx import parse_args as parse_make_args
+from rwkv7m.model.state import init_rwkv_state, reset_state_rows
 
 
 def write_demo_binidx(tmp_path, *, n_tokens=257, dtype=np.uint16):
@@ -133,6 +134,124 @@ def test_binidx_sequential_sampling_reports_state_reset_boundaries(tmp_path):
         assert not dataset.should_reset_state_before_step(lane_length + 1)
     finally:
         dataset.close()
+
+
+def test_document_sequential_sampling_resets_each_lane_at_document_boundaries(
+    tmp_path,
+):
+    prefix = str(tmp_path / "documents")
+    builder = MMapIndexedDatasetBuilder(
+        data_file_path(prefix),
+        dtype=np.uint16,
+    )
+    for start in (10, 30, 50, 70):
+        builder.add_item(np.arange(start, start + 9, dtype=np.uint16))
+        builder.end_document()
+    builder.finalize(index_file_path(prefix))
+
+    dataset = create_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        batch_size=2,
+        sampling_mode="document_sequential",
+        loss_mask_after_token=33,
+    )
+    try:
+        first = dataset.get_batch(0)
+        second = dataset.get_batch(1)
+        third = dataset.get_batch(2)
+        assert first["state_reset_mask"].tolist() == [True, True]
+        assert second["state_reset_mask"].tolist() == [False, False]
+        assert third["state_reset_mask"].tolist() == [True, True]
+        assert int(first["input_ids"][0, 0]) == 10
+        assert int(first["input_ids"][1, 0]) == 30
+        assert int(third["input_ids"][0, 0]) == 50
+        assert int(third["input_ids"][1, 0]) == 70
+        assert float(jnp.sum(first["mask"])) == 1.0
+    finally:
+        dataset.close()
+
+
+def test_document_sequential_assigns_only_eligible_documents_to_lanes(
+    tmp_path,
+):
+    prefix = str(tmp_path / "eligible-documents")
+    builder = MMapIndexedDatasetBuilder(
+        data_file_path(prefix),
+        dtype=np.uint16,
+    )
+    for values in (
+        np.arange(3, dtype=np.uint16),
+        np.arange(10, 19, dtype=np.uint16),
+        np.arange(3, dtype=np.uint16),
+        np.arange(30, 39, dtype=np.uint16),
+    ):
+        builder.add_item(values)
+        builder.end_document()
+    builder.finalize(index_file_path(prefix))
+
+    dataset = create_binidx_dataset(
+        prefix,
+        ctx_len=4,
+        batch_size=2,
+        sampling_mode="document_sequential",
+    )
+    try:
+        batch = dataset.get_batch(0)
+        assert batch["input_ids"][:, 0].tolist() == [10, 30]
+        assert batch["state_reset_mask"].tolist() == [True, True]
+    finally:
+        dataset.close()
+
+
+def test_document_sampling_iterates_one_global_epoch_across_ranks(tmp_path):
+    prefix = str(tmp_path / "ranked-documents")
+    builder = MMapIndexedDatasetBuilder(
+        data_file_path(prefix),
+        dtype=np.uint16,
+    )
+    for start in (10, 30, 50, 70):
+        builder.add_item(np.arange(start, start + 9, dtype=np.uint16))
+        builder.end_document()
+    builder.finalize(index_file_path(prefix))
+
+    rank_datasets = [
+        create_binidx_dataset(
+            prefix,
+            ctx_len=8,
+            batch_size=1,
+            rank=rank,
+            world_size=2,
+            sampling_mode="document",
+        )
+        for rank in range(2)
+    ]
+    try:
+        rank_batches = [list(dataset.iter_batches()) for dataset in rank_datasets]
+        assert [len(batches) for batches in rank_batches] == [2, 2]
+        assert [
+            int(batch["input_ids"][0, 0])
+            for batches in rank_batches
+            for batch in batches
+        ] == [10, 50, 30, 70]
+    finally:
+        for dataset in rank_datasets:
+            dataset.close()
+
+
+def test_state_row_reset_preserves_other_stream_lanes():
+    config = tiny_config(
+        vocab_size=32,
+        d_model=32,
+        n_layers=2,
+        n_heads=2,
+        head_size=16,
+    )
+    initial = init_rwkv_state(2, config)
+    current = jax.tree.map(lambda value: value + 1.0, initial)
+    reset = reset_state_rows(current, initial, jnp.asarray([True, False]))
+    assert jnp.all(reset[0].time_mix_x[0] == 0.0)
+    assert jnp.all(reset[0].time_mix_x[1] == 1.0)
 
 
 def test_binidx_batch_dataset_supports_multi_document_global_sampling(tmp_path):

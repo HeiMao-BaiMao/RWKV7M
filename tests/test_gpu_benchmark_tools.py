@@ -172,6 +172,22 @@ def test_gradient_diagnostic_reports_nonfinite_values_and_largest_leaf():
     assert summary["nonfinite_value_count"] == 2
     assert summary["nonfinite_gradients"][0]["path"] == "invalid"
     assert summary["largest_finite_gradients"][0]["path"] == "finite"
+    assert summary["groups"]["all"]["leaf_count"] == 2
+
+
+def test_gradient_diagnostic_separates_screening_and_trunk_groups():
+    gradients = nnx.State(
+        {
+            "layer_0": {
+                "screening_0": {"kernel": jnp.asarray([3.0])},
+                "rwkv_block_0": {"kernel": jnp.asarray([4.0])},
+            }
+        }
+    )
+    summary = DIAGNOSE.summarize_gradient_state(gradients, top_k=2)
+    assert summary["groups"]["screening"]["l2_norm_finite"] == 3.0
+    assert summary["groups"]["trunk"]["l2_norm_finite"] == 4.0
+    assert summary["groups"]["all"]["l2_norm_finite"] == 5.0
 
 
 def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
@@ -194,6 +210,8 @@ def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
     assert args.checkpoint == checkpoint
     assert args.sequence_chunk_size == 0
     assert args.float32_model is True
+    assert args.component_gradients is False
+    assert args.include_update is False
 
 
 def test_nsight_rejects_conflicting_profile_mode():

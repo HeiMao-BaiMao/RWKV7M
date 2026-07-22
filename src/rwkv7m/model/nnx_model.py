@@ -1338,6 +1338,13 @@ class NNXStateLevelScreening(nnx.Module):
         learned_lambda_screen = jax.nn.softplus(_value(self.lambda_raw)).astype(
             jnp.float32
         )
+        curriculum_step = training_step
+        if training_step is not None and v5_enabled:
+            curriculum_step = jnp.maximum(
+                jnp.asarray(training_step, dtype=jnp.float32)
+                - float(cfg.activation_step),
+                0.0,
+            )
         lambda_screen_floor = jnp.zeros((), dtype=jnp.float32)
         if (
             v5_enabled
@@ -1349,7 +1356,7 @@ class NNXStateLevelScreening(nnx.Module):
                 cfg.lambda_screen_warmup_floor
                 * jnp.clip(
                     1.0
-                    - jnp.asarray(training_step, dtype=jnp.float32)
+                    - jnp.asarray(curriculum_step, dtype=jnp.float32)
                     / float(cfg.lambda_screen_warmup_steps),
                     0.0,
                     1.0,
@@ -1491,11 +1498,30 @@ class NNXStateLevelScreening(nnx.Module):
             ):
                 read_soft_warmup_alpha = jnp.clip(
                     1.0
-                    - jnp.asarray(training_step, dtype=jnp.float32)
+                    - jnp.asarray(curriculum_step, dtype=jnp.float32)
                     / float(cfg.read_soft_warmup_steps),
                     0.0,
                     1.0,
                 )
+            training_activation = jnp.ones((), dtype=jnp.float32)
+            if training_step is not None and (
+                cfg.activation_step > 0 or cfg.activation_warmup_steps > 0
+            ):
+                activation_progress = (
+                    jnp.asarray(training_step, dtype=jnp.float32)
+                    - float(cfg.activation_step)
+                )
+                if cfg.activation_warmup_steps > 0:
+                    training_activation = jnp.clip(
+                        activation_progress
+                        / float(cfg.activation_warmup_steps),
+                        0.0,
+                        1.0,
+                    )
+                else:
+                    training_activation = (
+                        activation_progress >= 0.0
+                    ).astype(jnp.float32)
 
             v5_config = ScreeningV5RecurrenceConfig(
                 use_value_unit_norm=cfg.use_value_unit_norm,
@@ -1533,6 +1559,7 @@ class NNXStateLevelScreening(nnx.Module):
                     cfg.read_soft_warmup_temperature
                 ),
                 self_index_margin=cfg.self_index_margin,
+                training_activation=training_activation,
             )
             recurrence_outputs = screening_v5_recurrence_reference(
                 v5_projected_inputs[0],
@@ -1649,6 +1676,11 @@ class NNXStateLevelScreening(nnx.Module):
         effective_lambda = (
             lambda_screen
             * residual_scale
+            * (
+                training_activation
+                if v5_enabled
+                else jnp.ones((), dtype=jnp.float32)
+            )
             / math.sqrt(cfg.n_read_tiles)
         )
         if cfg.gate_space == "value":
@@ -1802,6 +1834,19 @@ class NNXStateLevelScreening(nnx.Module):
                 step_statistics[..., ACCEPTED_NOVEL_RATE]
             )
             accepted_denominator = jnp.maximum(accepted_count, 1.0)
+            bank_ids = jnp.asarray(cfg.bank_ids, dtype=jnp.int32)
+            bank_slot_utilization = tuple(
+                jnp.sum(
+                    final_occupancy
+                    * (bank_ids == bank)[None, :].astype(jnp.float32)
+                )
+                / jnp.maximum(
+                    final_occupancy.shape[0]
+                    * jnp.sum((bank_ids == bank).astype(jnp.float32)),
+                    1.0,
+                )
+                for bank in range(3)
+            )
             stats.update(
                 {
                     "tau_r": jnp.mean(
@@ -1821,6 +1866,9 @@ class NNXStateLevelScreening(nnx.Module):
                     ),
                     "slot_utilization": jnp.mean(final_occupancy),
                     "dead_slot_rate": jnp.mean(final_occupancy <= 0.5),
+                    "short_bank_slot_utilization": bank_slot_utilization[0],
+                    "mid_bank_slot_utilization": bank_slot_utilization[1],
+                    "long_bank_slot_utilization": bank_slot_utilization[2],
                     "matched_erase_mass": jnp.mean(
                         step_statistics[..., MATCHED_ERASE_MASS]
                     ),
@@ -1851,6 +1899,22 @@ class NNXStateLevelScreening(nnx.Module):
                     "write_budget_rate": jnp.mean(
                         step_statistics[..., WRITE_BUDGET_RATE]
                     ),
+                    "hard_write_budget_rate": jnp.mean(
+                        step_statistics[..., ACCEPTED_NOVEL_RATE]
+                    ),
+                    "write_budget_realized_rate": (
+                        jnp.mean(
+                            step_statistics[..., WRITE_BUDGET_RATE]
+                        )
+                        + jax.lax.stop_gradient(
+                            jnp.mean(
+                                step_statistics[..., ACCEPTED_NOVEL_RATE]
+                            )
+                            - jnp.mean(
+                                step_statistics[..., WRITE_BUDGET_RATE]
+                            )
+                        )
+                    ),
                     "write_self_similarity": jnp.sum(
                         step_statistics[..., SELF_WRITE_SIMILARITY]
                     )
@@ -1876,6 +1940,7 @@ class NNXStateLevelScreening(nnx.Module):
                     "lambda_screen_floor": lambda_screen_floor
                     / math.sqrt(cfg.n_read_tiles),
                     "screening_residual_scale": residual_scale,
+                    "screening_activation": training_activation,
                 }
             )
         else:
@@ -2112,6 +2177,7 @@ class NNXScreenedRWKVModel(nnx.Module):
         new_rwkv_layers = list(rwkv_state)
         new_screen_layers = list(screen_state.layers)
         all_stats = []
+        layer_stats = {}
         for layer_idx in range(cfg.n_layers):
             if layer_idx in screened_idx:
                 scr_state = screen_state.layers[screened_idx[layer_idx]]
@@ -2139,6 +2205,12 @@ class NNXScreenedRWKVModel(nnx.Module):
             new_rwkv_layers[layer_idx] = new_rwkv
             if layer_idx in screened_idx:
                 new_screen_layers[screened_idx[layer_idx]] = new_screen
+                layer_stats.update(
+                    {
+                        f"screening_layer_{layer_idx}_{key}": value
+                        for key, value in stats.items()
+                    }
+                )
             all_stats.append(stats)
         keys = {key for stats in all_stats for key in stats}
         agg_stats = {
@@ -2147,6 +2219,7 @@ class NNXScreenedRWKVModel(nnx.Module):
             )
             for key in keys
         }
+        agg_stats.update(layer_stats)
         return (
             x,
             tuple(new_rwkv_layers),

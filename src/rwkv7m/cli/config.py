@@ -214,6 +214,33 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         type=int,
         default=0,
     )
+    parser.add_argument(
+        "--screening-activation-step",
+        type=int,
+        default=None,
+        help="keep v5 Screening inert before this optimizer step",
+    )
+    parser.add_argument(
+        "--screening-activation-warmup-steps",
+        type=int,
+        default=None,
+        help="linearly ramp v5 Screening after its activation step",
+    )
+    parser.add_argument(
+        "--screening-optimizer-lr-multiplier",
+        type=float,
+        default=None,
+        help="multiply optimizer updates for Screening parameters",
+    )
+    parser.add_argument(
+        "--screening-write-budget-min-slot-utilization",
+        type=float,
+        default=None,
+        help=(
+            "enable the upper v5 write budget only after each screened "
+            "layer reaches this occupied-slot fraction"
+        ),
+    )
 
 
 def screening_v2_kwargs(args):
@@ -328,6 +355,28 @@ def screening_v2_kwargs(args):
         "self_index_loss_steps": getattr(
             args, "screening_self_index_loss_steps", 0
         ),
+        "activation_step": (
+            getattr(args, "screening_activation_step", None) or 0
+        ),
+        "activation_warmup_steps": (
+            getattr(args, "screening_activation_warmup_steps", None) or 0
+        ),
+        "optimizer_lr_multiplier": (
+            1.0
+            if getattr(args, "screening_optimizer_lr_multiplier", None)
+            is None
+            else args.screening_optimizer_lr_multiplier
+        ),
+        "write_budget_min_slot_utilization": (
+            0.0
+            if getattr(
+                args,
+                "screening_write_budget_min_slot_utilization",
+                None,
+            )
+            is None
+            else args.screening_write_budget_min_slot_utilization
+        ),
     }
 
 
@@ -384,6 +433,27 @@ def apply_execution_overrides(config, args):
     optimizer_backend = getattr(args, "optimizer_backend", None)
     if optimizer_backend is not None:
         config.optimizer_backend = optimizer_backend
+    warmup_steps = getattr(args, "warmup_steps", None)
+    if warmup_steps is not None:
+        if warmup_steps < 0:
+            raise ValueError("--warmup-steps must be non-negative")
+        config.warmup_steps = int(warmup_steps)
+    if hasattr(args, "use_screening") and not args.use_screening:
+        config.use_screening = False
+    screening_overrides = (
+        ("screening_activation_step", "activation_step"),
+        ("screening_activation_warmup_steps", "activation_warmup_steps"),
+        ("screening_optimizer_lr_multiplier", "optimizer_lr_multiplier"),
+        (
+            "screening_write_budget_min_slot_utilization",
+            "write_budget_min_slot_utilization",
+        ),
+    )
+    for argument_name, field_name in screening_overrides:
+        value = getattr(args, argument_name, None)
+        if value is not None:
+            setattr(config.screening, field_name, value)
+    config.screening.__post_init__()
     return config
 
 

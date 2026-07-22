@@ -12,7 +12,11 @@ from rwkv7m.kernels.optimizer_pallas_gpu import (
     fused_adamw_update_gpu,
     fused_adamw_update_reference,
 )
-from rwkv7m.train.train_state import decay_mask_fn, rwkv_w0_mask_fn
+from rwkv7m.train.train_state import (
+    decay_mask_fn,
+    rwkv_w0_mask_fn,
+    screening_mask_fn,
+)
 from rwkv7m.model.nnx_model import initialize_nnx_model
 from rwkv7m.model.screened_rwkv import ModelConfig
 
@@ -162,3 +166,36 @@ def test_fused_optimizer_accepts_nnx_parameter_state():
     )
     assert int(state.count) == 1
     assert all(jnp.all(jnp.isfinite(value)) for value in jax.tree.leaves(updates))
+
+
+def test_fused_optimizer_freezes_screening_before_activation():
+    params = {
+        "layer_0": {
+            "screening_0": {"kernel": jnp.ones((3,), dtype=jnp.float32)},
+            "rwkv_block_0": {"kernel": jnp.ones((3,), dtype=jnp.float32)},
+        }
+    }
+    gradients = jax.tree.map(jnp.ones_like, params)
+    optimizer = fused_adamw_optimizer(
+        learning_rate=1e-3,
+        max_grad_norm=100.0,
+        weight_decay=0.1,
+        beta1=0.9,
+        beta2=0.999,
+        epsilon=1e-8,
+        moment_dtype=jnp.float32,
+        decay_mask_fn=decay_mask_fn,
+        w0_mask_fn=rwkv_w0_mask_fn,
+        screening_mask_fn=screening_mask_fn,
+        screening_learning_rate_multiplier=0.1,
+        screening_activation_step=2,
+        lowering="triton",
+        interpret=True,
+    )
+    updates, _ = optimizer.update(
+        gradients,
+        optimizer.init(params),
+        params,
+    )
+    assert jnp.all(updates["layer_0"]["screening_0"]["kernel"] == 0.0)
+    assert jnp.any(updates["layer_0"]["rwkv_block_0"]["kernel"] != 0.0)
