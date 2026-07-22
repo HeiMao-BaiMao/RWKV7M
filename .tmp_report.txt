@@ -1077,6 +1077,71 @@ phase 0.5 capture:
 - interpretでも再現すれば数式/kernel body、再現しなければROCm/Triton lowering固有を
   第一候補とする。
 
+capture後の再訂正:
+
+- layer 6 captureは4 chunk全て取得できたが、WKVへ着弾したactivation cotangentが
+  capture時点で既にnon-finiteだった。
+- 例として最初のcaptureは`y_cotangent` 82,944 valueがnon-finite。他3 chunkは
+  各98,304 valueがnon-finiteで、後3 chunkのfinal-state cotangentにも各49,152
+  non-finite valueがあった。
+- このcotangentをPallasとreference WKV pullbackへ単体投入すると、両者は同じ位置で
+  non-finiteになり、有限部分は近似一致した。
+- 従って「layer 6 Pallas WKV backwardが発生源」という上のper-layer解釈は撤回する。
+  layer 6 reference化でfiniteになったのは、forward微小差が後段graphの故障領域を
+  回避したためと解釈する。
+
+上位層capture:
+
+- layers 7--11の全20 WKV callを、Pallas forward + reference pullbackとして1回で
+  captureした。このfull stepは全423 gradient leafがfinite、grad L2=27.1972。
+- 全20 captureのprimal、activation cotangent、final-state cotangentは全てfinite。
+- 各captureをMI300X上でPallas/reference VJPへ単体再投入したところ、20/20で
+  Pallas gradientはfinite。referenceとの有限差も小さかった。
+- したがってWKV kernel bodyの単一call数式バグは、この再現では支持されない。
+
+full graph集合判別:
+
+- layers 9--11だけreference pullback: 48,508,683 non-finite valueで失敗。
+- layers 7--8だけreference pullback: 48,507,915 non-finite valueで失敗。
+- layers 7--11を同時にreference pullback: 0 non-finite、全423 leaf finite。
+- 単独callは全てfiniteなのに、複数Pallas backward custom callが同一full graphへ
+  共存すると失敗する。ROCm/Triton lowering、buffer aliasing、custom-call scheduling、
+  またはそれらの相互作用が現在の第一候補である。
+- 一つの層/kernal数式へ局在したとは主張しない。
+
+成果物回収:
+
+- local root: `.tmp/mi300x-budget250-wkv/`
+- 50 files、うちNPZ 25 files、合計128,046,793 bytes。
+- layer 6 capture、layers 7--11 capture、20 callのanalysis JSON、fixed batch、
+  corrected config、full-run JSONを含む。
+- ローカルで全ファイルのSHA-256読み取りが成功した。GPU上の追加計算は終了。
+
+MI300X fail-closed dispatch:
+
+- 現行`pallas_gpu_triton` WKV backwardは、単体call parityを通るがMI300X full graph
+  gateを通らない。
+- AMD deviceの`auto` backendを新しい
+  `pallas_gpu_triton_reference_vjp`へ変更した。
+- forwardはPallas Tritonを維持し、reverse-mode pullbackだけportable JAX referenceを
+  使用する。これにより推論forwardとtraining forwardではPallasを利用しつつ、
+  full graphで観測した複数Pallas backward相互作用を回避する。
+- NVIDIA L40S/Adaは従来どおり`pallas_gpu_triton`、Hopper/Blackwellは
+  `pallas_gpu_mosaic`、TPUは`pallas_tpu`のauto dispatchを維持する。
+- AMDでも明示的`pallas_gpu_triton`はbenchmark/correctness調査用に利用可能。
+- CPU interpretを含むWKV/API/診断43テストがpass。
+- MI300Xでこの新auto backendをfull-step再実行してはいない。サーバー費用を抑えるため
+  capture回収後に停止可能とし、実機acceptanceは次の短時間GPU sessionへfail-closedで
+  残す。
+- capture directoryは大容量・checkpoint由来の一時成果物なので`/.tmp/`をgitignoreへ
+  追加し、repositoryへcommitしない。
+
+最終ローカル回帰:
+
+- repository全suite: 279 passed、5 skipped、所要484.87秒。
+- skippedは実acceleratorを要求する既存gateであり、失敗ではない。
+- ccc index: 164 files、3,766 chunks、error 0で更新。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================
@@ -1111,5 +1176,5 @@ PI制御案に対する現時点の立場:
   内容学習やcausal useは保証されない。
 - PI controllerは「率の安定化」、ranking/content objectiveは「何を書くか」、
   causal-use/retrieval objectiveは「読む価値を作る」を別の契約として設計すべき。
-- 実装前に、現在のportable v5 backwardの数値不安定性を修正する。コントローラを
-  追加しただけでは、同じwrite-state gradient経路を通って再発する可能性がある。
+- 実装前に、MI300X full graphで複数Pallas WKV backwardが共存する数値/実行時問題を
+  fail-closedにする。コントローラ追加だけでは同じaccelerator graphで再発し得る。

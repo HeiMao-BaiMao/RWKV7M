@@ -181,7 +181,11 @@ def main(argv=None):
         lambda *values: wkv7(*values, selected_backend)
     )
     reference_forward = jax.jit(wkv7_reference)
-    if selected_backend in ("pallas_gpu_mosaic", "pallas_gpu_triton"):
+    if selected_backend in (
+        "pallas_gpu_mosaic",
+        "pallas_gpu_triton",
+        "pallas_gpu_triton_reference_vjp",
+    ):
         from rwkv7m.kernels.wkv_pallas_gpu import (
             wkv7_pallas_gpu_forward_with_aux,
         )

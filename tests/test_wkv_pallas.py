@@ -155,6 +155,34 @@ def test_auto_backend_is_pallas_first_and_never_selects_ffi(monkeypatch):
     assert resolve_wkv_backend(
         platform="gpu", device_kind="NVIDIA H100 80GB HBM3"
     ) == "pallas_gpu_mosaic"
+    assert resolve_wkv_backend(
+        platform="gpu", device_kind="AMD Instinct MI300X VF"
+    ) == "pallas_gpu_triton_reference_vjp"
+
+
+def test_amd_safe_backend_keeps_pallas_forward_and_reference_vjp():
+    inputs = _inputs()
+
+    def loss(backend, *values):
+        y, final_state = wkv7(*values, backend, True)
+        return jnp.sum(y.astype(jnp.float32) ** 2) + jnp.sum(
+            final_state**2
+        )
+
+    expected = jax.grad(
+        lambda *values: loss("reference", *values),
+        argnums=tuple(range(7)),
+    )(*inputs)
+    actual = jax.grad(
+        lambda *values: loss(
+            "pallas_gpu_triton_reference_vjp", *values
+        ),
+        argnums=tuple(range(7)),
+    )(*inputs)
+    assert all(
+        jnp.allclose(left, right, rtol=1e-5, atol=1e-6)
+        for left, right in zip(actual, expected, strict=True)
+    )
 
 
 def test_backend_environment_override_is_validated(monkeypatch):

@@ -13,6 +13,7 @@ WKVBackend = Literal[
     "pallas_tpu",
     "pallas_gpu_mosaic",
     "pallas_gpu_triton",
+    "pallas_gpu_triton_reference_vjp",
     "ffi",
 ]
 
@@ -22,6 +23,7 @@ _BACKENDS = frozenset(
         "pallas_tpu",
         "pallas_gpu_mosaic",
         "pallas_gpu_triton",
+        "pallas_gpu_triton_reference_vjp",
         "ffi",
     }
 )
@@ -34,6 +36,7 @@ _HOPPER_OR_NEWER_MARKERS = (
     "gb200",
     "blackwell",
 )
+_AMD_MARKERS = ("amd", "instinct", "mi300", "radeon", "gfx")
 
 
 def available_wkv_backends() -> tuple[str, ...]:
@@ -80,6 +83,13 @@ def resolve_wkv_backend(
         return "pallas_tpu"
     if current_platform == "gpu":
         kind = (device_kind or _default_device_kind()).lower()
+        if any(marker in kind for marker in _AMD_MARKERS):
+            # The Triton forward is numerically valid on MI300X, but a
+            # production full graph with multiple Pallas WKV pullbacks can
+            # corrupt cotangents even though every captured pullback passes
+            # in isolation. Keep Pallas forward while fail-closing training
+            # to the portable VJP until an AMD-specific full-graph gate passes.
+            return "pallas_gpu_triton_reference_vjp"
         if any(marker in kind for marker in _HOPPER_OR_NEWER_MARKERS):
             return "pallas_gpu_mosaic"
         return "pallas_gpu_triton"

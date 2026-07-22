@@ -143,7 +143,11 @@ def _wkv7_forward_dispatch(
     if selected == "reference":
         outputs = _wkv7_reference_impl(*inputs)
         return (outputs, ()) if with_aux else outputs
-    if selected in ("pallas_gpu_mosaic", "pallas_gpu_triton"):
+    if selected in (
+        "pallas_gpu_mosaic",
+        "pallas_gpu_triton",
+        "pallas_gpu_triton_reference_vjp",
+    ):
         from rwkv7m.kernels.wkv_pallas_gpu import wkv7_pallas_gpu_forward
 
         lowering = (
@@ -184,6 +188,9 @@ def _wkv7_backward_dispatch(
 ):
     selected = resolve_wkv_backend(backend)
     if selected == "reference":
+        _, pullback = jax.vjp(_wkv7_reference_impl, *inputs)
+        return pullback(cotangents)
+    if selected == "pallas_gpu_triton_reference_vjp":
         _, pullback = jax.vjp(_wkv7_reference_impl, *inputs)
         return pullback(cotangents)
     y_cotangent, final_state_cotangent = cotangents
