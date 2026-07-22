@@ -12,8 +12,8 @@ Triton Pallas 経路が機能するかを、長期学習へ進む前に確認す
 | 0.185B Screening v2 | 400 step、6,553,600 tokenをfiniteで完走。lossは20.768から5.789へ低下 | RWKV主経路は学習できる。ただしstep 26までにwrite admissionがほぼゼロになり、Screeningは実質停止した |
 | 0.3B legacy read/write | 200 step、6,553,600 tokenをfiniteで完走。lossは18.686から6.091へ低下 | 学習は継続できる。ただしread activityはstep 107までにゼロになり、slotは高い重複を示した |
 | 0.3B Screening v2 | 20-step診断はfiniteで完走したが、別の200-step予定runはstep 7からNaN | 本格学習へ進めない。数値不安定性とrun間の再現性を先に解決する必要がある |
-| 0.185B Screening v5 core | FP32 recurrence/projection境界の修正後、50 step、819,200 tokenをfiniteで完走。lossは20.891から8.628へ低下 | 数値gateは改善。ただしmemory residual比は2.54e-7、slot redundancyは0.919で、memory利用の品質gateは未通過 |
-| 0.3B Screening v5 core | 30-step runの一方はstep 16からNaN、同条件の再runは245,760 tokenをfiniteで完走しloss 18.618から9.685へ低下 | 再現性を含む安定性は未確立。完走runでもnovel writeが100%、redundancyが0.987、memory residual比が1.97e-6 |
+| 0.185B Screening v5 core | recovery profileで2,000 step、32,768,000 tokenをfinite完走。lossは20.891から4.954へ低下し、step 2,000 gradientは423/423 leaf finite | 数値gateは通過。ただし1 / 16 slotだけを使い、memory-off loss差は+9e-6。memory品質gateは未通過 |
+| 0.3B Screening v5 core | recovery profileで同一seed 30-step 2 runと400-step runをfinite完走。step 400 gradientは480/480 leaf finite | 旧all-writeは抑えたが、aggregate利用率3.125%と層間collapseを示唆。memory-off loss差は-4e-6で品質gate未通過 |
 | ROCm Triton Pallas | WKV、Screening、training head、optimizerが実機lowering・実行可能 | AMD GPU対応の基盤は成立。ただしproduction形状のScreening parity gateは未通過 |
 
 したがって、この測定は「MI300X上で現行JAX/Pallas学習スタックを実行できる」
@@ -96,9 +96,115 @@ anti-starvation/read curriculumの検証を先行する。
 key次元16でanalytic近似が`tau_read=0.946`まで上昇することを確認した。実装は
 Gaussian null CDFのfamily-wise quantile（同条件で0.789）へ変更し、training
 限定soft-to-hard read、temporary self-index loss、upper write budget、
-redundancy-aware victim、memory-off評価を追加した。これらはローカルの意味論・
-gradientテストを対象とするfollow-upであり、本書のMI300X結果を上書きしない。
-新構成のmemory利用と品質改善は再測定するまで未検証である。
+redundancy-aware victim、memory-off評価を追加した。この時点ではローカルの
+意味論・gradientテストだけを対象とするfollow-upであり、新構成のmemory利用と
+品質改善は未検証だった。次節に、その後の再測定を分離して記録する。
+
+### 2026-07-22 recovery profile再検証
+
+上記follow-upをcommit `c08d970`で実装し、checkpoint counterfactual評価の
+NNX trace境界をcommit `3e1c3ae`で修正した後、別のMI300X VFで再測定した。
+ハードウェアはgfx942、HBM約192 GiB、softwareはPython 3.13.14、JAX / jaxlib
+0.10.0、ROCm 7.14である。公開repositoryの
+`agent/screening-pallas-benchmarks`を新規cloneし、README記載のBlinkDL
+MiniPile `.idx` / `.bin`を使用した。WKVは`pallas_gpu_triton`、Screening v5は
+`portable_jax_v5`、headは`full_logits_xla`、optimizerはOptaxである。
+
+実機smokeではWKV Pallas、v4 Screening Pallas、training headの4 testが通過
+した。checkpoint付きmemory-off evaluatorは、互換`apply`を`jax.jit`内部で
+再構成せず、NNX moduleを明示引数とする`nnx.jit`へ変更し、CPU 5 testと
+MI300X実評価の両方を通過した。
+
+#### 実学習
+
+| model / run | batch x context | steps / tokens | train loss first -> last | steady median | final gradient gate |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0.185B短期 | 32 x 512 | 50 / 819,200 | 20.891 -> 8.770 | 25,781 token/s | 423/423 leaf finite |
+| 0.185B curriculum全期間 | 32 x 512 | 2,000 / 32,768,000 | 20.891 -> 4.954 | 25,822 token/s | 423/423 leaf finite |
+| 0.3B再現run 1 | 8 x 1,024 | 30 / 245,760 | 18.618 -> 9.584 | 5,030 token/s | 480/480 leaf finite |
+| 0.3B再現run 2 | 8 x 1,024 | 30 / 245,760 | 18.618 -> 9.594 | 約5,030 token/s | 480/480 leaf finite |
+| 0.3B延長run | 8 x 1,024 | 400 / 3,276,800 | 18.618 -> 6.669 | 5,111 token/s | 480/480 leaf finite |
+
+0.3Bの同一seed 30-step 2 runはどちらもfiniteだった。最終loss差は0.00933、
+全step中の最大loss差は0.571であり、以前のstep 16 NaNは再現しなかったが、
+bitwiseな決定性を示す結果でもない。0.185B step 2,000と0.3B step 400の
+gradient gateは、学習batchとは別の固定MiniPile batchを使い、lossと全gradient
+値がfiniteであることをfail-closedで確認した。
+
+#### memory利用
+
+| model / step | novel | accepted novel | rejected write | write budget rate | slot utilization | read relevance | residual/base RMS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.185B / 1 | 5.322% | 4.065% | 26.538% | 0.2284 | 21.387% | 7.072e-3 | 5.094e-3 |
+| 0.185B / 50 | 0.635% | 0.470% | 0.867% | 0.0223 | 13.867% | 1.932e-2 | 8.057e-6 |
+| 0.185B / 500 | 0.195% | 0.195% | 0% | 0.0438 | 6.250% | 2.627e-3 | 4.166e-6 |
+| 0.185B / 2,000 | 0.195% | 0.195% | 0% | 0.0279 | 6.250% | 3.746e-3 | 9.422e-6 |
+| 0.3B / 1 | 7.434% | 5.231% | 30.029% | 0.2316 | 24.902% | 7.267e-3 | 3.720e-3 |
+| 0.3B / 30 | 50.049% | 0.049% | 50.000% | 0.0499 | 3.125% | 2.753e-3 | 4.162e-7 |
+| 0.3B / 400 | 50.049% | 0.049% | 50.000% | 0.0459 | 3.125% | 4.909e-3 | 5.372e-7 |
+
+0.185Bではstep 500以降、1 token / 512 tokenと一致するnovel rateと1 / 16の
+slot utilizationが固定された。0.3Bでは2 screened layerのaggregateが、
+`novel=0.50048828125`、`accepted=0.00048828125`、`rejected=0.5`、
+`slot utilization=0.03125`へ固定された。層別metricがないため断定はできないが、
+この正確な分数は、一方の層がほぼ全tokenをnovelとして拒否し、他方の層だけが
+最初の1 slotを占有した状態と整合する。少なくとも、全層平均のwrite budgetが
+目標付近にあることは、各層が健全である証拠にならない。
+
+旧runの全novel/all-writeと0.987 redundancyは解消したが、slot redundancyが0に
+なった理由はslotが十分に分離されたからではなく、比較対象となるoccupied slotが
+ほぼ1個しかないためである。recovery profileは退化解を、過剰write・高重複から
+過少allocation・層間collapseへ移した。memory capacity利用のquality gateは
+依然として不合格である。
+
+#### memory-off counterfactual
+
+| checkpoint | evaluation tokens | active loss | off - active loss | prediction RMS delta |
+| --- | ---: | ---: | ---: | ---: |
+| 0.185B step 50 | 163,840 | 8.598566 | +1.6e-5 | 4.906e-3 |
+| 0.185B step 2,000 | 327,680 | 4.587761 | +9e-6 | 8.884e-3 |
+| 0.3B step 30 run 1 | 81,920 | 9.757456 | -5e-6 | 3.607e-3 |
+| 0.3B step 30 run 2 | 81,920 | 9.733965 | +1.4e-5 | 3.447e-3 |
+| 0.3B step 400 | 163,840 | 6.481575 | -4e-6 | 2.741e-3 |
+
+符号はrun間で一貫せず、loss差はすべて1.6e-5以下である。予測logitは厳密な
+同一ではないが、現在のmemory branchがこの同一MiniPile評価batch上のcross
+entropyを一貫して改善する証拠は得られなかった。held-out品質比較ではない。
+
+#### compute-only complete step
+
+固定device batch、warmup 2、測定5、GC無効、iterationごとの同期を使った。
+
+| model | benchmark LR | forward | backward | optimizer | complete step | throughput | finite gate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 0.185B、32 x 512 | 1e-5 | 135.339 ms | 479.449 ms | 19.445 ms | 612.273 ms | 26,759 token/s | pass |
+| 0.185B、32 x 512 | 1e-4 | 135.404 ms | 480.196 ms | 19.756 ms | 692.546 ms | 23,658 token/s | **fail** |
+| 0.3B、8 x 1,024 | 1e-4 | 378.170 ms | 1,213.370 ms | 25.536 ms | 1,665.190 ms | 4,920 token/s | pass |
+
+0.185Bの1e-4測定はprepared loss/gradientはfiniteだったが、同じ固定batchを
+warmupと測定で繰り返し更新した後のlossとtrain stateがnon-finiteになった。
+したがって23,658 token/sは採用値ではない。実MiniPileの2,000-step runはより
+高いpeak LRでも異なるbatchを用いてfinite完走したため、これは直ちに通常学習の
+NaNを意味しない。一方、以前は同じ1e-4条件が通過していたため、固定batch stress
+の数値回帰として未解決事項に残す。
+
+#### この再検証から必要になった変更
+
+次の実装では、global平均後のanti-starvation lossを強めるだけでは不十分である。
+
+1. `novel`、admission、occupancy、write budget、read/residualをscreened layer別・
+   bank別に記録し、lossも各層へ適用してから集約する。
+2. empty capacityがあるbootstrap期間だけ、各層・各bankの最低occupied slot数または
+   allocation rateを要求する。target到達後は0へannealし、永久writeは強制しない。
+3. 最初のslotが全queryのmatch先になることを防ぐため、capacity fill中はnoveltyを
+   learned matchだけへ依存させず、empty-slot explorationまたは割当予約を導入する。
+4. memory residualを単に非ゼロへ固定せず、synthetic retrieval上で
+   counterfactual改善を伴う範囲に限ってbranch-scale curriculumを検討する。
+5. retention、v5 checkpoint redesign、v5 Pallas化は、複数slot・複数layerの利用と
+   positive counterfactualが確認されるまで後回しにする。
+
+この結果はportable v5の数値実行可能性を支持するが、memoryが主機能として利用
+されるという中心仮説は支持しない。
 
 ### fail-closed compute-only
 

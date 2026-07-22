@@ -114,7 +114,8 @@ alone cannot distinguish healthy writes from saturation.
 - the frozen Linen model rejects v5 rather than silently running v4 equations.
 - large-mesh TPU lowering, multi-device GPU lowering, v5 Pallas parity, and
   checkpoint peak memory have not been measured. Portable v5 has single-MI300X
-  loss/gradient, short-training, and throughput measurements only.
+  loss/gradient, curriculum-length training, counterfactual, and throughput
+  measurements, but its memory-quality gate failed.
 
 ## Tracked configurations
 
@@ -135,17 +136,23 @@ the Gaussian-null threshold value, below-threshold smooth-read gradients,
 self-index geometry gradients, the upper write budget, the memory-off residual
 override, and the first versioned golden vector.
 
-On one MI300X, the corrected 0.185B configuration completed 50 MiniPile steps
-(819,200 tokens) and a separate step-50 fixed-batch diagnostic passed 423/423
-gradient leaves. A 0.3B run completed 30 steps and its step-14/30 diagnostics
-passed 480/480 leaves, but another run with the same main settings became NaN
-at step 16. Numerical reproducibility is therefore still open.
+On 2026-07-22, the tracked recovery profile was repeated on one MI300X. The
+0.185B configuration completed all 2,000 curriculum steps (32.77M tokens), and
+the 0.3B configuration completed 400 steps plus two same-seed 30-step runs.
+All final production-shape diagnostics passed 423/423 and 480/480 finite
+gradient leaves. The earlier 0.3B step-16 NaN did not recur in these runs,
+although the two same-seed trajectories were not bitwise deterministic.
 
-The quality gate failed more clearly than the finite gate. At the end of the
-0.185B run, memory residual/base RMS was 2.54e-7 and slot redundancy was 0.919.
-At the end of the finite 0.3B run, every token was admitted as novel, residual
-ratio was 1.97e-6, and redundancy was 0.987. These observations support neither
-memory use nor quality benefit. See
+The memory-quality gate still failed. The 0.185B run converged to one occupied
+slot out of 16 and a residual/base RMS ratio of 9.42e-6. The 0.3B aggregate
+converged to 3.125% utilization across two screened layers, 50.0488% novel
+tokens, 50% rejected writes, and a residual ratio of 5.37e-7. Exact aggregate
+fractions are consistent with one layer rejecting nearly every token and only
+one slot in the other layer being occupied, but layer-resolved metrics are
+required to prove that interpretation. Memory-off loss deltas ranged from
+-5e-6 to +1.6e-5 and did not show a consistent quality benefit. The recovery
+profile therefore exchanged all-write/high-redundancy collapse for
+under-allocation and likely layer-wise collapse. See
 [`gpu_mi300x_training_validation.md`](gpu_mi300x_training_validation.md) for
 the exact conditions and limitations.
 
@@ -155,8 +162,8 @@ counterfactual memory ablation, parameter/compute-matched controls, and real
 accelerator gates must pass before this path is called beneficial or
 production-ready.
 
-The threshold, read curriculum, self-index objective, upper write budget,
-redundancy-aware victim setting, and memory-off evaluator were added after
-those MI300X measurements. They have local semantic/gradient coverage but no
-new accelerator quality result yet. The prior failed quality gate remains the
-last empirical result until the matched experiments are repeated.
+The next recovery iteration must expose and constrain write/read behavior per
+screened layer and bank, and must bootstrap empty-capacity allocation without
+forcing permanent writes. Retention, v5 checkpoint reconstruction, and v5
+Pallas optimization remain gated until multi-slot use and a positive causal
+counterfactual are demonstrated.

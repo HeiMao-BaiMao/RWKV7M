@@ -2310,7 +2310,7 @@ semantics_version:
 | --- | --- | --- |
 | `screening-v4-legacy` | `disabled`, `legacy_unconditional`, `legacy_threshold` | implemented compatibility contract |
 | `screening-v4-competitive` | `competitive_novel` | implemented predecessor contract |
-| `screening-v5-core` | `competitive_novel` | portable Phase 1 candidate; MI300X partial finite gate通過、quality/Pallas accelerator gate未通過 |
+| `screening-v5-core` | `competitive_novel` | portable Phase 1 candidate; MI300X 0.185B 2,000-step / 0.3B 400-step finite gate通過、memory quality/Pallas accelerator gate未通過 |
 | `screening-v5-retention` | `competitive_novel` | design-only |
 
 同じ`write_mode=competitive_novel`でも、semantics versionが異なればoccupancy、
@@ -2342,6 +2342,23 @@ v5 benchmark toolingでは、headline commandが必ずmodeを明示する。
 ```
 
 未指定でheadline benchmarkを実行しない。
+
+## 17.1 Recovery profileのMI300X反証結果
+
+2026-07-22のMI300X再測定では、Gaussian-null threshold、soft-to-hard read、
+self-index loss、上下write budget、redundancy-aware victimを含むtracked profileを
+評価した。0.185Bは2,000 stepをfinite完走したが、step 500以降のslot利用は
+1 / 16、step 2,000のmemory residual/base RMSは9.42e-6だった。0.3Bも400 stepを
+finite完走したが、2 screened layerのaggregate slot利用は3.125%、residual比は
+5.37e-7だった。memory-off counterfactualのloss差はrun間で-5e-6から+1.6e-5で、
+一貫した改善を示さなかった。
+
+したがって、recovery profileは旧all-write/high-redundancy collapseを解消したが、
+memory利用を成立させたのではなく、under-allocationと層間collapseへ退化解を
+移したと判定する。次版はglobal平均後のbudgetではなく、screened layer・bank別の
+occupancy/allocation curriculumを用い、empty capacityを各層で埋める必要がある。
+このgateを通るまでretention、checkpoint redesign、v5 Pallas最適化を品質改善の
+根拠として進めない。
 
 ---
 

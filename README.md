@@ -261,14 +261,19 @@ The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
   compute and recurrent state/cotangents with BF16 stored parameters; this
   boundary passed post-training MI300X gradient diagnostics. Its Pallas path,
   checkpoint redesign, retention profile, numerical reproducibility, and
-  quality claims remain gated. The MI300X short runs collapsed the memory
-  residual and produced high slot redundancy. The tracked recovery configs
+  quality claims remain gated. The original MI300X short runs collapsed the
+  memory residual and produced high slot redundancy. The tracked recovery
+  configs
   now replace the overly conservative read tail bound with a Gaussian-null
   family-wise quantile, use a training-only soft-to-hard read curriculum,
   bootstrap query/candidate geometry with a temporary self-index loss, cap
   all-novel writes with an upper budget, and enable redundancy-aware victim
-  selection. These changes are implemented and locally tested, but have not
-  yet repeated the MI300X quality gate. See the
+  selection. A 2026-07-22 MI300X rerun completed 2,000 0.185B steps and 400
+  0.3B steps with finite final gradients, but converged to one occupied slot
+  per active aggregate and memory-off loss deltas between -5e-6 and +1.6e-5.
+  The recovery avoided the previous all-write/high-redundancy state but
+  replaced it with under-allocation and likely layer-wise collapse; the
+  quality gate remains failed. See the
   [Screening v5 implementation contract](docs/state_level_screening_v5_design.md).
   Screening v2 adds value-space gating, a factorized
 candidate, confidence-preserving competitive writes,
