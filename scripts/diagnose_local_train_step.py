@@ -334,7 +334,10 @@ def main(argv=None):
                 "--include-update cannot be combined with --float32-model"
             )
         _make_optimizer_state_writable(train_state.optimizer)
-        before_params = nnx.state(train_state.model, nnx.Param)
+        before_params = jax.tree.map(
+            _writable_device_copy,
+            nnx.state(train_state.model, nnx.Param),
+        )
         train_state.optimizer.update(train_state.model, gradients)
         after_params = nnx.state(train_state.model, nnx.Param)
         parameter_delta = _parameter_delta(before_params, after_params)

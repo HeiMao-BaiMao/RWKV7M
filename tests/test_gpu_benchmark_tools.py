@@ -199,6 +199,13 @@ def test_gradient_diagnostic_copies_read_only_arrays_to_device():
     assert np.array_equal(np.asarray(copied), source)
 
 
+def test_gradient_diagnostic_parameter_delta_uses_independent_values():
+    before = nnx.State({"weight": jnp.asarray([1.0, 2.0])})
+    after = nnx.State({"weight": jnp.asarray([1.5, 1.0])})
+    delta = DIAGNOSE._parameter_delta(before, after)
+    assert jnp.array_equal(delta["weight"], jnp.asarray([0.5, -1.0]))
+
+
 def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
     checkpoint = tmp_path / "ckpt-00000007"
     args = DIAGNOSE.parse_args(
