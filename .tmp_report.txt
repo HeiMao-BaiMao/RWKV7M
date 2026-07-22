@@ -1035,6 +1035,48 @@ CheckifyとWKV backend対照:
 - ただし全WKVを一括でreference化した対照なので、故障層とkernel内部演算は未確定。
 - per-layer reference overrideを診断ツールへ追加し、まずlayer 6だけを置換する。
 
+per-layer判別結果:
+
+- layer 6だけをportable WKVへ置換し、他11層をPallasのままにした。
+- loss=8.2016163、423 gradient leaf全てfinite。
+- total grad L2=27.2010、max abs=1.75。
+- Screening grad L2=0.0144143、max abs=0.0017319。
+- 従ってstep 251の故障callはscreened layer 6のPallas WKV backwardに局在した。
+
+finiteな独立対照の合流:
+
+- full FP32: loss=8.202595、grad L2=27.1887、max abs=1.75185
+- global `eps=1e-5` + Pallas: loss=8.2016392、grad L2=27.1970、max abs=1.75
+- 全WKV reference: loss=8.2052517、grad L2=27.2002、max abs=1.75
+- layer 6だけreference: loss=8.2016163、grad L2=27.2010、max abs=1.75
+
+この合流が支持する解釈:
+
+- 有限な迂回路は全てほぼ同じ良条件のgradient normへ到達する。
+- model checkpointが本質的なgradient特異点にある、という説明は弱くなった。
+- FP32やepsilon変更はmodelを「治した」のではなく、微小なforward差でkernelの
+  故障入力領域を回避した可能性が最も高い。
+- よってstep 251についてはkernel defectを第一原因とする確信度が高い。
+
+ただし一般化の制約:
+
+- §8のreference WKV training runは別trajectoryのstep 248でNaNになった。
+- 今回のfixed-state比較はその別NaNを説明しない。Pallas修正後も複数seed/再開で
+  安定性統計を取り、全training NaNが解消したとは仮定しない。
+
+phase 0.5 capture:
+
+- layer 6の各WKV callについて、`r/w/k/v/neg_kk/kka`、initial state、
+  activation cotangent、final-state cotangentをNPZへ保存する診断経路を追加した。
+- capture forwardは実Pallas Tritonを使い、capture callのpullbackだけportable
+  referenceへ置換する。これにより親graphをfiniteに保ちながら、Pallas forwardへ
+  実際に着弾したcotangentを回収する。
+- captureを単体でPallas/reference VJPへ再投入し、入力・出力・7 gradientごとの
+  non-finite数、有限部分のmax差、relative L2差をJSON化するscriptを追加した。
+- まずMI300X captureを回収し、その後CPU Pallas interpretで再現を試す。
+- interpretでも再現すれば数式/kernel body、再現しなければROCm/Triton lowering固有を
+  第一候補とする。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================

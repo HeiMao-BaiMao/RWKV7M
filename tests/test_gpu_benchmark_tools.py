@@ -32,6 +32,7 @@ COMPARE = _load("compare_compute_benchmarks")
 CUDA_RANGE = _load("cuda_profiler_range")
 LOCAL = _load("benchmark_local_train_compute")
 DIAGNOSE = _load("diagnose_local_train_step")
+WKV_CAPTURE = _load("diagnose_wkv_capture")
 
 
 def test_fixed_batch_content_hash_ignores_container_and_mapping_order(tmp_path):
@@ -286,6 +287,67 @@ def test_gradient_diagnostic_rejects_invalid_reference_wkv_layers(tmp_path):
                 str(tmp_path / "diagnostic.json"),
             ]
         )
+
+
+def test_gradient_diagnostic_accepts_wkv_capture_pair(tmp_path):
+    capture_dir = tmp_path / "captures"
+    args = DIAGNOSE.parse_args(
+        [
+            "--fixed-batch",
+            str(tmp_path / "batch.npz"),
+            "--model-config",
+            "config.json",
+            "--capture-wkv-layer",
+            "6",
+            "--capture-wkv-dir",
+            str(capture_dir),
+            "--output",
+            str(tmp_path / "diagnostic.json"),
+        ]
+    )
+    assert args.capture_wkv_layer == 6
+    assert args.capture_wkv_dir == capture_dir
+
+
+def test_gradient_diagnostic_rejects_incomplete_wkv_capture_pair(tmp_path):
+    with pytest.raises(SystemExit):
+        DIAGNOSE.parse_args(
+            [
+                "--fixed-batch",
+                str(tmp_path / "batch.npz"),
+                "--model-config",
+                "config.json",
+                "--capture-wkv-layer",
+                "6",
+                "--output",
+                str(tmp_path / "diagnostic.json"),
+            ]
+        )
+
+
+def test_wkv_capture_summary_counts_nonfinite_values():
+    summary = WKV_CAPTURE._summary(
+        jnp.asarray([1.0, jnp.nan, jnp.inf], dtype=jnp.float32)
+    )
+    assert summary["nonfinite_count"] == 2
+    assert summary["max_abs_finite"] == 1.0
+    assert summary["l2_norm_finite"] == 1.0
+
+
+def test_wkv_capture_parser_accepts_explicit_backend(tmp_path):
+    args = WKV_CAPTURE.parse_args(
+        [
+            "--capture",
+            str(tmp_path / "capture.npz"),
+            "--backend",
+            "pallas_gpu_triton",
+            "--output",
+            str(tmp_path / "result.json"),
+            "--require-parity",
+        ]
+    )
+    assert args.backend == "pallas_gpu_triton"
+    assert args.require_parity is True
 
 
 def test_gradient_diagnostic_rejects_both_float32_modes(tmp_path):
