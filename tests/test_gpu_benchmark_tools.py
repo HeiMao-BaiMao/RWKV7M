@@ -234,6 +234,7 @@ def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
     assert args.float32_model is True
     assert args.float32_parameters is False
     assert args.component_gradients is False
+    assert args.checkify_floats is False
     assert args.include_update is False
 
 
@@ -251,6 +252,21 @@ def test_gradient_diagnostic_accepts_parameter_only_promotion(tmp_path):
     )
     assert args.float32_model is False
     assert args.float32_parameters is True
+
+
+def test_gradient_diagnostic_accepts_float_checkification(tmp_path):
+    args = DIAGNOSE.parse_args(
+        [
+            "--fixed-batch",
+            str(tmp_path / "batch.npz"),
+            "--model-config",
+            "config.json",
+            "--checkify-floats",
+            "--output",
+            str(tmp_path / "diagnostic.json"),
+        ]
+    )
+    assert args.checkify_floats is True
 
 
 def test_gradient_diagnostic_rejects_both_float32_modes(tmp_path):

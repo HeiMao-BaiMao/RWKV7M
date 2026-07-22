@@ -1007,6 +1007,14 @@ normalization-only感度:
 - この変更だけでproduction fixed batchが有限化するかを次に検証する。有限化しなければ
   global epsilonが影響する別の数式を引き続き分離する。
 
+production fixed-batch結果:
+
+- tie-safe min--max適用後もloss=8.2013826、non-finiteは
+  247 leaf / 48,508,683 valueで変化なし。
+- 従ってこの人工的gradientは独立した数値リスクだが、step 251 NaNの直接原因ではない。
+- 次はtotal loss/gradient graphへJAX float checkを挿入し、最初に報告される
+  NaN/division演算を取得する。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================

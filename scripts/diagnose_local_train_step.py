@@ -9,6 +9,7 @@ from pathlib import Path
 from flax import nnx
 import jax
 import jax.numpy as jnp
+from jax.experimental import checkify
 import numpy as np
 
 from rwkv7m.api import create_train_runtime
@@ -94,6 +95,15 @@ def parse_args(argv=None):
         help=(
             "also differentiate CE, admission floor, write budget, and "
             "self-index losses independently"
+        ),
+    )
+    parser.add_argument(
+        "--checkify-floats",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "instrument the total loss/gradient graph with JAX NaN and "
+            "division checks and record the first reported error"
         ),
     )
     parser.add_argument(
@@ -339,7 +349,16 @@ def main(argv=None):
         loss, _ = loss_outputs(active_params)
         return loss
 
-    loss, gradients = jax.jit(jax.value_and_grad(loss_function))(params)
+    checkify_error = None
+    if args.checkify_floats:
+        checked_value_and_grad = checkify.checkify(
+            jax.value_and_grad(loss_function),
+            errors=checkify.float_checks,
+        )
+        error, (loss, gradients) = jax.jit(checked_value_and_grad)(params)
+        checkify_error = error.get()
+    else:
+        loss, gradients = jax.jit(jax.value_and_grad(loss_function))(params)
     jax.block_until_ready((loss, gradients))
     summary = summarize_gradient_state(gradients, top_k=args.top_k)
     component_summaries = None
@@ -418,6 +437,7 @@ def main(argv=None):
         ],
         "gradients": summary,
         "component_gradients": component_summaries,
+        "checkify_float_error": checkify_error,
         "parameter_update": update_summary,
     }
     rendered = json.dumps(payload, indent=2, sort_keys=True)
