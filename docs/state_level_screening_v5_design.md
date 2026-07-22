@@ -199,6 +199,26 @@ upper budget prematurely. GPU validation remains pending. Retention, v5
 checkpoint reconstruction, and v5 Pallas optimization remain gated until
 multi-slot use and a positive causal counterfactual are demonstrated.
 
+A 2026-07-22 MI300X stability investigation on the synthetic retrieval task
+added two numeric hardenings to this path: victim-allocation age/usage
+statistics use a tie-safe masked min--max (a span at or below `eps` yields
+zero forward and gradient, removing artifact gradients up to about `1.17e6`
+on tied statistics), and `norm_eps` is an independent setting with an
+unchanged default. Neither was the cause of the recurring production training
+NaN: that failure was isolated on a fixed batch to the coexistence of
+multiple ROCm Pallas WKV pullbacks in one full graph, not to v5 recurrence
+math, and AMD WKV dispatch now fails closed to a Pallas-forward/reference-VJP
+hybrid backend (see
+[`gpu_mi300x_training_validation.md`](gpu_mi300x_training_validation.md)).
+The same investigation showed that while the memory residual is near zero the
+auxiliary objectives are the effective primary training signal for routing:
+with all auxiliaries off, routing saturated toward write-everything;
+self-index alone produced raw-gradient spikes up to `5.56e11` followed by
+collapse toward all-reject; no configuration has yet held a stable interior
+write rate. On held-out streaming retrieval at an early checkpoint the memory
+branch showed its first nonzero causal loss delta (`+1.04e-4`) with
+chance-level retrieval accuracy, so the memory-quality gate remains open.
+
 ## Retrieval evaluation vehicle
 
 `rwkv7m-prepare-retrieval` creates document-aligned delayed key/value data with

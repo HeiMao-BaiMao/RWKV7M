@@ -61,6 +61,13 @@ Implemented:
     backward kernels, with portable reference fallbacks and explicit dispatch.
 20. Real L40S and TPU v5e correctness/performance gates for the tracked
     projected Screening recurrence shape.
+21. A synthetic delayed key-value retrieval data generator with document-aware
+    sampling modes, staged Screening activation with a separate Screening
+    learning-rate multiplier, resume-time execution overrides with preserved
+    checkpoint metadata, non-finite gradient/parameter training diagnostics
+    with fail-closed stopping, and a fail-closed AMD WKV dispatch
+    (`pallas_gpu_triton_reference_vjp`: Triton Pallas forward with the
+    portable reference VJP).
 
 Important limitation:
 
@@ -80,7 +87,12 @@ commit `f35f6fc` passed real TPU v5e-4 lowering, recurrence parity and timing,
 checkpointed `T=512`, and four-way model-axis optimizer steps through the
 tracked 512-token maximum on 2026-07-18. Direct single-kernel `T=2048` exceeds
 v5e scoped VMEM; measured peak memory and steady-state complete-model
-throughput gates have not run.
+throughput gates have not run. On AMD MI300X, a 2026-07-22 fixed-batch
+isolation showed that multiple Pallas WKV training pullbacks coexisting in
+one full graph corrupted cotangents even though every captured call passed in
+isolation; AMD automatic dispatch therefore fails closed to a
+Pallas-forward/reference-VJP hybrid WKV backend, and its real-device
+complete-step acceptance is still pending.
 
 ## 3. Package Layout
 
@@ -557,14 +569,19 @@ Run:
 uv run pytest -q
 ```
 
-As of 2026-07-18, the current worktree suite completed with 200 passing tests
+As of 2026-07-22, the current worktree suite completed with 279 passing tests
 and five accelerator/optional-runtime skips. This count includes GPU optimizer
 and benchmark-harness coverage plus Screening v2 legacy migration, routing
 invariants, hard-forward/soft-backward admission and novelty gradients,
 checkpoint strength limits, fail-closed benchmark parity, sequence-chunk
 parity, and CPU Pallas interpret-mode GPU/TPU checkpointed-gradient parity.
-Real TPU evidence is recorded separately and is not part of this local test
-count.
+It also covers the synthetic retrieval generator and document sampling modes,
+staged Screening activation, resume execution overrides with preserved
+checkpoint metadata, non-finite training diagnostics, separated read/write
+threshold warm-ups, tie-safe allocation statistics, the decay-underflow WKV
+backward regression on both GPU and TPU Pallas backends, and the fail-closed
+AMD `pallas_gpu_triton_reference_vjp` WKV dispatch. Real TPU/GPU evidence is
+recorded separately and is not part of this local test count.
 
 ## 14. Design Rules
 

@@ -32,6 +32,7 @@ common WKV API + custom VJP + sharding contract
     TPU               -> TPU Pallas forward/backward
     NVIDIA Ada/Ampere -> Triton Pallas forward/backward
     NVIDIA Hopper+    -> Mosaic GPU forward/backward
+    AMD (auto)        -> Triton Pallas forward + portable reference VJP
     NVIDIA opt-in     -> registered FFI forward/backward
     CPU/tests          -> lax.scan reference
 ```
@@ -65,10 +66,18 @@ pullback.
 
 Automatic dispatch selects TPU Pallas on TPU, Mosaic GPU Pallas on recognized
 Hopper/Blackwell devices, Triton Pallas on older NVIDIA devices including L40S,
-and the reference recurrence on CPU. `RWKV7M_WKV_BACKEND` can explicitly select
-`reference`, `pallas_tpu`, `pallas_gpu_mosaic`, `pallas_gpu_triton`, or `ffi`.
-FFI is never selected automatically and fails early unless an application has
-registered all three forward, forward-with-aux, and backward callables.
+the hybrid `pallas_gpu_triton_reference_vjp` on recognized AMD devices, and
+the reference recurrence on CPU. The AMD hybrid keeps the Triton Pallas
+forward but runs the portable reference VJP: a 2026-07-22 MI300X fixed-batch
+isolation showed that multiple Pallas WKV pullbacks coexisting in one full
+training graph corrupted cotangents even though all 20 captured pullback
+calls passed in isolation, so AMD training pullbacks fail closed until a
+real-device full-graph gate passes. `RWKV7M_WKV_BACKEND` can explicitly
+select `reference`, `pallas_tpu`, `pallas_gpu_mosaic`, `pallas_gpu_triton`,
+`pallas_gpu_triton_reference_vjp`, or `ffi`; explicit `pallas_gpu_triton`
+remains available on AMD for benchmarking and investigation. FFI is never
+selected automatically and fails early unless an application has registered
+all three forward, forward-with-aux, and backward callables.
 
 ## Training pipeline boundary
 
@@ -368,6 +377,21 @@ During real MiniPile training, 0.185B v2 rejected every write by step 26,
 0.3B legacy stopped producing a measurable memory read by step 81, and the
 longer 0.3B v2 attempt first became non-finite at step 7. The next GPU work is
 therefore numerical and learning-dynamics diagnosis, not dispatch promotion.
+
+A 2026-07-22 stability investigation on synthetic retrieval training then
+isolated a recurring MI300X training NaN on a fixed batch. Along the way it
+fixed an independent Pallas WKV backward defect (inverse state reconstruction
+divided by a decay that FP32 rounds to zero; replaced with a per-token FP32
+state tape on both GPU and TPU backends). The remaining failure was not a
+single-kernel math bug: every captured WKV pullback passed in isolation on
+MI300X for both Pallas and reference, yet any full graph keeping two or more
+Pallas WKV pullbacks failed, while replacing all of them with the reference
+VJP was finite. The first suspect is a ROCm/Triton lowering, buffer-aliasing,
+or custom-call-scheduling interaction. AMD automatic dispatch therefore fails
+closed to `pallas_gpu_triton_reference_vjp` (Pallas forward, reference
+pullback); the real-device complete-step acceptance of this hybrid backend is
+deferred to the next GPU session. Details are in the MI300X validation
+report.
 
 ## TPU v5e Pallas validation record
 

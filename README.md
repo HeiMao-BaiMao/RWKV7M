@@ -224,15 +224,22 @@ The real L40S correctness gate, four-shape WKV benchmark, complete train-step
 measurements, upstream RWKV comparison, TPU comparison, and two-GPU scaling
 record are in the
 [L40S Pallas performance report](docs/gpu_l40s_pallas_performance.md).
-The AMD MI300X ROCm/Triton lowering, compute-only throughput, and short
-MiniPile learning-behavior record for the 0.185B and 0.3B configurations are
-in the
+The AMD MI300X ROCm/Triton lowering, compute-only throughput, short MiniPile
+learning-behavior record for the 0.185B and 0.3B configurations, and the
+2026-07-22 synthetic-retrieval stability investigation with the AMD WKV
+pullback fail-close are in the
 [MI300X training validation report](docs/gpu_mi300x_training_validation.md).
 WKV now dispatches to persistent Pallas forward/backward kernels by default on
 TPU and NVIDIA GPU, while CPU uses the reference recurrence. L40S/Ada selects
 the Triton Pallas lowering explicitly; recognized Hopper/Blackwell devices use
-Mosaic GPU. FFI is an unbundled, explicitly registered escape hatch and is
-never selected automatically.
+Mosaic GPU. Recognized AMD devices fail closed to
+`pallas_gpu_triton_reference_vjp`, which keeps the Triton Pallas forward but
+runs the portable reference VJP: an MI300X fixed-batch isolation showed that
+multiple Pallas WKV pullbacks coexisting in one full training graph corrupted
+cotangents even though every captured call passed in isolation, so training
+pullbacks fail closed until a real-device full-graph gate passes. FFI is an
+unbundled, explicitly registered escape hatch and is never selected
+automatically.
 
 State-level screening has a separate projected recurrence boundary. Dense
 query, gate, delta, key/value-target, and output projections execute once over
@@ -273,7 +280,18 @@ The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
   per active aggregate and memory-off loss deltas between -5e-6 and +1.6e-5.
   The recovery avoided the previous all-write/high-redundancy state but
   replaced it with under-allocation and likely layer-wise collapse; the
-  quality gate remains failed. See the
+  quality gate remains failed. A 2026-07-22 follow-up investigation therefore
+  moved memory-quality evaluation to a synthetic delayed key-value retrieval
+  task with document-aware sampling, staged Screening activation, a separate
+  Screening learning-rate multiplier, and read-only threshold warm-up (the
+  earlier warm-up also lowered write/novelty thresholds and reinforced
+  one-slot collapse). The recurring MI300X training NaN was isolated on a
+  fixed batch to the coexistence of multiple ROCm Pallas WKV pullbacks in one
+  full graph rather than v5 recurrence math; AMD WKV training now fails
+  closed to a Pallas-forward/reference-VJP hybrid backend pending a
+  real-device full-graph gate. On held-out retrieval the memory branch showed
+  its first nonzero causal loss delta (+1.04e-4) but chance accuracy, so the
+  quality gate is still open. See the
   [Screening v5 implementation contract](docs/state_level_screening_v5_design.md).
   Screening v2 adds value-space gating, a factorized
 candidate, confidence-preserving competitive writes,
@@ -903,4 +921,4 @@ Not yet included:
 uv run pytest -q
 ```
 
-Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-19, the current worktree suite completed with 223 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration and the v5 portable Phase 1 semantics: occupancy, capacity calibration, bounded reads, ambiguity-aware routing, finite empty-state gradients, chunk invariance, temporary anti-starvation curricula, a tiny full-model gradient pass, and a size-one Explicit-mesh screening call. It also covers checkpoint strength limits, fail-closed accelerator labeling, explicit factorized-candidate sharding, and CPU Pallas interpret-mode v4 GPU/TPU checkpointed-gradient parity. Real TPU/GPU evidence is recorded separately and is not part of this local test count; no v5 real-accelerator claim is made.
+Current smoke coverage includes math helpers, shape checks, phase/config validation, scan consistency, the common WKV forward/custom-VJP contract, NNX public inference/training, binidx data loading, sequential carry-state reset/eval behavior, safetensors/checkpoint boundaries, local distributed training boundaries, full-model Linen/NNX forward and gradient parity, screening algebra/gradient parity, all five named preset counts and JSON contracts, BF16/FP32 compute and optimizer dtype contracts, independent recurrent/head chunk equivalence, microbatch equivalence, vocabulary-parallel loss, vocabulary-tiled Pallas training-head parity, 7B abstract memory planning, and NNX Orbax lifecycle tests. As of 2026-07-22, the current worktree suite completed with 279 passing tests and five real-accelerator or optional-runtime skips. This includes Screening v2 legacy migration and the v5 portable Phase 1 semantics: occupancy, capacity calibration, bounded reads, ambiguity-aware routing, finite empty-state gradients, chunk invariance, temporary anti-starvation curricula, a tiny full-model gradient pass, and a size-one Explicit-mesh screening call. It also covers checkpoint strength limits, fail-closed accelerator labeling, explicit factorized-candidate sharding, and CPU Pallas interpret-mode v4 GPU/TPU checkpointed-gradient parity. Newer coverage adds the synthetic retrieval generator and document sampling modes, staged Screening activation, resume execution overrides and checkpoint-metadata preservation, non-finite gradient/parameter training diagnostics, separated read/write threshold warm-ups, tie-safe allocation statistics, the decay-underflow WKV backward regression for both GPU and TPU Pallas backends, and the fail-closed AMD `pallas_gpu_triton_reference_vjp` WKV dispatch. Real TPU/GPU evidence is recorded separately and is not part of this local test count; no v5 real-accelerator claim is made.

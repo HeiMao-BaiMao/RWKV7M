@@ -15,6 +15,7 @@ Triton Pallas 経路が機能するかを、長期学習へ進む前に確認す
 | 0.185B Screening v5 core | recovery profileで2,000 step、32,768,000 tokenをfinite完走。lossは20.891から4.954へ低下し、step 2,000 gradientは423/423 leaf finite | 数値gateは通過。ただし1 / 16 slotだけを使い、memory-off loss差は+9e-6。memory品質gateは未通過 |
 | 0.3B Screening v5 core | recovery profileで同一seed 30-step 2 runと400-step runをfinite完走。step 400 gradientは480/480 leaf finite | 旧all-writeは抑えたが、aggregate利用率3.125%と層間collapseを示唆。memory-off loss差は-4e-6で品質gate未通過 |
 | ROCm Triton Pallas | WKV、Screening、training head、optimizerが実機lowering・実行可能 | AMD GPU対応の基盤は成立。ただしproduction形状のScreening parity gateは未通過 |
+| 0.185B v5 synthetic retrieval安定性調査（2026-07-22） | 反復するstep 150--290帯のtraining NaNをfixed batchで隔離。単体call parityは20/20通過、複数Pallas WKV backwardの同一graph共存時のみ破綻 | 第一候補はROCm/Triton lowering・buffer aliasing・custom-call schedulingの相互作用。AMD autoはPallas forward + reference VJPへfail-close。実機full-step受け入れは次回session |
 
 したがって、この測定は「MI300X上で現行JAX/Pallas学習スタックを実行できる」
 ことを支持するが、「Screeningが学習品質を改善する」ことは支持しない。
@@ -227,6 +228,124 @@ NaNを意味しない。一方、以前は同じ1e-4条件が通過していた�
 した最終loss/stateがnon-finiteになったため、表示された9,443 token/sを採用
 しない。実MiniPile runの28,535 token/sとcompute-onlyの23,532 token/sも、
 batch内容、学習率、反復境界が異なる別系列であり、直接比率を性能主張に使わない。
+
+## 2026-07-22 synthetic retrieval安定性調査とAMD WKV fail-close
+
+recovery profile再検証の後、memory品質評価の主vehicleをMiniPile magic
+sampler + `carry_state=false`からdocument単位のsynthetic delayed key-value
+retrievalへ変更し、同じMI300X系ホストで学習安定性を切り分けた。magic +
+`carry_state=false`は毎シーケンスで空memoryから始まるため、chunk境界を越える
+保持というScreening固有の価値を評価できない。以後この構成は数値・throughput
+gateとしてのみ使う。
+
+### 実験系
+
+- 0.185B preset、batch 8 x 512(4,096 token/step)、LR 1e-4一定
+- Screening layer 6、16 slots、`screening-v5-core`
+- staged activation: `activation_step=100`、warmup 100 step、
+  Screening optimizer LR multiplier 0.1
+- retrieval data: train 8,192 / eval 1,024 documents、1 document = 4 chunk x
+  128 token、key 256種、distractor 16、answer maskはtoken 4以降
+- 評価はdocument_sequential + `carry_state=true`、memory-on/off同時比較
+
+### 調査中に確定した独立バグと修正
+
+1. 低load時のread threshold warm-upがwrite/novelty閾値にも適用され、最初の
+   occupied slotがほぼ全tokenへmatchして1-slot collapseを自己強化していた。
+   warm-upをread専用に分離した(commit `cc3e42c`)。
+2. `--model-config`使用時にoptimizer系CLI overrideが無視されていた
+   (commit `828b9e7`)。resume時にexecution overrideが適用されない問題
+   (commit `8b761a0`)と、resume後checkpoint metadataが旧設定を記録する問題
+   (commit `3717e8f`)も修正した。これらの影響を受けた一部ablation runは無効
+   として除外した。
+3. Pallas WKV backwardのinverse state reconstructionは、decayがFP32で0へ
+   roundする入力で非有限化するアルゴリズム欠陥だった。VJP内forward再実行と
+   token別FP32 state tapeへ置換し、GPU/TPU両backendへ回帰テストを追加した
+   (commit `2599ad5`)。修正後のPallasはreference比約2.6倍を維持した。
+4. victim allocationのmasked min--max正規化は、同値統計のtieで最大約1.17e6の
+   人工gradientを作った。spanが`eps`以下なら0へ落とすtie-safe化を実装した
+   (commit `2263dcd`)。`norm_eps`も独立設定へ分離した(既定値は不変)。
+5. 学習CLIへraw gradient / 更新後parameterのfinite診断とfail-closed停止を
+   追加した(commit `d13836c`、`5fb2ad4`)。
+
+### aux ablationの要約
+
+trunk-only checkpoint 100から同一条件でresumeした有効runの結果:
+
+| arm | 結果 | 要点 |
+| --- | --- | --- |
+| no-aux | step 400までfinite | ただしnovelty=1.0の全書き込みから約4--5%へ漂流し、slot utilization 0.25、residual/base RMS比median 4.94e-6の退化解 |
+| self-index-only | step 300までfinite | step 112--119にraw gradient L2最大5.5586e11のspike、直後にほぼ全拒否へcollapse |
+| budget-only | step 251でraw gradient NaN | 直前spikeなし、window内budget loss=0のまま失敗 |
+| all-aux | step 176 / 290でNaN | step 287--288に4.3e8--2.2e10のspike後、289で正常値へ戻り290で非有限化 |
+
+CEに対するmemory residualが極小(~1e-5)のままでは、routing系ゲートの実効的な
+学習信号はaux lossだけになる。安定した中間write率を長期維持した構成はまだ
+ない。aux値の急峻さ単独ではNaNを説明できず、auxはrouting/stateの軌道を変える
+因子として扱う。
+
+### fixed-batch隔離: step 251 NaNの帰属
+
+budget-only runの最終健全checkpoint 250と固定batchで、失敗を決定論的に
+再現・分解した。
+
+- forward loss 8.2013はfinite。CE単独の微分で423 leaf中247 leaf、
+  48,508,683値のgradientが非有限。非有限はlayer 0--6、embedding、layer 6
+  write-side 16 leafに局在し、layer 7--11とLM headはfinite。
+- parameter storageだけFP32へ昇格しても完全に同数・同一pathで非有限。
+- global `eps`を1e-5または1e-3にすると有限化するが、`norm_eps`だけの変更では
+  不変。tie-safe min--max適用後も不変。full FP32化では有限(grad L2 27.19)。
+- `RWKV7M_WKV_BACKEND=reference`でWKVだけportable化すると、既定epsのまま
+  全423 leafがfinite(grad L2 27.2002)。full FP32・eps=1e-5・reference WKVの
+  3変種が同水準のgradient norm(~27.2)へ合流するため、このcheckpoint状態の
+  真の勾配は良条件であり、失敗は数値conditioningではなく実行系にあると
+  判断した。
+- layer 6のWKV callをcaptureすると、着弾するactivation cotangentがcapture
+  時点で既に非有限だった。従って「layer 6 Pallas WKV backwardが発生源」と
+  いう一次解釈は撤回した。
+- finiteなfull step(全layer Pallas forward + reference pullback)でlayers
+  7--11の全20 WKV callをcaptureし、各callをPallas/reference VJPへ単体再投入
+  すると20/20でfiniteかつ近似一致した。単一kernel数式バグはこの再現では
+  支持されない。
+- 集合判別: layers 9--11のみreference pullback化しても、layers 7--8のみでも
+  失敗(それぞれ48,508,683 / 48,507,915値)。layers 7--11を同時にreference化
+  した場合のみ0非有限で全leaf finite。
+
+結論として、step 251 NaNはv5 Screening recurrence単体の数式バグではなく、
+単体では正しい複数のPallas WKV backward custom callが同一full graphに共存
+した場合にのみ破綻する。現時点の第一候補はROCm/Tritonのlowering、buffer
+aliasing、custom-call schedulingまたはその相互作用であり、単一layer/kernel
+数式への局在は主張しない。
+
+### AMD fail-closed dispatch
+
+対策として、WKV backendへ`pallas_gpu_triton_reference_vjp`を追加した。
+forwardはTriton Pallasを維持し、reverse-mode pullbackだけportable reference
+を使う。AMD deviceの`auto` dispatchはこのhybrid backendへfail-closeした。
+NVIDIA L40S/Adaの`pallas_gpu_triton`、Hopper/Blackwellの`pallas_gpu_mosaic`、
+TPUの`pallas_tpu`は変更していない。AMDでも明示的な`pallas_gpu_triton`指定は
+benchmark・調査用に残る。
+
+このhybrid backendのMI300X実機full-step再検証は、費用を抑えるため次回の
+短時間GPU sessionへfail-closedのまま残している。現時点の根拠はfixed-batch
+隔離と、CPU interpretを含むローカル回帰(repository全suite 279 passed、
+5 skipped)である。
+
+### 再現資産
+
+fixed batch、corrected checkpoint metadata、layer 6 / layers 7--11 capture、
+20 call分の解析JSONは`.tmp/mi300x-budget250-wkv/`(50 files、NPZ 25本、
+128,046,793 bytes)としてローカル回収済みである。大容量のcheckpoint由来
+一時成果物のため`.tmp/`はgitignoreされ、repositoryへはcommitしない。
+
+### retrieval品質の現状
+
+write threshold修正後のstep 205 checkpointに対するheld-out streaming
+retrieval評価(128 eval step、ctx 128、memory-on/off同一batch列)は、
+loss 9.2866、accuracy 1/256(chance)、memory-off loss delta +1.04e-4、
+prediction RMS delta 2.688e-3だった。旧dead branchと異なりmemoryはlogitへ
+非ゼロの因果効果を持つが、retrieval精度の改善はまだ示されていない。
+memory品質gateは引き続き未通過である。
 
 ## 検証対象
 
