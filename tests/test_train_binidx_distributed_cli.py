@@ -231,9 +231,17 @@ def test_distributed_binidx_training_cli_saves_and_resumes(tmp_path):
     assert checkpoint_payload.dataset_position == {"step": 1}
 
     resumed, resumed_checkpoint = run_distributed_training(
-        parse_args([*base, "--resume", str(checkpoint)])
+        parse_args(
+            [
+                *base,
+                "--resume",
+                str(checkpoint),
+                "--remat-blocks",
+            ]
+        )
     )
     assert int(resumed.train_state.step) == 2
+    assert resumed.train_state.model.config.remat_blocks is True
     assert resumed_checkpoint == output_dir / "ckpt-00000002"
 
 

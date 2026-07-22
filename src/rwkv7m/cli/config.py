@@ -69,10 +69,10 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         default="sigmoid",
     )
     parser.add_argument(
-        "--screening-lambda-warmup-floor", type=float, default=0.0
+        "--screening-lambda-warmup-floor", type=float, default=None
     )
     parser.add_argument(
-        "--screening-lambda-warmup-steps", type=int, default=0
+        "--screening-lambda-warmup-steps", type=int, default=None
     )
     parser.add_argument("--screening-candidate-rank", type=int, default=None)
     parser.add_argument("--screening-route-power", type=float, default=1.0)
@@ -167,52 +167,52 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--screening-admission-floor-target-initial",
         type=float,
-        default=0.0,
+        default=None,
     )
     parser.add_argument(
         "--screening-admission-floor-weight",
         type=float,
-        default=0.0,
+        default=None,
     )
     parser.add_argument(
         "--screening-admission-floor-steps",
         type=int,
-        default=0,
+        default=None,
     )
     parser.add_argument(
         "--screening-read-soft-warmup-steps",
         type=int,
-        default=0,
+        default=None,
     )
     parser.add_argument(
         "--screening-read-soft-warmup-temperature",
         type=float,
-        default=0.1,
+        default=None,
     )
     parser.add_argument(
         "--screening-write-budget-target-max",
         type=float,
-        default=1.0,
+        default=None,
     )
     parser.add_argument(
         "--screening-write-budget-weight",
         type=float,
-        default=0.0,
+        default=None,
     )
     parser.add_argument(
         "--screening-self-index-margin",
         type=float,
-        default=0.0,
+        default=None,
     )
     parser.add_argument(
         "--screening-self-index-loss-weight",
         type=float,
-        default=0.0,
+        default=None,
     )
     parser.add_argument(
         "--screening-self-index-loss-steps",
         type=int,
-        default=0,
+        default=None,
     )
     parser.add_argument(
         "--screening-activation-step",
@@ -244,6 +244,10 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
 
 
 def screening_v2_kwargs(args):
+    def value_or_default(name, default):
+        value = getattr(args, name, None)
+        return default if value is None else value
+
     return {
         "semantics_version": getattr(
             args, "screening_semantics_version", None
@@ -253,11 +257,11 @@ def screening_v2_kwargs(args):
         "gate_activation": getattr(
             args, "screening_gate_activation", "sigmoid"
         ),
-        "lambda_screen_warmup_floor": getattr(
-            args, "screening_lambda_warmup_floor", 0.0
+        "lambda_screen_warmup_floor": value_or_default(
+            "screening_lambda_warmup_floor", 0.0
         ),
-        "lambda_screen_warmup_steps": getattr(
-            args, "screening_lambda_warmup_steps", 0
+        "lambda_screen_warmup_steps": value_or_default(
+            "screening_lambda_warmup_steps", 0
         ),
         "candidate_rank": getattr(args, "screening_candidate_rank", None),
         "route_power": getattr(args, "screening_route_power", 1.0),
@@ -325,35 +329,35 @@ def screening_v2_kwargs(args):
         "allocation_redundancy_weight": getattr(
             args, "screening_allocation_redundancy_weight", 1.0
         ),
-        "admission_floor_target_initial": getattr(
-            args, "screening_admission_floor_target_initial", 0.0
+        "admission_floor_target_initial": value_or_default(
+            "screening_admission_floor_target_initial", 0.0
         ),
-        "admission_floor_weight": getattr(
-            args, "screening_admission_floor_weight", 0.0
+        "admission_floor_weight": value_or_default(
+            "screening_admission_floor_weight", 0.0
         ),
-        "admission_floor_steps": getattr(
-            args, "screening_admission_floor_steps", 0
+        "admission_floor_steps": value_or_default(
+            "screening_admission_floor_steps", 0
         ),
-        "read_soft_warmup_steps": getattr(
-            args, "screening_read_soft_warmup_steps", 0
+        "read_soft_warmup_steps": value_or_default(
+            "screening_read_soft_warmup_steps", 0
         ),
-        "read_soft_warmup_temperature": getattr(
-            args, "screening_read_soft_warmup_temperature", 0.1
+        "read_soft_warmup_temperature": value_or_default(
+            "screening_read_soft_warmup_temperature", 0.1
         ),
-        "write_budget_target_max": getattr(
-            args, "screening_write_budget_target_max", 1.0
+        "write_budget_target_max": value_or_default(
+            "screening_write_budget_target_max", 1.0
         ),
-        "write_budget_weight": getattr(
-            args, "screening_write_budget_weight", 0.0
+        "write_budget_weight": value_or_default(
+            "screening_write_budget_weight", 0.0
         ),
-        "self_index_margin": getattr(
-            args, "screening_self_index_margin", 0.0
+        "self_index_margin": value_or_default(
+            "screening_self_index_margin", 0.0
         ),
-        "self_index_loss_weight": getattr(
-            args, "screening_self_index_loss_weight", 0.0
+        "self_index_loss_weight": value_or_default(
+            "screening_self_index_loss_weight", 0.0
         ),
-        "self_index_loss_steps": getattr(
-            args, "screening_self_index_loss_steps", 0
+        "self_index_loss_steps": value_or_default(
+            "screening_self_index_loss_steps", 0
         ),
         "activation_step": (
             getattr(args, "screening_activation_step", None) or 0
@@ -458,6 +462,24 @@ def apply_execution_overrides(config, args):
         ("screening_activation_step", "activation_step"),
         ("screening_activation_warmup_steps", "activation_warmup_steps"),
         ("screening_optimizer_lr_multiplier", "optimizer_lr_multiplier"),
+        ("screening_lambda_warmup_floor", "lambda_screen_warmup_floor"),
+        ("screening_lambda_warmup_steps", "lambda_screen_warmup_steps"),
+        (
+            "screening_admission_floor_target_initial",
+            "admission_floor_target_initial",
+        ),
+        ("screening_admission_floor_weight", "admission_floor_weight"),
+        ("screening_admission_floor_steps", "admission_floor_steps"),
+        ("screening_read_soft_warmup_steps", "read_soft_warmup_steps"),
+        (
+            "screening_read_soft_warmup_temperature",
+            "read_soft_warmup_temperature",
+        ),
+        ("screening_write_budget_target_max", "write_budget_target_max"),
+        ("screening_write_budget_weight", "write_budget_weight"),
+        ("screening_self_index_margin", "self_index_margin"),
+        ("screening_self_index_loss_weight", "self_index_loss_weight"),
+        ("screening_self_index_loss_steps", "self_index_loss_steps"),
         (
             "screening_write_budget_min_slot_utilization",
             "write_budget_min_slot_utilization",

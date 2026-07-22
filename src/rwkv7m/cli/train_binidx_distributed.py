@@ -42,6 +42,7 @@ from .config import (
     add_optimizer_backend_arg,
     add_screening_v2_args,
     add_training_vocab_tiling_args,
+    apply_execution_overrides,
     parse_args_with_config,
 )
 from .train_binidx import build_config
@@ -626,7 +627,7 @@ def run_distributed_training(args):
         )
     if args.resume:
         checkpoint_payload = load_distributed_checkpoint_metadata(args.resume)
-        config = checkpoint_payload.config
+        config = apply_execution_overrides(checkpoint_payload.config, args)
         start_step = checkpoint_payload.start_step
         if args.model_config is not None or args.model_preset is not None:
             requested_config = build_config(args)

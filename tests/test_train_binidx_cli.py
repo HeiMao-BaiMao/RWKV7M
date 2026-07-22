@@ -203,6 +203,41 @@ def test_model_config_preserves_optimizer_settings_without_cli_overrides(tmp_pat
     assert config.weight_decay == 0.002
 
 
+def test_model_config_honors_explicit_screening_curriculum_overrides(tmp_path):
+    payload = json.loads(
+        Path(
+            "configs/rwkv7m-0.185b-screening-v5-core.json.example"
+        ).read_text(encoding="utf-8")
+    )
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = build_config(
+        parse_args(
+            [
+                "--data-file",
+                "unused",
+                "--ctx-len",
+                "512",
+                "--model-config",
+                str(path),
+                "--screening-activation-step",
+                "300",
+                "--screening-admission-floor-weight",
+                "0",
+                "--screening-write-budget-weight",
+                "0",
+                "--screening-self-index-loss-weight",
+                "0",
+            ]
+        )
+    )
+    assert config.screening.activation_step == 300
+    assert config.screening.admission_floor_weight == 0.0
+    assert config.screening.write_budget_weight == 0.0
+    assert config.screening.self_index_loss_weight == 0.0
+
+
 def test_train_cli_requires_finite_metrics_by_default():
     args = parse_args(["--data-file", "unused", "--ctx-len", "4"])
     assert args.require_finite is True

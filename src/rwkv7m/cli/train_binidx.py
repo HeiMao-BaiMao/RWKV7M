@@ -326,6 +326,7 @@ def run_training(args):
         )
     if args.resume:
         cfg, payload = load_train_checkpoint_metadata(args.resume)
+        cfg = apply_execution_overrides(cfg, args)
         start_step = int(payload.get("step", 0))
         if args.model_config is not None or args.model_preset is not None:
             requested_config = build_config(args)
