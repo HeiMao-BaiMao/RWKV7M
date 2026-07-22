@@ -226,8 +226,41 @@ def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
     assert args.checkpoint == checkpoint
     assert args.sequence_chunk_size == 0
     assert args.float32_model is True
+    assert args.float32_parameters is False
     assert args.component_gradients is False
     assert args.include_update is False
+
+
+def test_gradient_diagnostic_accepts_parameter_only_promotion(tmp_path):
+    args = DIAGNOSE.parse_args(
+        [
+            "--fixed-batch",
+            str(tmp_path / "batch.npz"),
+            "--model-config",
+            "config.json",
+            "--float32-parameters",
+            "--output",
+            str(tmp_path / "diagnostic.json"),
+        ]
+    )
+    assert args.float32_model is False
+    assert args.float32_parameters is True
+
+
+def test_gradient_diagnostic_rejects_both_float32_modes(tmp_path):
+    with pytest.raises(SystemExit):
+        DIAGNOSE.parse_args(
+            [
+                "--fixed-batch",
+                str(tmp_path / "batch.npz"),
+                "--model-config",
+                "config.json",
+                "--float32-model",
+                "--float32-parameters",
+                "--output",
+                str(tmp_path / "diagnostic.json"),
+            ]
+        )
 
 
 def test_nsight_rejects_conflicting_profile_mode():

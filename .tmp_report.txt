@@ -810,33 +810,46 @@ routing/state:
   Pallas backwardが不安定になる領域へ移動させる可能性がある。
 - ただしno-auxはnovelty=1、1-slot、極小residualであり、品質解として不採用。
 
-次の判別実験:
+次の判別実験（後で前提誤りを確認）:
 
-- budget-onlyの最後の健全checkpoint 250から、同じ1 stepを
-  Pallas Screening backendとreference Screening backendで比較する。
-- referenceだけfiniteならPallas backward correctness bug、両方non-finiteなら
-  数式/parameter trajectory側を第一原因とする。
+- budget-onlyの最後の健全checkpoint 250から、同じ1 stepをbackend環境変数を
+  変えて比較する予定だった。
+- しかしコード再監査で、v5 semanticsは現時点では常にportable reference recurrenceを
+  呼び、v4用backend環境変数はv5へ影響しないことを確認した。従ってこの方法では
+  v5 Pallas/referenceを比較できない。以下の§23で訂正する。
 
 
-23. budget checkpoint 250のPallas/reference比較とmetadata bug
-=============================================================
+23. budget checkpoint 250の再現とbackend指定に関する訂正
+=========================================================
 
-backend比較:
+当初backend比較と解釈した実行:
 
 - source checkpoint:
   /root/RWKV7M/out/retrieval-185m-resume100-budgetonly-valid/ckpt-00000250
-- Pallas Screeningでstep 251:
+- backend既定値でstep 251:
   loss=8.195102、raw gradient NaN
-- reference Screeningで同じstep 251:
+- `RWKV7M_SCREENING_BACKEND=reference`指定で同じstep 251:
   loss=8.194990、raw gradient NaN
 - hard write=0.003418、slot utilization=0.091797、budget loss=0は一致
-- forward metricは小さなbackend丸め差以外ほぼ一致
+- forward metricは小さな実行時丸め差以外ほぼ一致
+
+コード再監査による重要な訂正:
+
+- `NNXScreenedRWKVLayer`はv5 semanticsで必ず
+  `screening_v5_recurrence_reference`を呼ぶ。
+- v5実装ファイルも、portable reference gateを通るまでv4 Pallas bodyを再利用しないことを
+  明記している。
+- `RWKV7M_SCREENING_BACKEND`が選択するPallas/reference分岐はv4 recurrence側だけである。
+- 従って上の2実行は、どちらも同じv5 portable recurrenceを実行した。
+- 以前の「Pallas kernel固有ではない」という表現は比較として成立しておらず、撤回する。
 
 結論:
 
-- step 251 NaNはPallas Screening kernel固有ではない。
-- portable reference recurrence/backwardでも再現するため、数式、parameter/state
-  trajectory、またはScreeningを含む上位graphのgradientを調べる必要がある。
+- 確認できたのは、v5 portable recurrence/backwardを含むgraphでstep 251のraw gradientが
+  非有限になることだけである。
+- v5 Pallasは未実装なので、Pallas固有性については現段階で判定不能。
+- 原因調査はv5 portable数式、parameter/state trajectory、hard routing、および
+  Screeningを含む上位graphへ向ける。
 
 固定batch診断で発見した別bug:
 
@@ -857,3 +870,120 @@ backend比較:
 
 修正後にcheckpoint 250からoverrideを保持した新しいdiagnostic checkpointを作り、
 parameter path別の非有限gradient診断をやり直す。
+
+
+24. metadata訂正後のfixed-batch勾配診断
+========================================
+
+再現資産:
+
+- corrected checkpoint:
+  `/root/RWKV7M/out/retrieval-185m-budget250-corrected-metadata/ckpt-00000250`
+- fixed batch:
+  `/root/RWKV7M/out/diagnostics/budget250/step251-batch.npz`
+- corrected config:
+  `/root/RWKV7M/out/diagnostics/budget250/model-config-corrected.json`
+- total diagnostic:
+  `/root/RWKV7M/out/diagnostics/budget250/reference-total-corrected.json`
+- component diagnostic:
+  `/root/RWKV7M/out/diagnostics/budget250/reference-components-corrected.json`
+- full-FP32 diagnostic:
+  `/root/RWKV7M/out/diagnostics/budget250/float32-total-corrected.json`
+
+同じcheckpoint valueとfixed batchをv5 portable recurrenceで評価した結果:
+
+- forward loss=8.2013407、finite
+- 全423 parameter leaf中247 leafのgradientがnon-finite
+- non-finite value総数=48,508,683
+- Screening groupは24 leaf、229,131 valueがnon-finite
+- trunkは48,279,552 valueがnon-finite
+- layer 0--6とembeddingだけが非有限で、layer 7--11とLM headはfinite
+
+top-level別non-finite value数:
+
+- layer 0: 6,896,640
+- layer 1: 6,945,024
+- layer 2: 6,944,256
+- layer 3: 6,939,648
+- layer 4: 6,924,288
+- layer 5: 6,860,544
+- layer 6: 6,969,099
+- embedding: 29,184
+
+Screening parameterの局在:
+
+- non-finiteはlayer 6のwrite-side parameter 16 leafへ局在した。
+- admission feature/projection、bank route、delta candidate、write q/k、screen LN、
+  `tau_w_offset`、一部`mu_by_bank_raw`、slot embeddingが非有限。
+- read projection、value projection、output projection、value gateはfinite。
+- 最も妥当な伝播順は、layer 6のwrite/state recurrence backwardから、その入力である
+  layer 0--6 trunkとembeddingへ非有限値が伝わった、である。
+
+loss component別:
+
+- CE=8.1949902だけを微分しても、totalと同一の247 leaf / 48,508,683 valueが
+  non-finite。
+- write-budget lossはforward値0だが、これを単独微分しても同じ非有限gradientになる。
+  これは`0 * NaN`を含むrate計算経路の結果であり、budget loss値の発火が直接原因とは
+  いえない。
+- admission-floorとself-indexはforward値0で、単独gradientも全てfinite zero。
+- よってこのfixed stateでは、CEからwrite/stateへ入る経路だけで非有限化する。
+
+JAX debug NaN:
+
+- `JAX_DEBUG_NANS=True`ではreverse側v5 `lax.scan`内のNaNとして停止した。
+- scan内部のどのprimitiveかまでは特定できていない。
+
+full FP32対照:
+
+- 同じcheckpoint valueとbatchを`--float32-model`で実行すると423 leaf全てfinite。
+- total gradient L2=27.1887、max abs=1.75185
+- Screening gradient L2=0.0144171、max abs=0.001731
+- loss=8.202595、finite
+
+この結果の解釈上の制約:
+
+- v5 Screening recurrence自体は既にFP32で計算し、投影入力もFP32へcastしている。
+- full FP32化は主にRWKV trunkのhidden値とhard routing境界を変える。
+- 従って「BF16 gradientが単純にoverflowした」とはまだ結論できない。
+- 過去のFP32 parameter-storageだけのtrainingも失敗しており、param保存dtype単独を
+  第一原因とは扱わない。
+- 次にparam保存だけをFP32へ昇格したexact fixed-batch診断を追加し、trunk computeとの
+  効果を分離する。
+
+
+25. Fableによる§15評価と現在の証拠による更新
+=============================================
+
+Fableの主要な指摘:
+
+- no-auxではmemory residualが極小のままwrite policyが100%側へ漂流したため、CEは
+  write rateを実質監督しておらず、auxがroutingの主目的関数になっている。
+- 旧all-rejectとno-aux all-writeは、sigmoid両端の鏡像的な吸収状態である。
+- no-aux step 220は既知のNaN窓244/248より前なので、安定性の証拠として不十分。
+- self-index-only、次にtrunk stop-gradient版を優先すべき。
+- write率をhard実測値に対する勾配外PI制御へ移す案には、Goodhart gap、飽和、
+  急峻なaux gradientを同時に除く可能性がある。
+
+その後に得た実測による更新:
+
+- no-auxはstep 400まで延長し、この1 trajectoryでは全gradient/parameterがfinite。
+- ただしwrite率は最終的に約4--5%へ移動しても、novelty=1、slot utilization=0.25、
+  residual/base RMS比median 4.94e-6で、memory品質はcollapseしたまま。
+- self-index-onlyはstep 300までfiniteだったが、step 117にgradient L2
+  5.56e11という極端なspikeを記録し、その直後にほぼ全拒否へcollapseした。
+  self-indexは重大な不安定化要因だが、NaNの必要十分条件ではない。
+- budget-onlyはbudget lossが0のままstep 251でraw gradient NaNになった。
+  corrected fixed-batch診断ではCE単独でも同じNaNを再現した。
+- 従って現在の証拠は「aux値の急峻さだけがNaNを直接作る」より、auxがrouting/stateを
+  危険な軌道へ動かし、その後CEのwrite-state backwardが非有限化する、を支持する。
+
+PI制御案に対する現時点の立場:
+
+- hard write率を直接制御してsoft/hard Goodhart gapを閉じる発想は採用候補として強い。
+- ただしwrite率だけを5%へ保っても、no-aux runのようにmemory residualがほぼ0なら
+  内容学習やcausal useは保証されない。
+- PI controllerは「率の安定化」、ranking/content objectiveは「何を書くか」、
+  causal-use/retrieval objectiveは「読む価値を作る」を別の契約として設計すべき。
+- 実装前に、現在のportable v5 backwardの数値不安定性を修正する。コントローラを
+  追加しただけでは、同じwrite-state gradient経路を通って再発する可能性がある。

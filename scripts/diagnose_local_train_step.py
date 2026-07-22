@@ -58,6 +58,15 @@ def parse_args(argv=None):
             "mixed-precision overflow from the recurrence equations."
         ),
     )
+    parser.add_argument(
+        "--float32-parameters",
+        action="store_true",
+        help=(
+            "Promote restored parameter storage to float32 while preserving "
+            "the configured activation/compute dtype. This separates "
+            "parameter quantization from full-model compute precision."
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument(
         "--component-gradients",
@@ -93,6 +102,10 @@ def parse_args(argv=None):
         parser.error("--sequence-chunk-size must be non-negative")
     if args.optimizer_total_steps <= 0:
         parser.error("--optimizer-total-steps must be positive")
+    if args.float32_model and args.float32_parameters:
+        parser.error(
+            "--float32-model and --float32-parameters are mutually exclusive"
+        )
     return args
 
 
@@ -270,7 +283,7 @@ def main(argv=None):
             train_state,
         )
         checkpoint_step = restored.start_step
-    if args.float32_model:
+    if args.float32_model or args.float32_parameters:
         promoted_params = jax.tree.map(
             lambda value: value.astype(jnp.float32)
             if hasattr(value, "dtype")
@@ -329,9 +342,10 @@ def main(argv=None):
 
     update_summary = None
     if args.include_update:
-        if args.float32_model:
+        if args.float32_model or args.float32_parameters:
             raise SystemExit(
-                "--include-update cannot be combined with --float32-model"
+                "--include-update cannot be combined with a float32 "
+                "diagnostic override"
             )
         _make_optimizer_state_writable(train_state.optimizer)
         before_params = jax.tree.map(
@@ -364,6 +378,7 @@ def main(argv=None):
         "optimizer_total_steps": int(args.optimizer_total_steps),
         "sequence_chunk_size": config.sequence_chunk_size,
         "float32_model": bool(args.float32_model),
+        "float32_parameters": bool(args.float32_parameters),
         "devices": [
             {
                 "platform": device.platform,
