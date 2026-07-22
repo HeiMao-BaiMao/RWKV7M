@@ -179,6 +179,37 @@ def test_distributed_train_requires_finite_metrics_by_default():
     assert parse_args([*required, "--no-require-finite"]).require_finite is False
 
 
+def test_metric_record_preserves_nonfinite_diagnostics():
+    args = parse_args(
+        [
+            "--data-file",
+            "unused",
+            "--ctx-len",
+            "4",
+            "--global-batch-size",
+            "2",
+        ]
+    )
+    diagnostics = {
+        "loss": 1.0,
+        "total_loss": 1.0,
+        "gradient_all_finite": 1.0,
+        "gradient_global_norm": 2.0,
+        "gradient_max_abs": 3.0,
+        "parameter_all_finite": 1.0,
+    }
+
+    record = distributed_cli._metric_record(
+        args,
+        "train",
+        1,
+        diagnostics,
+    )
+
+    for name, value in diagnostics.items():
+        assert record[name] == value
+
+
 def test_distributed_binidx_training_cli_saves_and_resumes(tmp_path):
     prefix = write_dp_train_data(tmp_path)
     output_dir = tmp_path / "out"

@@ -582,4 +582,17 @@ CLIのrequire-finiteはlossだけでなく、`*_all_finite < 0.5`でも停止す
 - raw gradientが先に非有限化
 - raw gradientはfiniteだがoptimizer update後のparameterが非有限化
 
-この診断コードはまだローカル未コミットであり、テスト後にGPUへ反映する。
+最初の診断再開run:
+
+  /root/RWKV7M/out/retrieval-185m-resume160-allaux-gradientdiag
+
+- commit d13836cを使用し、元の全aux runのcheckpoint 160からstep 180まで再開
+- step 176の非有限化は再現せず、全step finite
+- step 162以降のthroughputは概ね8.0--8.34k token/s
+- loss、write率、slot利用率は元runと近いが完全一致せず、ROCm trajectoryの
+  非決定性を再確認した
+
+このrunではtrain step内部に診断値を追加した一方、distributed CLIの
+metric record許可リストへ診断名を追加していなかったため、JSONLへ記録されなかった。
+fail-closed判定はfilter前のhost metricsを使うため有効だったが、事後解析には不足した。
+許可リストと回帰テストを追加してから、checkpoint 180以降を再開する。

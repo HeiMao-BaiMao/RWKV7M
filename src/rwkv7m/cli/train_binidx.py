@@ -219,7 +219,10 @@ def parse_args(argv=None):
         "--require-finite",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="stop immediately when the train loss becomes non-finite",
+        help=(
+            "stop immediately when the train loss, gradients, or updated "
+            "parameters become non-finite"
+        ),
     )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--save-every", type=int, default=0)

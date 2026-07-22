@@ -305,6 +305,10 @@ def _metric_record(
         "screening_residual_rms",
         "base_residual_rms",
         "screening_base_rms_ratio",
+        "gradient_all_finite",
+        "gradient_global_norm",
+        "gradient_max_abs",
+        "parameter_all_finite",
     ):
         record[key] = metrics.get(key)
     for key, value in metrics.items():
