@@ -1015,6 +1015,26 @@ production fixed-batch結果:
 - 次はtotal loss/gradient graphへJAX float checkを挿入し、最初に報告される
   NaN/division演算を取得する。
 
+CheckifyとWKV backend対照:
+
+- Pallas WKVを含むgraphへのCheckifyは、検査用`reduce_or` primitiveをROCmの
+  Pallas loweringが未実装のためcompileできなかった。これはmodel NaNではない。
+- `RWKV7M_WKV_BACKEND=reference`でWKVだけportable実装へ切り替えた同一checkpoint、
+  同一batch、既定epsilonではCheckify errorなし。
+- loss=8.2052517、全423 gradient leafがfinite、grad L2=27.2002、max abs=1.75。
+- これは「v5 portable recurrenceだけでNaNになる」という§24時点の解釈を反証する。
+
+更新した第一仮説:
+
+- v5 training trajectoryが作った特定入力に対し、GPU Pallas WKV backwardが
+  非有限化する。
+- そのcotangentがscreened layer 6のwrite-sideとlayer 0--6へ伝播したため、
+  Screening recurrenceが発生源に見えていた可能性が高い。
+- full FP32化やglobal epsilon変更は入力・hard routeを僅かに変え、Pallas WKVの
+  失敗領域を回避したと説明できる。
+- ただし全WKVを一括でreference化した対照なので、故障層とkernel内部演算は未確定。
+- per-layer reference overrideを診断ツールへ追加し、まずlayer 6だけを置換する。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================

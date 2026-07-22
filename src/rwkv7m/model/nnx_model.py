@@ -477,6 +477,10 @@ class NNXRWKV7TimeMix(nnx.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.sharding = sharding
+        # Static per-layer override used by fixed-batch correctness
+        # diagnostics. Production leaves this as ``None`` and follows the
+        # normal Pallas-first backend resolver.
+        self.wkv_backend = None
 
         C = config.d_model
         H = config.n_heads
@@ -747,7 +751,11 @@ class NNXRWKV7TimeMix(nnx.Module):
             for value in (r_h, w_h, k_h, v_h, neg_kk_h, kka_h)
         )
         if self.sharding is None:
-            y_h, final_state = wkv7(*inputs, initial_state)
+            y_h, final_state = wkv7(
+                *inputs,
+                initial_state,
+                backend=self.wkv_backend,
+            )
         else:
             y_h, final_state = wkv7_sharded(
                 *inputs,
@@ -755,6 +763,7 @@ class NNXRWKV7TimeMix(nnx.Module):
                 mesh=self.sharding.mesh,
                 data_axis=self.sharding.data_axis,
                 model_axis=self.sharding.model_axis,
+                backend=self.wkv_backend,
             )
         y = _flatten_heads(
             jnp.swapaxes(y_h, 0, 1), (B, T, C), self.sharding

@@ -91,6 +91,7 @@ def wkv7_sharded(
     mesh,
     data_axis: str = "data",
     model_axis: str = "model",
+    backend: str | None = None,
 ):
     """Run WKV on per-device shards under manual Pallas mesh axes.
 
@@ -107,7 +108,7 @@ def wkv7_sharded(
         data_axis, model_axis, None, None
     )
     mapped_wkv7 = jax.shard_map(
-        wkv7,
+        partial(wkv7, backend=backend),
         mesh=mesh,
         in_specs=(
             vector_spec,

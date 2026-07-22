@@ -89,6 +89,14 @@ def parse_args(argv=None):
     )
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument(
+        "--reference-wkv-layers",
+        default="",
+        help=(
+            "comma-separated zero-based layer indices whose WKV recurrence "
+            "should use the portable reference instead of backend auto"
+        ),
+    )
+    parser.add_argument(
         "--component-gradients",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -139,6 +147,20 @@ def parse_args(argv=None):
         parser.error(
             "--float32-model and --float32-parameters are mutually exclusive"
         )
+    try:
+        args.reference_wkv_layers = tuple(
+            sorted(
+                {
+                    int(value.strip())
+                    for value in args.reference_wkv_layers.split(",")
+                    if value.strip()
+                }
+            )
+        )
+    except ValueError:
+        parser.error("--reference-wkv-layers must contain integer indices")
+    if any(index < 0 for index in args.reference_wkv_layers):
+        parser.error("--reference-wkv-layers indices must be non-negative")
     return args
 
 
@@ -308,6 +330,10 @@ def main(argv=None):
     if args.float32_model:
         config.dtype = "float32"
         config.param_dtype = "float32"
+    if any(index >= config.n_layers for index in args.reference_wkv_layers):
+        raise SystemExit(
+            "--reference-wkv-layers contains an index outside the model"
+        )
     runtime, train_state = create_train_runtime(
         jax.random.key(args.seed),
         config,
@@ -329,6 +355,10 @@ def main(argv=None):
             nnx.state(train_state.model, nnx.Param),
         )
         nnx.update(train_state.model, promoted_params)
+    for layer_index in args.reference_wkv_layers:
+        layer = getattr(train_state.model, f"layer_{layer_index}")
+        block = getattr(layer, f"rwkv_block_{layer_index}")
+        block.att.wkv_backend = "reference"
     graphdef, params = nnx.split(train_state.model, nnx.Param)
 
     def loss_outputs(active_params):
@@ -425,6 +455,7 @@ def main(argv=None):
         "sequence_chunk_size": config.sequence_chunk_size,
         "screening_eps": config.screening.eps,
         "screening_norm_eps": config.screening.norm_eps,
+        "reference_wkv_layers": list(args.reference_wkv_layers),
         "float32_model": bool(args.float32_model),
         "float32_parameters": bool(args.float32_parameters),
         "devices": [
