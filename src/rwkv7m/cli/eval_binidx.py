@@ -4,6 +4,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from ..api import create_runtime, load_runtime_params
 from ..data import create_binidx_dataset
@@ -111,8 +112,9 @@ def evaluate_binidx(args):
             "--memory-off-counterfactual requires screening to be enabled"
         )
 
-    @jax.jit
+    @nnx.jit
     def eval_step(
+        model,
         input_ids,
         target_ids,
         mask,
@@ -120,8 +122,7 @@ def evaluate_binidx(args):
         screen_state,
         residual_scale,
     ):
-        logits, _, _, stats = runtime.model.apply(
-            runtime.variables,
+        logits, _, _, stats = model(
             input_ids,
             rwkv_state,
             screen_state,
@@ -131,8 +132,9 @@ def evaluate_binidx(args):
         )
         return cross_entropy_loss(logits, target_ids, mask), stats, logits
 
-    @jax.jit
+    @nnx.jit
     def stateful_eval_step(
+        model,
         input_ids,
         target_ids,
         mask,
@@ -140,8 +142,7 @@ def evaluate_binidx(args):
         screen_state,
         residual_scale,
     ):
-        logits, new_rwkv_state, new_screen_state, stats = runtime.model.apply(
-            runtime.variables,
+        logits, new_rwkv_state, new_screen_state, stats = model(
             input_ids,
             rwkv_state,
             screen_state,
@@ -169,6 +170,7 @@ def evaluate_binidx(args):
             batch = dataset.get_batch(step)
             if args.carry_state:
                 loss, rwkv_state, screen_state, _, logits = stateful_eval_step(
+                    runtime.model,
                     batch["input_ids"],
                     batch["target_ids"],
                     batch["mask"],
@@ -178,6 +180,7 @@ def evaluate_binidx(args):
                 )
             else:
                 loss, _, logits = eval_step(
+                    runtime.model,
                     batch["input_ids"],
                     batch["target_ids"],
                     batch["mask"],
@@ -195,6 +198,7 @@ def evaluate_binidx(args):
                         _,
                         off_logits,
                     ) = stateful_eval_step(
+                        runtime.model,
                         batch["input_ids"],
                         batch["target_ids"],
                         batch["mask"],
@@ -204,6 +208,7 @@ def evaluate_binidx(args):
                     )
                 else:
                     off_loss, _, off_logits = eval_step(
+                        runtime.model,
                         batch["input_ids"],
                         batch["target_ids"],
                         batch["mask"],

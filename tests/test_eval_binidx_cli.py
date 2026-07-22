@@ -1,5 +1,7 @@
+import jax
 import numpy as np
 
+from rwkv7m import create_runtime, save_model_safetensors, tiny_config
 from rwkv7m.data import MMapIndexedDatasetBuilder, data_file_path, index_file_path
 from rwkv7m.cli.eval_binidx import evaluate_binidx, parse_args
 
@@ -96,6 +98,42 @@ def test_eval_binidx_reports_memory_off_counterfactual(tmp_path):
     assert np.isfinite(metrics["memory_loss_delta"])
     assert np.isfinite(metrics["prediction_rms_delta"])
     assert metrics["prediction_rms_delta"] >= 0.0
+
+
+def test_eval_binidx_checkpoint_memory_off_counterfactual(tmp_path):
+    prefix = write_eval_binidx(tmp_path)
+    config = tiny_config(
+        vocab_size=64,
+        d_model=32,
+        n_layers=2,
+        n_heads=2,
+        head_size=16,
+    )
+    runtime = create_runtime(jax.random.key(31), config, batch_size=1)
+    checkpoint = tmp_path / "model.safetensors"
+    save_model_safetensors(checkpoint, runtime.variables["params"], config)
+    args = parse_args(
+        [
+            "--data-file",
+            prefix,
+            "--checkpoint",
+            str(checkpoint),
+            "--ctx-len",
+            "4",
+            "--batch-size",
+            "1",
+            "--steps",
+            "1",
+            "--phase",
+            "read_write",
+            "--memory-off-counterfactual",
+            "--print-every",
+            "0",
+        ]
+    )
+    metrics = evaluate_binidx(args)
+    assert np.isfinite(metrics["memory_loss_delta"])
+    assert np.isfinite(metrics["prediction_rms_delta"])
 
 
 def test_eval_binidx_can_carry_state_on_sequential_sampling(tmp_path):
