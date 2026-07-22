@@ -143,31 +143,29 @@ def _wkv7_forward_dispatch(
         outputs = _wkv7_reference_impl(*inputs)
         return (outputs, ()) if with_aux else outputs
     if selected in ("pallas_gpu_mosaic", "pallas_gpu_triton"):
-        from rwkv7m.kernels.wkv_pallas_gpu import (
-            wkv7_pallas_gpu_forward,
-            wkv7_pallas_gpu_forward_with_aux,
-        )
+        from rwkv7m.kernels.wkv_pallas_gpu import wkv7_pallas_gpu_forward
 
         lowering = (
             "mosaic" if selected == "pallas_gpu_mosaic" else "triton"
         )
         if with_aux:
-            return wkv7_pallas_gpu_forward_with_aux(
+            # The VJP recomputes a token state tape immediately before its
+            # reverse kernel. Retaining an inverse-reconstruction tape here
+            # is incorrect when an RWKV decay rounds to zero in FP32.
+            outputs = wkv7_pallas_gpu_forward(
                 *inputs, lowering=lowering, interpret=interpret
             )
+            return outputs, ()
         return wkv7_pallas_gpu_forward(
             *inputs, lowering=lowering, interpret=interpret
         )
     if selected == "pallas_tpu":
-        from rwkv7m.kernels.wkv_pallas_tpu import (
-            wkv7_pallas_tpu_forward,
-            wkv7_pallas_tpu_forward_with_aux,
-        )
+        from rwkv7m.kernels.wkv_pallas_tpu import wkv7_pallas_tpu_forward
 
         if with_aux:
-            return wkv7_pallas_tpu_forward_with_aux(
-                *inputs, interpret=interpret
-            )
+            # Match the stable recompute contract used by the GPU path.
+            outputs = wkv7_pallas_tpu_forward(*inputs, interpret=interpret)
+            return outputs, ()
         return wkv7_pallas_tpu_forward(*inputs, interpret=interpret)
     ffi_backend = require_wkv_ffi_backend()
     if with_aux:
@@ -189,27 +187,50 @@ def _wkv7_backward_dispatch(
         return pullback(cotangents)
     y_cotangent, final_state_cotangent = cotangents
     if selected in ("pallas_gpu_mosaic", "pallas_gpu_triton"):
-        from rwkv7m.kernels.wkv_pallas_gpu import wkv7_pallas_gpu_backward
+        from rwkv7m.kernels.wkv_pallas_gpu import (
+            WKVGPUConfig,
+            wkv7_pallas_gpu_backward,
+            wkv7_pallas_gpu_forward_with_aux,
+        )
 
         lowering = (
             "mosaic" if selected == "pallas_gpu_mosaic" else "triton"
+        )
+        stable_config = WKVGPUConfig(checkpoint_interval=1)
+        _, stable_aux = wkv7_pallas_gpu_forward_with_aux(
+            *inputs,
+            lowering=lowering,
+            config=stable_config,
+            interpret=interpret,
         )
         return wkv7_pallas_gpu_backward(
             *inputs[:-1],
             y_cotangent,
             final_state_cotangent,
-            *aux,
+            *stable_aux,
             lowering=lowering,
+            config=stable_config,
             interpret=interpret,
         )
     if selected == "pallas_tpu":
-        from rwkv7m.kernels.wkv_pallas_tpu import wkv7_pallas_tpu_backward
+        from rwkv7m.kernels.wkv_pallas_tpu import (
+            WKVTPUConfig,
+            wkv7_pallas_tpu_backward,
+            wkv7_pallas_tpu_forward_with_aux,
+        )
 
+        stable_config = WKVTPUConfig(checkpoint_interval=1)
+        _, stable_aux = wkv7_pallas_tpu_forward_with_aux(
+            *inputs,
+            config=stable_config,
+            interpret=interpret,
+        )
         return wkv7_pallas_tpu_backward(
             *inputs[:-1],
             y_cotangent,
             final_state_cotangent,
-            *aux,
+            *stable_aux,
+            config=stable_config,
             interpret=interpret,
         )
     ffi_backend = require_wkv_ffi_backend()

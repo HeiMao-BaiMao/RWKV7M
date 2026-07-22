@@ -81,6 +81,42 @@ def test_pallas_custom_vjp_matches_reference_for_all_inputs(backend):
     )
 
 
+@pytest.mark.parametrize(
+    "backend", ["pallas_gpu_triton", "pallas_tpu"]
+)
+def test_pallas_custom_vjp_remains_finite_when_decay_rounds_to_zero(
+    backend,
+):
+    inputs = list(_inputs(time=3))
+    inputs[1] = inputs[1].at[1].set(5.0)
+
+    def loss(fn, *values):
+        y, final_state = fn(*values)
+        return jnp.sum(jnp.square(y)) + 0.03 * jnp.sum(
+            jnp.square(final_state)
+        )
+
+    argnums = tuple(range(len(inputs)))
+    expected = jax.grad(
+        lambda *values: loss(wkv7_reference, *values),
+        argnums=argnums,
+    )(*inputs)
+    actual = jax.jit(
+        jax.grad(
+            lambda *values: loss(
+                lambda *args: wkv7(*args, backend, True), *values
+            ),
+            argnums=argnums,
+        )
+    )(*inputs)
+
+    assert all(jnp.all(jnp.isfinite(value)) for value in actual)
+    assert all(
+        jnp.allclose(left, right, rtol=1e-5, atol=1e-6)
+        for left, right in zip(actual, expected, strict=True)
+    )
+
+
 def test_pallas_aux_uses_interval_checkpoints_for_partial_final_chunk():
     inputs = _inputs(time=5)
     gpu_config = WKVGPUConfig(checkpoint_interval=2)

@@ -21,7 +21,7 @@ GPULowering = Literal["mosaic", "triton"]
 
 @dataclass(frozen=True)
 class WKVGPUConfig:
-    checkpoint_interval: int = 16
+    checkpoint_interval: int = 1
     num_warps: int = 8
     num_stages: int = 2
 
@@ -219,11 +219,7 @@ def _wkv_gpu_backward_kernel(
         sa_t = _load_vector(sa_ref, t)
 
         decay = jnp.exp(-jnp.exp(w_t))
-        previous_state = (
-            current_state
-            - sa_t[:, None] * kka_t[None, :]
-            - v_t[:, None] * k_t[None, :]
-        ) / decay[None, :]
+        previous_state = _load_checkpoint(checkpoints_ref, t)
 
         r_gradient = jnp.sum(
             current_state * y_cotangent_t[:, None], axis=-2
@@ -456,6 +452,11 @@ def wkv7_pallas_gpu_backward(
     """Run the persistent reverse recurrence for the GPU Pallas path."""
 
     _validate_config(config)
+    if config.checkpoint_interval != 1:
+        raise ValueError(
+            "WKV backward requires checkpoint_interval=1; inverse state "
+            "reconstruction is undefined when an FP32 decay rounds to zero"
+        )
     time, batch, heads, head_size = r.shape
     checkpoint_count = checkpoints.shape[0]
     expected_checkpoint_count = (

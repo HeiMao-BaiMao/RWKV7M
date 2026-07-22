@@ -17,7 +17,7 @@ from jax.experimental import pallas as pl
 
 @dataclass(frozen=True)
 class WKVTPUConfig:
-    checkpoint_interval: int = 16
+    checkpoint_interval: int = 1
 
 
 def _load_vector(ref, index):
@@ -212,11 +212,7 @@ def _wkv_tpu_backward_kernel(
         sa_t = _load_vector(sa_ref, t)
 
         decay = jnp.exp(-jnp.exp(w_t))
-        previous_state = (
-            current_state
-            - sa_t[:, :, None] * kka_t[:, None, :]
-            - v_t[:, :, None] * k_t[:, None, :]
-        ) / decay[:, None, :]
+        previous_state = _load_checkpoint(checkpoints_ref, t)
 
         r_gradient = jnp.sum(
             current_state * y_cotangent_t[:, :, None], axis=-2
@@ -415,6 +411,11 @@ def wkv7_pallas_tpu_backward(
     """Run the TPU-specialized persistent reverse recurrence."""
 
     _validate_config(config)
+    if config.checkpoint_interval != 1:
+        raise ValueError(
+            "WKV backward requires checkpoint_interval=1; inverse state "
+            "reconstruction is undefined when an FP32 decay rounds to zero"
+        )
     time, batch, heads, head_size = r.shape
     checkpoint_count = checkpoints.shape[0]
     expected_checkpoint_count = (
