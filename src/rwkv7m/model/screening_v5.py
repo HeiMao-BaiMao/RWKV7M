@@ -150,8 +150,17 @@ def _masked_minmax_normalize(values, mask, eps):
         axis=-1,
         keepdims=True,
     )
-    normalized = (values - minimum) / (maximum - minimum + eps)
-    return jnp.where(mask, normalized, 0.0)
+    span = maximum - minimum
+    # Equal (or numerically indistinguishable) allocation statistics carry
+    # no ranking information. Dividing their zero numerator by ``eps`` keeps
+    # the forward value at zero but creates an arbitrary O(1 / eps) reverse
+    # signal through tie-breaking reductions. Recurrent usage statistics can
+    # encounter that tie for hundreds of tokens, so suppress the undefined
+    # preference instead of amplifying it.
+    has_rank_signal = jax.lax.stop_gradient(span > eps)
+    denominator = jnp.where(has_rank_signal, span + eps, 1.0)
+    normalized = (values - minimum) / denominator
+    return jnp.where(mask & has_rank_signal, normalized, 0.0)
 
 
 def _capacity_tau(

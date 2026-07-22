@@ -988,6 +988,25 @@ global Screening epsilon感度:
 - 次のコードでは`norm_eps`を独立設定として追加し、既定値は1e-6のまま互換性を維持。
   fixed batchで`norm_eps`だけ1e-5へ変更して判別する。
 
+normalization-only感度:
+
+- `norm_eps=1e-5`、その他`eps=1e-6`ではloss=8.2015162。
+- non-finiteは247 leaf / 48,508,683 valueで既定値と完全に同数。
+- unit normalizationはこのNaNの原因ではないため、仮説を棄却した。
+
+次の数式監査:
+
+- victim allocationのage/usageはmasked min--max正規化される。
+- 同値3 slotの単体例でforward出力は全0だが、旧式のgradientは
+  `eps=1e-6`時に最大1.17e6、`eps=1e-5`時に最大1.17e5だった。
+- 同値の統計には順位情報がないため、このgradientは有用な学習信号ではなく、
+  reduction tieとepsilonから生じる数値的な人工物である。
+- spanが`eps`以下ならforward/gradientを0にする安全化を実装し、distinctな統計の
+  既存min--max scaleは維持した。
+- 単体回帰を追加し、Screening v5の38テストがpass。
+- この変更だけでproduction fixed batchが有限化するかを次に検証する。有限化しなければ
+  global epsilonが影響する別の数式を引き続き分離する。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================

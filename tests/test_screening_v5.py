@@ -39,6 +39,7 @@ from rwkv7m.model.screening_v5 import (
     TAU_READ_MEAN,
     TAU_WRITE_MEAN,
     ScreeningV5RecurrenceConfig,
+    _masked_minmax_normalize,
     ambiguity_aware_matched_routing,
     deterministic_lowest_argmax,
     screening_v5_recurrence_reference,
@@ -366,6 +367,32 @@ def test_underflowed_matched_route_has_finite_zero_gradient():
     value, gradient = jax.value_and_grad(confidence)(eligibility)
     assert value == 0.0
     assert jnp.array_equal(gradient, jnp.zeros_like(gradient))
+
+
+def test_equal_allocation_statistics_have_zero_gradient():
+    mask = jnp.asarray([[True, True, True, False]])
+    weights = jnp.asarray([[1.0, -1.0, 0.5, 0.0]])
+
+    def objective(values):
+        return jnp.sum(
+            _masked_minmax_normalize(values, mask, 1e-6) * weights
+        )
+
+    values = jnp.zeros((1, 4), dtype=jnp.float32)
+    normalized, gradient = jax.value_and_grad(objective)(values)
+    assert normalized == 0.0
+    assert jnp.array_equal(gradient, jnp.zeros_like(values))
+
+
+def test_distinct_allocation_statistics_keep_minmax_scale():
+    values = jnp.asarray([[1.0, 2.0, 3.0, 100.0]])
+    mask = jnp.asarray([[True, True, True, False]])
+    normalized = _masked_minmax_normalize(values, mask, 1e-6)
+    assert jnp.allclose(
+        normalized,
+        jnp.asarray([[0.0, 0.5, 1.0, 0.0]]),
+        atol=1e-6,
+    )
 
 
 def test_empty_read_diagnostic_norm_has_zero_finite_gradient():
