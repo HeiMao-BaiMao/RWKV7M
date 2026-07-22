@@ -161,6 +161,7 @@ def _capacity_tau(
     false_positive_rate,
     learned_offset,
     slot_count,
+    warmup_by_load,
     config,
 ):
     test_count = jnp.maximum(occupied_count * tests_per_slot, 1.0)
@@ -176,7 +177,7 @@ def _capacity_tau(
         config.tau_min,
         config.tau_max,
     )
-    if config.threshold_warmup_by_load:
+    if warmup_by_load:
         load = jnp.clip(occupied_count / float(slot_count), 0.0, 1.0)
         tau = (
             config.threshold_warmup_tau
@@ -445,8 +446,15 @@ def screening_v5_recurrence_reference(
         false_positive_rate=config.target_false_read_rate,
         learned_offset=jnp.reshape(tau_read_offset, (read_tiles,)),
         slot_count=slot_count,
+        warmup_by_load=config.threshold_warmup_by_load,
         config=config,
     )
+    # The low-load threshold warm-up exists to keep the read path trainable
+    # before enough slots are occupied.  Applying the same negative warm-up
+    # threshold to write matching makes the first occupied slot match nearly
+    # every token, which prevents empty-first allocation from filling the
+    # remaining capacity.  Writes therefore always use the calibrated null
+    # thresholds, even while reads are being warmed up.
     write_tau_lookup = _capacity_tau(
         occupancy_levels,
         tests_per_slot=1.0,
@@ -454,6 +462,7 @@ def screening_v5_recurrence_reference(
         false_positive_rate=config.target_false_write_rate,
         learned_offset=jnp.reshape(tau_write_offset, (1,)),
         slot_count=slot_count,
+        warmup_by_load=False,
         config=config,
     )[..., 0]
     novel_tau_lookup = _capacity_tau(
@@ -463,6 +472,7 @@ def screening_v5_recurrence_reference(
         false_positive_rate=config.target_false_match_rate,
         learned_offset=jnp.reshape(tau_write_offset, (1,)),
         slot_count=slot_count,
+        warmup_by_load=False,
         config=config,
     )[..., 0]
 

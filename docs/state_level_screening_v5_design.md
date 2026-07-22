@@ -49,6 +49,13 @@ constructed once outside the token scan. Learned key distributions still
 require empirical false-read calibration; neither approximation is a
 statistical guarantee after training.
 
+The low-occupancy warm-up applies only to the read threshold. Write matching
+and novelty classification always use their capacity-calibrated null
+thresholds. Reusing the permissive read warm-up for writes makes the first
+occupied slot match almost every later token and defeats empty-first
+allocation; this failure mode was reproduced on MI300X before the contracts
+were separated.
+
 Long-context reverse scans use a stricter mixed-precision boundary than v4.
 The surrounding RWKV block and stored model parameters remain BF16, while v5
 Screening projection compute, recurrent vectors, slot state, and recurrent

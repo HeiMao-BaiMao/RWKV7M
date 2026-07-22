@@ -36,6 +36,8 @@ from rwkv7m.model.screening_v5 import (
     READ_MAX,
     SELF_INDEX_LOSS,
     Z_NORM,
+    TAU_READ_MEAN,
+    TAU_WRITE_MEAN,
     ScreeningV5RecurrenceConfig,
     ambiguity_aware_matched_routing,
     deterministic_lowest_argmax,
@@ -258,6 +260,23 @@ def test_capacity_calibration_uses_null_cdf_not_loose_tail_bound():
     loose_bound = jnp.sqrt(2.0 * jnp.log(64.0 / 0.05) / 16.0)
     assert jnp.allclose(threshold, 0.78887224, rtol=1e-5)
     assert threshold < loose_bound
+
+
+def test_low_load_warmup_only_relaxes_read_thresholds():
+    inputs = list(_v5_inputs())
+    inputs[14] = inputs[14].at[0, 0, 0].set(1.0)
+    inputs[16] = inputs[16].at[0, 0, 0].set(1.0)
+    inputs[19] = inputs[19].at[0, 0].set(1.0)
+    statistics = screening_v5_recurrence_reference(
+        *inputs,
+        _v5_recurrence_config(threshold_warmup_tau=-0.9),
+    )[5]
+
+    # Read starvation prevention may be permissive at low occupancy, but the
+    # write matcher must retain its null-calibrated threshold. Otherwise the
+    # first slot becomes an absorbing match for almost every later token.
+    assert statistics[0, 0, TAU_READ_MEAN] < 0.0
+    assert statistics[0, 0, TAU_WRITE_MEAN] > 0.5
 
 
 def test_smooth_trim_square_keeps_a_finite_gradient_below_hard_threshold():
