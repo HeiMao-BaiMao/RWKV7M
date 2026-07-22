@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx, traverse_util
+import pytest
 
 from rwkv7m.api import create_train_runtime, tiny_config, train_batch
 from rwkv7m.distributed import (
@@ -172,8 +173,12 @@ def test_nnx_full_model_gradient_matches_linen_reference():
         ), path
 
 
-def test_bfloat16_compute_boundaries_keep_state_and_loss_statistics_in_fp32():
+@pytest.mark.parametrize("param_dtype", ["bfloat16", "float32"])
+def test_bfloat16_compute_boundaries_keep_state_and_loss_statistics_in_fp32(
+    param_dtype,
+):
     config = _bfloat16_config()
+    config.param_dtype = param_dtype
     model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(10))
     input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
     targets = jnp.asarray([[2, 3, 4]], dtype=jnp.int32)

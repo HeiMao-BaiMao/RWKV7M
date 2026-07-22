@@ -651,12 +651,12 @@ class NNXRWKV7TimeMix(nnx.Module):
         initial_state = _constrain_wkv(initial_state, self.sharding)
 
         xx = _time_shift(x, prev_x) - x
-        x_r = x + xx * _value(self.x_r)
-        x_w = x + xx * _value(self.x_w)
-        x_k = x + xx * _value(self.x_k)
-        x_v = x + xx * _value(self.x_v)
-        x_a = x + xx * _value(self.x_a)
-        x_g = x + xx * _value(self.x_g)
+        x_r = x + xx * _value(self.x_r).astype(compute_dtype)
+        x_w = x + xx * _value(self.x_w).astype(compute_dtype)
+        x_k = x + xx * _value(self.x_k).astype(compute_dtype)
+        x_v = x + xx * _value(self.x_v).astype(compute_dtype)
+        x_a = x + xx * _value(self.x_a).astype(compute_dtype)
+        x_g = x + xx * _value(self.x_g).astype(compute_dtype)
 
         r = self.receptance(x_r)
         w_hidden = _dot_last(
@@ -666,7 +666,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             output_model_sharded=False,
             dtype=compute_dtype,
         )
-        w_raw = _value(self.w0) + _dot_last(
+        w_raw = _value(self.w0).astype(compute_dtype) + _dot_last(
             jnp.tanh(w_hidden),
             _value(self.w2),
             sharding=self.sharding,
@@ -692,7 +692,9 @@ class NNXRWKV7TimeMix(nnx.Module):
                 output_model_sharded=True,
                 dtype=compute_dtype,
             )
-            v = v + (v_first - v) * jax.nn.sigmoid(_value(self.v0) + v12)
+            v = v + (v_first - v) * jax.nn.sigmoid(
+                _value(self.v0).astype(compute_dtype) + v12
+            )
 
         a_hidden = _dot_last(
             x_a,
@@ -702,7 +704,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             dtype=compute_dtype,
         )
         a = jax.nn.sigmoid(
-            _value(self.a0)
+            _value(self.a0).astype(compute_dtype)
             + _dot_last(
                 a_hidden,
                 _value(self.a2),
@@ -726,11 +728,13 @@ class NNXRWKV7TimeMix(nnx.Module):
             output_model_sharded=True,
             dtype=compute_dtype,
         )
-        kk = k * _value(self.k_k)
+        kk = k * _value(self.k_k).astype(compute_dtype)
         kk_h = _reshape_heads(kk, (B, T, H, N), self.sharding)
         kk_h /= jnp.sqrt(jnp.sum(kk_h * kk_h, axis=-1, keepdims=True) + 1e-12**2)
         kk = _flatten_heads(kk_h, (B, T, C), self.sharding)
-        k = k * (1.0 + (a - 1.0) * _value(self.k_a))
+        k = k * (
+            1.0 + (a - 1.0) * _value(self.k_a).astype(compute_dtype)
+        )
 
         r_h = _reshape_heads(r, (B, T, H, N), self.sharding)
         w_h = _reshape_heads(w_clamped, (B, T, H, N), self.sharding)
@@ -764,7 +768,7 @@ class NNXRWKV7TimeMix(nnx.Module):
             (B, T, C),
             self.sharding,
         )
-        rk = r_h * k_h * _value(self.r_k)
+        rk = r_h * k_h * _value(self.r_k).astype(compute_dtype)
         recurrent_bonus = _flatten_heads(
             jnp.sum(rk, axis=-1, keepdims=True) * v_h,
             (B, T, C),
@@ -839,7 +843,10 @@ class NNXRWKV7ChannelMix(nnx.Module):
         if prev_x is None:
             prev_x = jnp.zeros((B, C), dtype=x.dtype)
         xx = _time_shift(x, prev_x) - x
-        k = jax.nn.relu(self.key(x + xx * _value(self.x_k))) ** 2
+        compute_dtype = _get_model_dtype(self.config)
+        k = jax.nn.relu(
+            self.key(x + xx * _value(self.x_k).astype(compute_dtype))
+        ) ** 2
         value = _constrain_hidden(self.value(k), self.sharding)
         return value, x[:, -1, :].astype(jnp.float32)
 
@@ -2277,7 +2284,7 @@ class NNXScreenedRWKVModel(nnx.Module):
             ce_total, ce_count, l2_total, l2_count = (
                 tiled_training_loss_components(
                     normalized,
-                    _value(self.lm_head.kernel),
+                    _value(self.lm_head.kernel).astype(normalized.dtype),
                     targets,
                     loss_mask,
                     int(tile_size),
