@@ -61,6 +61,15 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--screening-norm-eps",
+        type=float,
+        default=None,
+        help=(
+            "Override only the v5 vector-normalization epsilon after "
+            "checkpoint compatibility validation."
+        ),
+    )
+    parser.add_argument(
         "--float32-model",
         action="store_true",
         help=(
@@ -112,6 +121,8 @@ def parse_args(argv=None):
         parser.error("--sequence-chunk-size must be non-negative")
     if args.screening_eps is not None and args.screening_eps <= 0.0:
         parser.error("--screening-eps must be positive")
+    if args.screening_norm_eps is not None and args.screening_norm_eps <= 0.0:
+        parser.error("--screening-norm-eps must be positive")
     if args.optimizer_total_steps <= 0:
         parser.error("--optimizer-total-steps must be positive")
     if args.float32_model and args.float32_parameters:
@@ -282,6 +293,8 @@ def main(argv=None):
         )
     if args.screening_eps is not None:
         config.screening.eps = args.screening_eps
+    if args.screening_norm_eps is not None:
+        config.screening.norm_eps = args.screening_norm_eps
     if args.float32_model:
         config.dtype = "float32"
         config.param_dtype = "float32"
@@ -392,6 +405,7 @@ def main(argv=None):
         "optimizer_total_steps": int(args.optimizer_total_steps),
         "sequence_chunk_size": config.sequence_chunk_size,
         "screening_eps": config.screening.eps,
+        "screening_norm_eps": config.screening.norm_eps,
         "float32_model": bool(args.float32_model),
         "float32_parameters": bool(args.float32_parameters),
         "devices": [

@@ -423,6 +423,11 @@ class ScreeningConfig:
     lambda_screen_warmup_floor: float = 0.0
     lambda_screen_warmup_steps: int = 0
     eps: float = 1e-6
+    # Keep vector-normalization conditioning independent from threshold,
+    # softmax, and metric denominators. Existing configs retain their exact
+    # behavior; v5 experiments can raise only this floor when diagnosing
+    # near-zero recurrent keys.
+    norm_eps: float = 1e-6
     use_value_unit_norm: bool = True
     use_age_mask: bool = False
     use_bank_bias: bool = False
@@ -507,6 +512,10 @@ class ScreeningConfig:
         invalid_banks = [bank_id for bank_id in self.bank_ids if bank_id not in (0, 1, 2)]
         if invalid_banks:
             raise ValueError("bank_ids values must be only 0, 1, or 2")
+        if self.eps <= 0.0:
+            raise ValueError("eps must be positive")
+        if self.norm_eps <= 0.0:
+            raise ValueError("norm_eps must be positive")
         if self.write_rel_floor < 0.0:
             raise ValueError("write_rel_floor must be non-negative")
         if self.lambda_screen_warmup_floor < 0.0:

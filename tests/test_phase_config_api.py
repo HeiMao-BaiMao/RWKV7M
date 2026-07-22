@@ -119,6 +119,10 @@ def test_invalid_config_validation():
         ScreeningConfig(n_slots=4, bank_ids=(0, 1))
     with pytest.raises(ValueError, match="bank_ids values"):
         ScreeningConfig(n_slots=4, bank_ids=(0, 1, 2, 3))
+    with pytest.raises(ValueError, match="eps must be positive"):
+        ScreeningConfig(eps=0.0)
+    with pytest.raises(ValueError, match="norm_eps must be positive"):
+        ScreeningConfig(norm_eps=0.0)
     with pytest.raises(ValueError, match="half-life"):
         ScreeningConfig(long_half_life_tokens=0)
     with pytest.raises(ValueError, match="usage_ema_decay"):

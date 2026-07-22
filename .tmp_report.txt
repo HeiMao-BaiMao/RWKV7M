@@ -970,6 +970,24 @@ parameter-storageだけFP32へ昇格した結果:
   最大約`1 / eps = 1e6`のJacobianを持つため、write-side recurrent scan内での
   勾配増幅候補である。ただし現時点では仮説であり、原因と断定しない。
 
+global Screening epsilon感度:
+
+- `eps=1e-5`: loss=8.2016392、423 gradient leaf全てfinite、
+  grad L2=27.1970、max abs=1.75
+- `eps=1e-3`: loss=8.2013826、423 gradient leaf全てfinite、
+  grad L2=27.1988、max abs=1.7422
+- 既定`eps=1e-6`: 247 leaf / 48,508,683 valueがnon-finite
+
+解釈:
+
+- 10倍のepsilon変更だけで有限化するため、数値conditioning仮説は強くなった。
+- ただし`eps`はunit normalizationだけでなくTrim-and-Square、masked softmax、
+  min-max normalization、metric denominator等にも使われる。これだけでは原因演算を
+  unit normalizationへ局在できない。
+- forward lossも変化しているため、hard routeが別分岐を選んだだけの可能性も残る。
+- 次のコードでは`norm_eps`を独立設定として追加し、既定値は1e-6のまま互換性を維持。
+  fixed batchで`norm_eps`だけ1e-5へ変更して判別する。
+
 
 25. Fableによる§15評価と現在の証拠による更新
 =============================================

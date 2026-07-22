@@ -100,6 +100,7 @@ class ScreeningV5RecurrenceConfig:
     read_soft_warmup_temperature: float = 0.1
     self_index_margin: float = 0.0
     training_activation: float | jax.Array = 1.0
+    norm_eps: float = 1e-6
 
 
 def _masked_softmax(logits, mask, *, temperature, eps):
@@ -401,6 +402,8 @@ def screening_v5_recurrence_reference(
 
     if config.read_soft_warmup_temperature <= 0.0:
         raise ValueError("read_soft_warmup_temperature must be positive")
+    if config.norm_eps <= 0.0:
+        raise ValueError("norm_eps must be positive")
     if not 0.0 <= config.self_index_margin < 1.0:
         raise ValueError("self_index_margin must be in [0, 1)")
 
@@ -551,7 +554,7 @@ def screening_v5_recurrence_reference(
         read_similarity = jnp.einsum(
             "brk,bmrk->brm",
             q_read_tiled,
-            unit_norm(read_keys_tiled, eps=config.eps),
+            unit_norm(read_keys_tiled, eps=config.norm_eps),
         )
         hard_read_relevance = trim_square(
             read_similarity,
@@ -574,7 +577,7 @@ def screening_v5_recurrence_reference(
         )
         read_relevance *= occupied[:, None, :] * training_enabled
         normalized_values = (
-            unit_norm(values_tiled, eps=config.eps)
+            unit_norm(values_tiled, eps=config.norm_eps)
             if config.use_value_unit_norm
             else values_tiled
         )
@@ -596,7 +599,9 @@ def screening_v5_recurrence_reference(
         write_similarity = jnp.einsum(
             "bk,bmk->bm",
             q_write_t,
-            unit_norm(write_keys.astype(jnp.float32), eps=config.eps),
+            unit_norm(
+                write_keys.astype(jnp.float32), eps=config.norm_eps
+            ),
         )
         eligibility = trim_square(
             write_similarity,
@@ -679,7 +684,7 @@ def screening_v5_recurrence_reference(
                 write_keys,
                 occupied,
                 bank_ids,
-                config.eps,
+                config.norm_eps,
             )
             if config.allocation_redundancy_weight > 0.0
             else jnp.zeros_like(occupied)
@@ -858,7 +863,10 @@ def screening_v5_recurrence_reference(
         candidate_write_similarity = jnp.einsum(
             "bk,bmk->bm",
             q_write_t,
-            unit_norm(delta_write_keys_t.astype(jnp.float32), eps=config.eps),
+            unit_norm(
+                delta_write_keys_t.astype(jnp.float32),
+                eps=config.norm_eps,
+            ),
         )
         candidate_read_keys = delta_read_keys_t.astype(jnp.float32).reshape(
             batch, slot_count, read_tiles, key_tile_size
@@ -866,7 +874,7 @@ def screening_v5_recurrence_reference(
         candidate_read_similarity = jnp.einsum(
             "brk,bmrk->brm",
             q_read_tiled,
-            unit_norm(candidate_read_keys, eps=config.eps),
+            unit_norm(candidate_read_keys, eps=config.norm_eps),
         )
         selected_write_similarity = jnp.sum(
             allocation_hard * candidate_write_similarity,

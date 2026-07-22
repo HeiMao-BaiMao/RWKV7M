@@ -1297,7 +1297,11 @@ class NNXStateLevelScreening(nnx.Module):
             cfg.n_read_tiles,
             cfg.d_k // cfg.n_read_tiles,
         )
-        q_r_seq = unit_norm(q_r_tiled, eps=cfg.eps).reshape(q_r_raw.shape)
+        normalization_eps = cfg.norm_eps if v5_enabled else cfg.eps
+        q_r_seq = unit_norm(
+            q_r_tiled,
+            eps=normalization_eps,
+        ).reshape(q_r_raw.shape)
         gate_seq = apply_screening_gate(
             self.gate_proj(x_ln_seq).astype(jnp.float32),
             cfg.gate_activation,
@@ -1383,7 +1387,8 @@ class NNXStateLevelScreening(nnx.Module):
                 [x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1
             )
             q_w_seq = unit_norm(
-                self.q_proj_w(q_w_in).astype(jnp.float32), eps=cfg.eps
+                self.q_proj_w(q_w_in).astype(jnp.float32),
+                eps=normalization_eps,
             )
             tau_w = (
                 _value(self.tau_w_offset).astype(jnp.float32)
@@ -1567,6 +1572,7 @@ class NNXStateLevelScreening(nnx.Module):
                 ),
                 self_index_margin=cfg.self_index_margin,
                 training_activation=training_activation,
+                norm_eps=cfg.norm_eps,
             )
             recurrence_outputs = screening_v5_recurrence_reference(
                 v5_projected_inputs[0],

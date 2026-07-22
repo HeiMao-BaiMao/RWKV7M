@@ -220,6 +220,8 @@ def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
             "0",
             "--screening-eps",
             "0.001",
+            "--screening-norm-eps",
+            "0.0001",
             "--float32-model",
             "--output",
             str(tmp_path / "diagnostic.json"),
@@ -228,6 +230,7 @@ def test_gradient_diagnostic_accepts_checkpoint_path(tmp_path):
     assert args.checkpoint == checkpoint
     assert args.sequence_chunk_size == 0
     assert args.screening_eps == pytest.approx(0.001)
+    assert args.screening_norm_eps == pytest.approx(0.0001)
     assert args.float32_model is True
     assert args.float32_parameters is False
     assert args.component_gradients is False
@@ -275,6 +278,24 @@ def test_gradient_diagnostic_rejects_nonpositive_screening_epsilon(tmp_path):
                 "--model-config",
                 "config.json",
                 "--screening-eps",
+                "0",
+                "--output",
+                str(tmp_path / "diagnostic.json"),
+            ]
+        )
+
+
+def test_gradient_diagnostic_rejects_nonpositive_normalization_epsilon(
+    tmp_path,
+):
+    with pytest.raises(SystemExit):
+        DIAGNOSE.parse_args(
+            [
+                "--fixed-batch",
+                str(tmp_path / "batch.npz"),
+                "--model-config",
+                "config.json",
+                "--screening-norm-eps",
                 "0",
                 "--output",
                 str(tmp_path / "diagnostic.json"),

@@ -384,6 +384,14 @@ def test_empty_read_diagnostic_norm_has_zero_finite_gradient():
     assert jnp.array_equal(gradient, jnp.zeros_like(gradient))
 
 
+def test_recurrence_rejects_nonpositive_normalization_epsilon():
+    with pytest.raises(ValueError, match="norm_eps must be positive"):
+        screening_v5_recurrence_reference(
+            *_v5_inputs(),
+            _v5_recurrence_config(norm_eps=0.0),
+        )
+
+
 def test_all_empty_uses_lowest_empty_slot_and_updates_occupancy():
     outputs = screening_v5_recurrence_reference(
         *_v5_inputs(),
