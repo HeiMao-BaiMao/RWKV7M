@@ -360,13 +360,96 @@ def test_wkv_capture_parser_accepts_explicit_backend(tmp_path):
             str(tmp_path / "capture.npz"),
             "--backend",
             "pallas_gpu_triton",
+            "--interpret",
             "--output",
             str(tmp_path / "result.json"),
             "--require-parity",
         ]
     )
     assert args.backend == "pallas_gpu_triton"
+    assert args.interpret is True
     assert args.require_parity is True
+
+
+def test_wkv_capture_parity_gate_checks_inputs_outputs_and_gradients():
+    args = WKV_CAPTURE.parse_args(
+        [
+            "--capture",
+            "capture.npz",
+            "--output",
+            "result.json",
+        ]
+    )
+    clean_summary = {
+        "nonfinite_count": 0,
+        "max_abs_finite": 1.0,
+        "l2_norm_finite": 1.0,
+    }
+    clean_comparison = {
+        "pallas": clean_summary,
+        "reference": clean_summary,
+        "max_abs_finite_difference": 0.0,
+        "relative_l2_finite_difference": 0.0,
+    }
+    payload = {
+        "inputs": {"r": clean_summary},
+        "outputs": {"activation": clean_comparison},
+        "gradients": {"r": clean_comparison},
+    }
+    assert WKV_CAPTURE._parity_gate(payload, args)["passed"] is True
+
+    payload["outputs"]["activation"] = {
+        **clean_comparison,
+        "relative_l2_finite_difference": 1.0,
+    }
+    gate = WKV_CAPTURE._parity_gate(payload, args)
+    assert gate["passed"] is False
+    assert gate["failures"][0]["group"] == "output"
+
+    payload["outputs"] = {
+        "activation": clean_comparison,
+        "final_state": {
+            **clean_comparison,
+            "max_abs_finite_difference": 1e-2,
+        },
+    }
+    gate = WKV_CAPTURE._parity_gate(payload, args)
+    assert gate["passed"] is False
+    assert gate["failures"][0]["name"] == "final_state"
+
+    nonfinite_summary = {
+        **clean_summary,
+        "nonfinite_count": 1,
+    }
+    payload["outputs"] = {"activation": clean_comparison}
+    payload["inputs"]["r"] = nonfinite_summary
+    gate = WKV_CAPTURE._parity_gate(payload, args)
+    assert gate["passed"] is False
+    assert gate["failures"][0]["group"] == "input"
+
+    payload["inputs"]["r"] = clean_summary
+    payload["gradients"]["r"] = {
+        **clean_comparison,
+        "reference": nonfinite_summary,
+    }
+    gate = WKV_CAPTURE._parity_gate(payload, args)
+    assert gate["passed"] is False
+    assert gate["failures"][0]["group"] == "gradient"
+    assert gate["failures"][0]["implementation"] == "reference"
+
+
+def test_wkv_capture_parser_rejects_negative_parity_threshold(tmp_path):
+    with pytest.raises(SystemExit):
+        WKV_CAPTURE.parse_args(
+            [
+                "--capture",
+                str(tmp_path / "capture.npz"),
+                "--output",
+                str(tmp_path / "result.json"),
+                "--gradient-max-abs",
+                "-1",
+            ]
+        )
 
 
 def test_gradient_diagnostic_rejects_both_float32_modes(tmp_path):

@@ -21,13 +21,37 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True)
     parser.add_argument("--backend", default="pallas_gpu_triton")
+    parser.add_argument(
+        "--interpret",
+        action="store_true",
+        help="run the selected Pallas backend in CPU interpret mode",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--require-parity",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
-    return parser.parse_args(argv)
+    parser.add_argument("--output-max-abs", type=float, default=0.25)
+    parser.add_argument("--output-max-relative-l2", type=float, default=5e-3)
+    parser.add_argument("--state-max-abs", type=float, default=1e-4)
+    parser.add_argument("--state-max-relative-l2", type=float, default=5e-4)
+    parser.add_argument("--gradient-max-abs", type=float, default=1e-4)
+    parser.add_argument(
+        "--gradient-max-relative-l2", type=float, default=5e-3
+    )
+    args = parser.parse_args(argv)
+    for name in (
+        "output_max_abs",
+        "output_max_relative_l2",
+        "state_max_abs",
+        "state_max_relative_l2",
+        "gradient_max_abs",
+        "gradient_max_relative_l2",
+    ):
+        if getattr(args, name) < 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    return args
 
 
 def _summary(value):
@@ -64,6 +88,92 @@ def _comparison(actual, expected):
     }
 
 
+def _parity_gate(payload, args):
+    thresholds = {
+        "output_max_abs": args.output_max_abs,
+        "output_max_relative_l2": args.output_max_relative_l2,
+        "state_max_abs": args.state_max_abs,
+        "state_max_relative_l2": args.state_max_relative_l2,
+        "gradient_max_abs": args.gradient_max_abs,
+        "gradient_max_relative_l2": args.gradient_max_relative_l2,
+    }
+    failures = []
+    for name, summary in payload["inputs"].items():
+        if summary["nonfinite_count"] > 0:
+            failures.append(
+                {
+                    "group": "input",
+                    "name": name,
+                    "metric": "nonfinite_count",
+                    "value": summary["nonfinite_count"],
+                    "limit": 0,
+                }
+            )
+    for group, comparisons, max_abs_limit, relative_l2_limit in (
+        (
+            "output",
+            payload["outputs"],
+            args.output_max_abs,
+            args.output_max_relative_l2,
+        ),
+        (
+            "gradient",
+            payload["gradients"],
+            args.gradient_max_abs,
+            args.gradient_max_relative_l2,
+        ),
+    ):
+        for name, comparison in comparisons.items():
+            if group == "output" and name == "final_state":
+                comparison_max_abs_limit = args.state_max_abs
+                comparison_relative_l2_limit = args.state_max_relative_l2
+            else:
+                comparison_max_abs_limit = max_abs_limit
+                comparison_relative_l2_limit = relative_l2_limit
+            for implementation in ("pallas", "reference"):
+                nonfinite_count = comparison[implementation][
+                    "nonfinite_count"
+                ]
+                if nonfinite_count > 0:
+                    failures.append(
+                        {
+                            "group": group,
+                            "name": name,
+                            "implementation": implementation,
+                            "metric": "nonfinite_count",
+                            "value": nonfinite_count,
+                            "limit": 0,
+                        }
+                    )
+            for metric, limit in (
+                (
+                    "max_abs_finite_difference",
+                    comparison_max_abs_limit,
+                ),
+                (
+                    "relative_l2_finite_difference",
+                    comparison_relative_l2_limit,
+                ),
+            ):
+                value = comparison[metric]
+                if not np.isfinite(value) or value > limit:
+                    failures.append(
+                        {
+                            "group": group,
+                            "name": name,
+                            "metric": metric,
+                            "value": value,
+                            "limit": limit,
+                        }
+                    )
+    return {
+        "required": args.require_parity,
+        "passed": not failures,
+        "thresholds": thresholds,
+        "failures": failures,
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     with np.load(args.capture, allow_pickle=False) as archive:
@@ -84,7 +194,11 @@ def main(argv=None):
 
     pallas = jax.jit(
         lambda *values: evaluate(
-            lambda *items: wkv7(*items, backend=args.backend),
+            lambda *items: wkv7(
+                *items,
+                backend=args.backend,
+                interpret=args.interpret,
+            ),
             values,
         )
     )(*inputs)
@@ -97,6 +211,7 @@ def main(argv=None):
     payload = {
         "capture": str(args.capture),
         "backend": args.backend,
+        "interpret": args.interpret,
         "shape": {
             "time": inputs[0].shape[0],
             "batch": inputs[0].shape[1],
@@ -129,15 +244,13 @@ def main(argv=None):
             )
         },
     }
+    payload["parity_gate"] = _parity_gate(payload, args)
     rendered = json.dumps(payload, indent=2, sort_keys=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
-    if args.require_parity and any(
-        value["pallas"]["nonfinite_count"] > 0
-        for value in payload["gradients"].values()
-    ):
-        raise SystemExit("captured Pallas WKV pullback is non-finite")
+    if args.require_parity and not payload["parity_gate"]["passed"]:
+        raise SystemExit(2)
     return 0
 
 

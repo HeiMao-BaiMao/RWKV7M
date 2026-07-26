@@ -185,6 +185,56 @@ def test_amd_safe_backend_keeps_pallas_forward_and_reference_vjp():
     )
 
 
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "pallas_gpu_triton",
+        "pallas_gpu_triton_reference_vjp",
+    ],
+)
+def test_multiple_gpu_pallas_pullbacks_compose_in_one_interpret_graph(backend):
+    inputs = _inputs(time=3)
+
+    def loss(fn, *values):
+        total = jnp.asarray(0.0, dtype=jnp.float32)
+        for index in range(6):
+            offset = jnp.asarray(index * 1e-3, dtype=values[0].dtype)
+            varied = tuple(value + offset for value in values[:-1]) + (
+                values[-1] + offset.astype(jnp.float32),
+            )
+            y, final_state = fn(*varied)
+            total = total + (index + 1) * (
+                jnp.sum(y.astype(jnp.float32))
+                + 0.01 * jnp.sum(final_state)
+            )
+        return total
+
+    argnums = tuple(range(len(inputs)))
+    expected = jax.grad(
+        lambda *values: loss(wkv7_reference, *values),
+        argnums=argnums,
+    )(*inputs)
+    actual = jax.jit(
+        jax.grad(
+            lambda *values: loss(
+                lambda *items: wkv7(
+                    *items,
+                    backend=backend,
+                    interpret=True,
+                ),
+                *values,
+            ),
+            argnums=argnums,
+        )
+    )(*inputs)
+
+    assert all(jnp.all(jnp.isfinite(value)) for value in actual)
+    assert all(
+        jnp.allclose(left, right, rtol=1e-5, atol=1e-6)
+        for left, right in zip(actual, expected, strict=True)
+    )
+
+
 def test_backend_environment_override_is_validated(monkeypatch):
     monkeypatch.setenv("RWKV7M_WKV_BACKEND", "pallas_tpu")
     assert resolve_wkv_backend(platform="cpu") == "pallas_tpu"

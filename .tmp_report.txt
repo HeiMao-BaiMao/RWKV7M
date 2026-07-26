@@ -1178,3 +1178,120 @@ PI制御案に対する現時点の立場:
   causal-use/retrieval objectiveは「読む価値を作る」を別の契約として設計すべき。
 - 実装前に、MI300X full graphで複数Pallas WKV backwardが共存する数値/実行時問題を
   fail-closedにする。コントローラ追加だけでは同じaccelerator graphで再発し得る。
+
+
+26. GPU/TPU不使用の実GPU投入前ローカル検証
+===========================================
+
+実施条件:
+
+- WindowsローカルCPUのみ。GPU/TPU、SSH、cloud resourceは使用していない。
+- branch: `agent/screening-pallas-benchmarks`
+- starting commit: `80b6eb7`
+- MI300Xから回収済みのproduction captureは
+  `.tmp/mi300x-budget250-wkv/` から読み取り、repositoryへは追加しない。
+
+診断基盤の監査で見つかった問題:
+
+- `scripts/diagnose_wkv_capture.py --require-parity`は、変更前はPallas gradientの
+  non-finite数だけを見ていた。
+- 入力/cotangent、forward output、final state、reference gradient、数値差は
+  exit codeへ反映されず、「parity」という名称より弱い検証だった。
+- CPU Pallas interpretを選ぶCLIもなく、回収済みcaptureをGPUなしで同じscriptへ
+  再投入できなかった。
+
+局所修正:
+
+- `--interpret`を追加し、GPU/TPU Pallas kernel bodyをCPU interpret modeで再生可能にした。
+- `--require-parity`を既定有効にした。既知のfailure解析時だけ
+  `--no-require-parity`で継続できる。
+- input/cotangent、Pallas/reference output、Pallas/reference gradientの
+  non-finiteを全てfail条件にした。
+- outputとgradientへmax-absolute、relative-L2の閾値を追加し、JSONへ
+  `parity_gate`、閾値、failure一覧を保存する。
+- BF16 activationとは別に、FP32 final stateへmax abs `1e-4`、
+  relative-L2 `5e-4`の専用閾値を設定した。
+- captureはBF16値をFP32のNPZとして保存しているが、BF16値はFP32で正確に表現でき、
+  replay時にBF16へ戻しているため、capture時のBF16 bit valueは失われない。
+
+production-shape CPU Pallas interpret replay:
+
+- 対象: layers 7--11、各4 recurrent chunk、合計20 WKV call。
+- shape: 全callで`T=128, B=8, H=12, N=64`。
+- backend: `pallas_gpu_triton`、`interpret=True`。
+- 結果: 20/20でfail-closed parity gate通過。
+- 全20 callを通した最大誤差:
+  - activation max abs: `0.125`
+  - activation relative L2: `5.20528446941171e-5`
+  - final-state max abs: `5.7220458984375e-6`
+  - final-state relative L2: `2.99139486514832e-7`
+  - gradient max abs: `7.45058059692383e-9`
+  - gradient relative L2: `4.8286106903106e-4`
+- Pallas/referenceのinput、output、gradientは全てfinite。
+- 既存MI300X実測JSONの上位層20 callも再集計し、non-finite gradient総数0、
+  gradient max abs差`1.49011611938477e-8`、
+  gradient relative-L2最大`3.0768447322771e-4`だった。
+
+fail-closed negative control:
+
+- layer 6 `wkv-000` captureは、WKVへ入る前の`y_cotangent`に82,944個の
+  non-finiteを含む。
+- 新しい既定gateはexit code 2で拒否し、JSONへ15 failureを列挙した。
+- Pallasとreferenceの両pullbackが同じnon-finite cotangentから非有限化するため、
+  kernel parityの合格例として誤分類しない。
+
+複数custom-VJPのローカル合成:
+
+- 一つのJIT/gradient graphへ、入力を僅かに変えた6個のGPU Pallas WKV callを配置した。
+- full Pallas pullbackとAMD安全backend
+  `pallas_gpu_triton_reference_vjp`の両方をreference全体gradientと比較した。
+- 2/2 caseで全gradient finiteかつ`rtol=1e-5, atol=1e-6`を通過した。
+- これはkernel数式とJAX custom-VJP合成を支持する。
+- 一方、実MI300Xで観測したfailureはROCm/Triton loweringを含むfull production graph
+  だけで発生したため、このCPU結果はROCmのbuffer aliasing、scheduling、lowering相互作用を
+  反証しない。AMD安全backendの実機full-step gateは依然必要。
+
+Screening/config/checkpoint/exportのCPU回帰:
+
+- Screening v5/v2/math、phase/config API、Flax checkpoint、safetensorsの関連79テスト:
+  `79 passed`。
+- 主な通過範囲:
+  - v5 portable Phase 1のtiny full train-step finite loss/gradient
+  - hard-forward write rateを使うauxiliary loss
+  - sequence chunk state/output invariance
+  - layer-wise metrics/loss
+  - self-index rejected-candidate gradient
+  - CPU Pallas interpretによるv2 GPU/TPU checkpoint parity
+  - explicit CPU mesh
+  - checkpoint round-trip
+  - safetensors round-tripとmetadata境界
+- `screening-v5-retention`、v5 interval checkpoint redesign、v5専用Pallas kernelは
+  現時点では未実装であり、config/testがsilent fallbackを拒否する。今回の結果は
+  それらの実装済み・性能済みを意味しない。
+
+全repository回帰:
+
+- `uv run python -m compileall -q src scripts tests`: pass。
+- `uv run pytest -q --durations=30`:
+  `282 passed, 5 skipped in 541.54s`。
+- parity gateの追加negative test後に最終コードで全suiteを再実行:
+  `283 passed, 5 skipped in 889.19s`。
+- 5 skipは全て実acceleratorを要求する既存gate
+  （optimizer、Screening、training head 2件、WKV）。
+- 2 CPU deviceのmodel-parallel path、Orbax save/resume、binidx CLI、
+  NNX/Linen forward-gradient parity、7B abstract plannerも通過した。
+
+現時点の判定:
+
+- GPUなしで検証可能なWKV数式、custom-VJP合成、production capture単体replay、
+  Screening portable semantics、checkpoint/export/config境界には新しいfailureはない。
+- MI300X full graph failureを「Pallas kernel本文の単体数式バグ」とする説明は、
+  production capture 20/20と複数call CPU合成の両方からさらに弱くなった。
+- 最も妥当な第一候補は引き続きROCm/Triton full-graph lowering、buffer aliasing、
+  custom-call scheduling、またはその相互作用。
+- 次のGPU sessionで必要なのは広い再調査ではなく、短いAMD安全backend acceptance:
+  1. MI300X auto dispatchが`pallas_gpu_triton_reference_vjp`を選ぶ。
+  2. corrected step-251 fixed batchが423/423 finite。
+  3. full reference WKV、安全hybrid、明示full-Pallasの固定batch時間を比較する。
+  4. 安全hybridで少数のoptimizer stepを実行し、loss/gradient/parameter finiteを確認する。
+- 上記実機gateを通るまでは「AMD training NaNを解消済み」とは扱わない。
