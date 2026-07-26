@@ -770,6 +770,45 @@ def test_nnx_admission_controller_moves_bias_against_hard_rate():
     assert inactive["admission_controller_update_enabled"] == 0.0
 
 
+def test_nnx_admission_controller_normalizes_trunk_context_per_token():
+    config = _v5_screening_config(
+        admission_init=0.16,
+        admission_controller_enabled=True,
+        admission_controller_target=0.05,
+    )
+    module = NNXStateLevelScreening(config, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(1), (2, 1, 32))
+    h = jax.random.normal(jax.random.key(2), (2, 1, 32))
+    initial = LayerScreenState(
+        slots=jnp.zeros((2, 4, 16), dtype=jnp.float32),
+        ages=jnp.zeros((2, 4), dtype=jnp.float32),
+        usage_ema=jnp.zeros((2, 4), dtype=jnp.float32),
+        occupancy=jnp.zeros((2, 4), dtype=jnp.float32),
+    )
+
+    _, _, reference = module(
+        x,
+        h,
+        initial,
+        phase="read_write",
+        deterministic=False,
+    )
+    _, _, shifted = module(
+        x,
+        h * 7.0 + 13.0,
+        initial,
+        phase="read_write",
+        deterministic=False,
+    )
+
+    assert jnp.allclose(
+        shifted["admission_mean"],
+        reference["admission_mean"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 def test_nnx_v5_detached_bootstrap_blocks_only_trunk_input_gradient():
     config = _v5_screening_config(
         detach_screening_inputs_steps=10,

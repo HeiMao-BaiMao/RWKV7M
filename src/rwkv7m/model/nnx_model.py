@@ -237,6 +237,15 @@ def _apply_norm_in_float32(module, x, *, output_dtype=None):
     return module(x.astype(jnp.float32)).astype(output_dtype)
 
 
+def _standardize_last_axis(x, *, eps):
+    """Return a parameter-free FP32 standardization over the feature axis."""
+
+    stats = x.astype(jnp.float32)
+    centered = stats - jnp.mean(stats, axis=-1, keepdims=True)
+    variance = jnp.mean(centered * centered, axis=-1, keepdims=True)
+    return centered * jax.lax.rsqrt(variance + eps)
+
+
 def _constrain_hidden(x, sharding: NNXShardingConfig | None):
     if sharding is None:
         return x
@@ -1575,9 +1584,27 @@ class NNXStateLevelScreening(nnx.Module):
                 ],
                 axis=-1,
             )
-            admission_projection = self.admission_proj(route_input).astype(
-                jnp.float32
-            )[..., 0]
+            admission_input = route_input
+            if v5_enabled and cfg.admission_controller_enabled:
+                # The controller bias assumes a stable score distribution.
+                # x_ln_seq already satisfies that contract, while the raw
+                # trunk residual changes scale and offset sharply during
+                # warm-up.  Normalize only the admission view so routing
+                # remains rank-sensitive without altering candidate, bank,
+                # or edit projections.
+                admission_input = jnp.concatenate(
+                    [
+                        x_ln_seq.astype(jnp.float32),
+                        _standardize_last_axis(
+                            screening_h_base_seq,
+                            eps=cfg.norm_eps,
+                        ),
+                    ],
+                    axis=-1,
+                )
+            admission_projection = self.admission_proj(
+                admission_input
+            ).astype(jnp.float32)[..., 0]
             if cfg.admission_controller_enabled:
                 admission_projection = admission_projection + (
                     jax.lax.stop_gradient(
