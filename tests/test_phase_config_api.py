@@ -133,6 +133,8 @@ def test_invalid_config_validation():
         ModelConfig(head_chunk_size=0, use_screening=False)
     with pytest.raises(ValueError, match="training_vocab_tile_size"):
         ModelConfig(training_vocab_tile_size=0, use_screening=False)
+    with pytest.raises(ValueError, match="gradient_spike_max_abs"):
+        ModelConfig(gradient_spike_max_abs=0.0, use_screening=False)
     with pytest.raises(ValueError, match="screening.d_model"):
         ModelConfig(
             d_model=32,

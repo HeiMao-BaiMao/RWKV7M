@@ -1295,3 +1295,295 @@ Screening/config/checkpoint/exportのCPU回帰:
   3. full reference WKV、安全hybrid、明示full-Pallasの固定batch時間を比較する。
   4. 安全hybridで少数のoptimizer stepを実行し、loss/gradient/parameter finiteを確認する。
 - 上記実機gateを通るまでは「AMD training NaNを解消済み」とは扱わない。
+
+
+27. MI300X delayed retrievalによるScreening v5の効果検証
+=========================================================
+
+目的:
+
+- Pallas化前の速度ではなく、現行Screening v5がheld-out delayed key/value retrievalで
+  実際に予測へ寄与するかを検証する。
+- train lossだけでなく、同一checkpointのmemory-on/off counterfactualを比較し、
+  memory branch固有のloss、accuracy、logit差を測る。
+- magic samplerではなく、memoryが利用可能なdocument-aligned taskを使う。
+
+実行環境とコード:
+
+- device: AMD Instinct MI300X VF、1 device、gfx942。
+- JAX / jaxlib / ROCm plugin: 0.10.0。
+- branch: `agent/screening-pallas-benchmarks`。
+- commit: `57d291c` (`Harden local WKV capture parity gates`)。
+- WKV auto backendはAMD安全経路
+  `pallas_gpu_triton_reference_vjp`を選択した。従って、今回の失敗を
+  既知のfull-Pallas WKV backward問題だけで説明することはできない。
+
+データ:
+
+- generator: `rwkv7m-prepare-retrieval`。
+- format: `rwkv7m-delayed-kv-v1`。
+- train: 8,192 documents、seed 42。
+- held-out eval: 1,024 documents、seed 4,242。
+- 1 documentは4 x 128-token chunk、training inputは512 token。
+- document先頭にquery対象のkey/value、16 distractor、最終chunk中央にqueryと
+  answer markerを置く。
+- key/value候補は256種類なので、未学習時のanswer accuracy期待値は1/256
+  (`0.00390625`)。
+- trainは`sampling_mode=document`、`ctx_len=512`、answer-only CE。
+- evalは`document_sequential + carry_state=true`、`ctx_len=128`、
+  answer-only CE。document境界でRWKV stateとScreening stateを行単位resetする。
+
+モデルと学習条件:
+
+- `configs/rwkv7m-0.185b-screening-v5-core.json.example`。
+- 0.185B、screened layer 6、16 slots、4 read tiles。
+- global batch 8、fixed LR `1e-4`、100-step optimizer warmup。
+- Screening activationはstep 100から100 stepで0 -> 1。
+- Screening parameter LR multiplierは0.1。
+- admission floor、write budget、self-indexはいずれもweight 0.1。
+- requested 500 steps、checkpoint every 100。
+- 実際にはstep 262でfail-closed停止した。
+
+時系列で確認された挙動:
+
+1. step 1--100: trunk-only期間
+
+   - `screening_activation=0`。
+   - hard write、slot utilization、read energy、memory residualは全て0。
+   - admission meanは0.82から0.49へ変化したが、activation前なのでslotは空。
+
+2. step 102--121: 最初のall-write側への転移
+
+   - step 102: activation 0.01、hard write 0.0813、slot utilization 0.9102。
+   - step 108: hard write 0.0857、admission mean 0.4858。
+   - step 109: hard writeが0.9624へ不連続に跳ね、gradient L2は
+     `1.5686e8`、max absは`1.3697e7`へspikeした。
+   - step 110--121もhard writeは0.91--0.98に滞在した。
+   - step 115--119にはgradient L2 `7.09e12`、`1.88e12`、
+     `8.74e8`、`1.29e14`、`4.99e9`のspikeが発生した。
+   - step 118のmax abs gradientは`1.4225e13`。
+   - 個々のgradientはまだfiniteだったため、既存finite gateだけでは停止しなかった。
+
+3. step 122--248: empty-memory collapse
+
+   - step 122でhard writeは0.0437、step 124以降はほぼ0へ落ちた。
+   - step 175: hard write 0、slot utilization 0、read energy 0、
+     residual/base RMS比0。
+   - step 200: hard write `0.000244`、slot utilization `0.001953`、
+     residual/base RMS比`1.49e-6`。
+   - step 225: hard write、slot utilization、read energy、residualが再び全て0。
+   - activation後161 stepのresidual/base RMS比はmedian `1.71e-6`、
+     maxでも`1.32e-4`だった。trunkへ入るmemory branchは一貫して極小。
+
+4. step 249--262: 二度目のall-write転移と停止
+
+   - step 248: hard write 0、soft write 0.1974、admission mean 0.3734、
+     slotは空。
+   - step 249: hard write 0.8596、slot utilization 0.25へ一stepで転移。
+   - step 250: hard write 0.8992、admission mean 0.8157、
+     slot cosine redundancy 0.9452、gradient L2 `1.7851e4`。
+   - step 255: hard write 0.9453、redundancy 0.9629、
+     gradient L2 `8.7389e8`。
+   - step 261: gradient L2 `5.6490e7`。
+   - step 262: hard write 0.9470、soft write 0.4975、admission mean 0.9485、
+     slot utilization 0.2578、redundancy 0.8923。
+   - step 262の最大gradient要素はfiniteな`1.4979e22`だったが、
+     FP32二乗和がoverflowしglobal normが`Inf`となった。
+   - trainerは`non-finite train metrics at step 262:
+     gradient_global_norm`でfail-closed停止した。parameterは停止時点ではfinite。
+
+write-budget制御について確認された問題:
+
+- upper write-budget lossは`slot_utilization >= 0.5`のときだけ有効になる。
+- 最初の飽和ではstep 109--113だけbudget lossが約0.01発火したが、
+  utilizationが0.33へ落ちたstep 114から、hard writeが0.94でもlossは0になった。
+- 二度目の飽和ではutilizationが約0.25だったため、hard write 0.95、
+  target 0.05でもbudget lossは0だった。
+- step 258だけutilizationがちょうど0.5となりbudget loss約0.09が発火したが、
+  step 259にutilizationが0.28へ戻ると再び0になった。
+- これはコードと実測の双方で確認できる。empty trapを避けるための
+  utilization hard switchが、低利用率のall-write状態では上限制御を完全に外す。
+- floorとbudgetはhard-forward/soft-backwardのrealized rateを受け取るため、
+  以前のsoft-only Goodhart問題そのものではない。ただし、0.5 thresholdの不連続性と
+  admission hard thresholdを含む閉ループは、安定な中間rateを形成できなかった。
+
+held-out memory-on/off評価:
+
+checkpoint 100:
+
+- 評価時はtraining activationに関係なくmemory residual scaleを1として比較した。
+- masked positions: 256。
+- memory-on loss: `12.146836`。
+- memory-off loss: `12.147200`。
+- memory loss delta: `+0.000364`。
+- prediction RMS delta: `0.003645`。
+- memory-on accuracy: `1/256 = 0.003906`。
+- memory-off accuracy: `1/256 = 0.003906`。
+- accuracy delta: 0。
+- Screening学習開始直前のcheckpointなので、微小なpositive loss deltaは
+  学習済みmemory効果ではなく、未学習branchの小さな摂動として扱う。
+
+checkpoint 200:
+
+- masked positions: 256。
+- memory-on loss: `9.272220`。
+- memory-off loss: `9.272220`。
+- memory loss delta: `0.000000`。
+- prediction RMS delta: `0.000000`。
+- memory-on accuracy: `0/256`。
+- memory-off accuracy: `0/256`。
+- accuracy delta: 0。
+- on/off logitsが同一なのは、同時期のhard write/read/slot指標がほぼ0であることと
+  整合する。trunkのlossは改善したが、memory branchは予測へ全く寄与していない。
+
+効果に関する判定:
+
+- 現行Screening v5は、このdocument-aligned delayed retrieval実験で
+  学習効果を示さなかった。
+- checkpoint 200ではmemoryを無効化してもloss、accuracy、logitsが変わらないため、
+  「taskが難しくaccuracyが低いだけ」ではなく、memory branchがcausally unusedである。
+- 学習は安定な中間write率へ入らず、
+  all-write -> empty-memory -> all-writeの順に吸収状態を移動した。
+- all-write期間にもresidual/base比は概ね`1e-5`なので、write率を維持するだけでは
+  causal useを保証できない。
+- 速度またはPallas kernel性能については、この実験から結論を出さない。
+
+次の実装判断:
+
+1. `write_budget_min_slot_utilization=0.5`によるhard enable/disableを廃止する。
+   少なくともhard write 95%時にupper controlが0になる構成は採用しない。
+2. hard write率の制御をCE/二次lossから分離し、training-step間で更新する
+   bounded feedback controllerを第一候補とする。controllerは率だけを担当し、
+   gradientはtoken ranking/contentへ使う。
+3. gradient finiteだけでなく、FP32 norm overflow前のmax-absまたはscaled-norm gateを
+   追加し、`1e8--1e14`級spikeを更新へ通さない。
+4. memory residualがtrunkから無視されないよう、delayed retrieval期間限定で
+   residual floorまたはcausal-use objectiveを設ける。ただし常時write強制とは分離する。
+5. 修正後のacceptanceは、同じheld-out protocolで
+   `memory_accuracy_delta > 0`、一貫したpositive `memory_loss_delta`、
+   非ゼロprediction RMS delta、安定したmulti-slot utilizationを同時に要求する。
+
+回収物:
+
+- `.tmp/mi300x-retrieval-v5-effect-s42/metrics.jsonl`
+- `.tmp/mi300x-retrieval-v5-effect-s42/run_config.json`
+- `.tmp/mi300x-retrieval-v5-effect-s42/run_summary.json`
+- `.tmp/mi300x-retrieval-v5-effect-s42/eval-ckpt100.txt`
+- `.tmp/mi300x-retrieval-v5-effect-s42/eval-ckpt200.txt`
+- train/eval dataset metadata
+
+上記`.tmp/`内の実験artifactはgit管理対象外であり、raw checkpointは回収していない。
+必要な数値、条件、判断は本節へ転記した。GPU上の学習/評価processは全て終了済みで、
+実験に必要なartifact回収後はMI300Xを停止可能と通知した。
+
+
+28. Delayed retrieval反証後の構造修正
+=====================================
+
+目的:
+
+- §27で確認した`all-write -> empty-memory -> all-write`の吸収状態を、
+  soft surrogate lossの再調整ではなく制御系の分離によって防ぐ。
+- routing/content学習とwrite率制御を分離する。
+- memory branchへCE信号を与えつつ、初期Screening gradientがRWKV trunkを
+  破壊しない境界を作る。
+- finiteだが巨大なgradientでparameter/optimizer stateを汚染しない。
+
+実装した変更:
+
+1. per-layer hard-write feedback controller
+
+   - 各screened layerの`hard_write_budget_rate`をstep終了時に観測する。
+   - controller biasはloss内でstop-gradientし、次のincremental PI式で更新する。
+
+     `delta = kp * (error - previous_error) + ki * error`
+
+   - deltaとbiasの双方を設定値でclipする。
+   - Screening activationが0の間、および観測rateが非finiteの場合は更新しない。
+   - tracked targetは0.05。
+   - admission floor / upper write-budget lossとの同時有効化はconfig errorにした。
+
+   これにより、率はhard実測値のfeedbackで決まり、gradientはtoken rankingと
+   memory contentの学習へ使える。write率5%自体を品質改善とは解釈しない。
+
+2. checkpoint / portable artifact境界
+
+   - learned controller biasはFP32 NNX Paramであり、full checkpointとsafetensorsの
+     双方へ保存する。
+   - FP32固定は、bias絶対値1--3付近で0.001級のPI incrementがBF16の1 ULP未満となり
+     消失することを防ぐためである。
+   - rate EMAとprevious errorは非parameter training stateであり、full checkpoint
+     だけへ保存する。
+   - checkpoint round-tripで3状態の復元を確認した。
+   - portable safetensorsにEMA/errorが混入しないことも確認した。
+
+3. Screening入力gradientのbootstrap分離
+
+   - activation後の設定期間、Screening projectionへ渡す`x`と`h_base`を
+     stop-gradient copyへ置換する。
+   - RWKV base residualのCE経路は変更しない。
+   - tracked期間は2,000 Screening steps。
+   - unit testでScreening側objectiveから入力gradientが厳密に0になり、
+     期間終了後は非ゼロへ戻ることを確認した。
+
+4. content signal
+
+   - tracked pre-tile `lambda_screen` floorを0.2へ変更した。
+   - 4 read tile後の初期effective floorは0.1。
+   - floorは2,000 Screening stepsで0へannealし、その後はlearned scaleだけを使う。
+   - self-index lossはtracked configで無効化した。理由はself-index-only実測で
+     raw gradient L2最大5.56e11と直後のall-reject collapseが確認されたため。
+   - admission floorとupper budgetも無効化した。write率はcontrollerが担当する。
+
+5. controller初期化
+
+   - tracked `admission_init`を0.16に変更した。
+   - logit(0.16)はroute scoreをunit normalと近似した場合の5% tailに近い。
+   - これは初期hard write率を保証する式ではなく、実機shapeで検証すべき
+     initialization heuristicである。
+
+6. overflow-safe gradient guard
+
+   - global normを`max_abs * norm(gradient / max_abs)`で計算し、有限の巨大値を
+     先に二乗してFP32 overflowする問題を回避した。
+   - nonfinite gradientまたは設定されたmax-abs threshold超過時は、
+     parameterだけでなくoptimizer momentとoptimizer stepを含む更新全体をskipする。
+   - tracked thresholdは1e6。これは§27の1e8--1e14級spikeを更新へ通さないための
+     初期実験値であり、最適値ではない。
+   - `gradient_clip_scale`、`gradient_spike_detected`、
+     `gradient_update_applied`をstructured metricsへ追加した。
+
+7. 旧upper-budgetの不連続性
+
+   - ablation用に残る`write_budget_min_slot_utilization`は、threshold未満で
+     penaltyを完全に0へするhard switchを廃止した。
+   - 現在は`clip(utilization / minimum, 0, 1)`で連続的にscaleする。
+   - tracked controller profileではこのloss自体を無効化している。
+
+現時点のローカル検証:
+
+- CLI/config overrideとtracked JSON parse。
+- controllerの増減方向、bias bound、inactive update。
+- controllerを含むtiny NNX full train step。
+- controller full-checkpoint round-tripとsafetensors境界。
+- bootstrap input-gradient分離。
+- finite巨大gradientのscaled norm。
+- spike時のcomplete optimizer-update skip。
+
+未検証:
+
+- 修正profileがMI300X delayed retrievalでhard write率5%へ収束するか。
+- multi-slot utilization、read energy、memory residualが維持されるか。
+- held-out memory-on/off loss delta、prediction delta、accuracy deltaが改善するか。
+- controller gain、initial admission、residual floor、max-gradient thresholdの妥当値。
+- v5 Pallas性能。今回の修正はportable v5の品質検証を先に行うためのものである。
+
+判定:
+
+- §27で確認されたsoft/hard Goodhart、low-utilization時のbudget無効化、
+  self-index spikeのtrunk漏出、naive norm overflowは、コード上の構造として
+  それぞれ対策した。
+- memoryが実際に使われるようになったとはまだ言えない。
+- 次のMI300X実験は§27と同じdataset/seed/eval protocolを使い、
+  controller rate、controller bias、per-layer slot/read指標、gradient skip回数、
+  checkpoint 100/200以降のmemory-on/off counterfactualを比較する。

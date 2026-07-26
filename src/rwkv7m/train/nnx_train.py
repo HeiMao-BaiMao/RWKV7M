@@ -248,17 +248,73 @@ def _tree_gradient_statistics(tree):
     all_finite = jnp.stack(
         [jnp.all(jnp.isfinite(value)) for value in leaves]
     ).all()
-    squared_norm = sum(
-        (jnp.sum(jnp.square(value)) for value in leaves),
+    finite_leaves = [
+        jnp.where(jnp.isfinite(value), value, 0.0) for value in leaves
+    ]
+    finite_max_abs = jnp.max(
+        jnp.stack([jnp.max(jnp.abs(value)) for value in finite_leaves])
+    )
+    normalization_scale = jnp.where(
+        finite_max_abs > 0.0,
+        finite_max_abs,
+        1.0,
+    )
+    normalized_squared_norm = sum(
+        (
+            jnp.sum(jnp.square(value / normalization_scale))
+            for value in finite_leaves
+        ),
         start=jnp.zeros((), dtype=jnp.float32),
     )
-    max_abs = jnp.max(
-        jnp.stack([jnp.max(jnp.abs(value)) for value in leaves])
+    finite_global_norm = normalization_scale * jnp.sqrt(
+        normalized_squared_norm
     )
+    global_norm = jnp.where(all_finite, finite_global_norm, jnp.inf)
+    max_abs = jnp.where(all_finite, finite_max_abs, jnp.inf)
     return (
         all_finite.astype(jnp.float32),
-        jnp.sqrt(squared_norm),
+        global_norm,
         max_abs,
+    )
+
+
+def _prepare_gradient_update(
+    tree,
+    *,
+    max_grad_norm,
+    spike_max_abs,
+):
+    """Return stably clipped gradients and a fail-safe update decision."""
+
+    all_finite, global_norm, max_abs = _tree_gradient_statistics(tree)
+    spike_detected = (
+        jnp.zeros((), dtype=jnp.bool_)
+        if spike_max_abs is None
+        else max_abs > float(spike_max_abs)
+    )
+    update_allowed = (all_finite > 0.5) & ~spike_detected
+    clip_scale = jnp.minimum(
+        1.0,
+        float(max_grad_norm) / jnp.maximum(global_norm, 1e-30),
+    )
+    clip_scale = jnp.where(update_allowed, clip_scale, 0.0)
+    prepared = jax.tree.map(
+        lambda value: (
+            jnp.where(jnp.isfinite(value), value, 0.0) * clip_scale
+            if hasattr(value, "dtype")
+            and jnp.issubdtype(value.dtype, jnp.inexact)
+            else value
+        ),
+        tree,
+    )
+    return (
+        prepared,
+        all_finite,
+        global_norm,
+        max_abs,
+        clip_scale,
+        spike_detected.astype(jnp.float32),
+        update_allowed.astype(jnp.float32),
     )
 
 
@@ -283,20 +339,26 @@ def compute_v5_write_budget_loss(
     excess = jax.nn.relu(
         jnp.asarray(write_rate, dtype=jnp.float32) - target
     )
-    enabled = jnp.ones((), dtype=jnp.float32)
+    utilization_scale = jnp.ones((), dtype=jnp.float32)
     minimum_utilization = float(
         screening_config.write_budget_min_slot_utilization
     )
     if slot_utilization is not None and minimum_utilization > 0.0:
-        enabled = jax.lax.stop_gradient(
-            (
+        # The former hard switch disabled the upper budget completely when
+        # utilization dipped below the threshold. A low-utilization all-write
+        # state could therefore receive no opposing gradient. Preserve the
+        # intended bootstrap relaxation, but remove that discontinuous escape.
+        utilization_scale = jax.lax.stop_gradient(
+            jnp.clip(
                 jnp.asarray(slot_utilization, dtype=jnp.float32)
-                >= minimum_utilization
-            ).astype(jnp.float32)
+                / minimum_utilization,
+                0.0,
+                1.0,
+            )
         )
     return (
         screening_config.write_budget_weight
-        * enabled
+        * utilization_scale
         * jnp.square(excess),
         target,
     )
@@ -782,16 +844,50 @@ def _nnx_train_step(
 
     accumulated_grads = _cast_gradient_tree(accumulated_grads, update_dtype)
     (
+        prepared_grads,
         gradient_all_finite,
         gradient_global_norm,
         gradient_max_abs,
-    ) = _tree_gradient_statistics(accumulated_grads)
-    optimizer.update(model, accumulated_grads)
+        gradient_clip_scale,
+        gradient_spike_detected,
+        gradient_update_applied,
+    ) = _prepare_gradient_update(
+        accumulated_grads,
+        max_grad_norm=model.config.max_grad_norm,
+        spike_max_abs=model.config.gradient_spike_max_abs,
+    )
+
+    def apply_optimizer_update(active_model, active_optimizer, gradients):
+        active_optimizer.update(active_model, gradients)
+        return jnp.ones((), dtype=jnp.float32)
+
+    def skip_optimizer_update(active_model, active_optimizer, gradients):
+        del active_model, active_optimizer, gradients
+        return jnp.zeros((), dtype=jnp.float32)
+
+    gradient_update_applied = nnx.cond(
+        gradient_update_applied > 0.5,
+        apply_optimizer_update,
+        skip_optimizer_update,
+        model,
+        optimizer,
+        prepared_grads,
+    )
     metrics = accumulated_metrics
+    if phase == "read_write":
+        metrics.update(
+            model.update_screening_admission_controllers(
+                metrics,
+                update_allowed=gradient_update_applied,
+            )
+        )
     metrics["total_loss"] = accumulated_loss
     metrics["gradient_all_finite"] = gradient_all_finite
     metrics["gradient_global_norm"] = gradient_global_norm
     metrics["gradient_max_abs"] = gradient_max_abs
+    metrics["gradient_clip_scale"] = gradient_clip_scale
+    metrics["gradient_spike_detected"] = gradient_spike_detected
+    metrics["gradient_update_applied"] = gradient_update_applied
     metrics["parameter_all_finite"] = _tree_finite_flag(
         nnx.state(model, nnx.Param)
     )

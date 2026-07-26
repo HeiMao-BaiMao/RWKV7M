@@ -1161,9 +1161,13 @@ class NNXStateLevelScreening(nnx.Module):
             admission_bias = math.log(
                 config.admission_init / (1.0 - config.admission_init)
             )
+            controller_enabled = (
+                v5_enabled and config.admission_controller_enabled
+            )
             self.admission_proj = screening_linear(
                 route_input_size,
                 1,
+                use_bias=not controller_enabled,
                 kernel_axes=row,
                 bias_init=initializers.constant(admission_bias),
                 rngs=rngs,
@@ -1171,6 +1175,30 @@ class NNXStateLevelScreening(nnx.Module):
                 dtype=compute_dtype,
                 param_dtype=param_dtype,
             )
+            if controller_enabled:
+                self.admission_controller_bias = _param(
+                    rngs,
+                    initializers.constant(admission_bias),
+                    (),
+                    sharding=sharding,
+                    # This is an accumulator updated in increments that are
+                    # commonly smaller than one BF16 ULP at |bias| ~= 1--3.
+                    # FP32 storage is part of the controller state contract.
+                    dtype=jnp.float32,
+                )
+                self.admission_controller_rate_ema = nnx.Variable(
+                    jnp.asarray(
+                        config.admission_controller_target,
+                        dtype=jnp.float32,
+                    )
+                )
+                self.admission_controller_previous_error = nnx.Variable(
+                    jnp.zeros((), dtype=jnp.float32)
+                )
+            else:
+                self.admission_controller_bias = nnx.data(None)
+                self.admission_controller_rate_ema = nnx.data(None)
+                self.admission_controller_previous_error = nnx.data(None)
             self.bank_route_proj = screening_linear(
                 route_input_size,
                 3,
@@ -1242,6 +1270,9 @@ class NNXStateLevelScreening(nnx.Module):
             self.matched_edit_proj = nnx.data(None)
             self.novel_edit_proj = nnx.data(None)
             self.admission_feature_weights = nnx.data(None)
+            self.admission_controller_bias = nnx.data(None)
+            self.admission_controller_rate_ema = nnx.data(None)
+            self.admission_controller_previous_error = nnx.data(None)
 
     def _compute_mu(self):
         cfg = self.config
@@ -1261,6 +1292,85 @@ class NNXStateLevelScreening(nnx.Module):
             ]
         )
         return per_bank[jnp.asarray(cfg.bank_ids)]
+
+    def update_admission_controller(self, observed_rate, activation):
+        """Update the bounded per-layer PI actuator from realized hard writes."""
+
+        cfg = self.config
+        if not cfg.admission_controller_enabled:
+            return {}
+        observed_rate = jax.lax.stop_gradient(
+            jnp.clip(jnp.asarray(observed_rate, dtype=jnp.float32), 0.0, 1.0)
+        )
+        activation = jax.lax.stop_gradient(
+            jnp.asarray(activation, dtype=jnp.float32)
+        )
+        update_enabled = (activation > 0.0) & jnp.isfinite(observed_rate)
+        old_rate_ema = _value(self.admission_controller_rate_ema).astype(
+            jnp.float32
+        )
+        decay = cfg.admission_controller_rate_ema_decay
+        next_rate_ema = jnp.where(
+            update_enabled,
+            decay * old_rate_ema + (1.0 - decay) * observed_rate,
+            old_rate_ema,
+        )
+        target = jnp.asarray(
+            cfg.admission_controller_target,
+            dtype=jnp.float32,
+        )
+        error = target - observed_rate
+        old_error = _value(
+            self.admission_controller_previous_error
+        ).astype(jnp.float32)
+        raw_delta = (
+            cfg.admission_controller_kp * (error - old_error)
+            + cfg.admission_controller_ki * error
+        )
+        bounded_delta = jnp.clip(
+            raw_delta,
+            -cfg.admission_controller_max_step,
+            cfg.admission_controller_max_step,
+        )
+        old_bias = _value(self.admission_controller_bias).astype(jnp.float32)
+        next_bias = jnp.where(
+            update_enabled,
+            jnp.clip(
+                old_bias + bounded_delta,
+                -cfg.admission_controller_bias_limit,
+                cfg.admission_controller_bias_limit,
+            ),
+            old_bias,
+        )
+        applied_delta = next_bias - old_bias
+        self.admission_controller_bias[...] = next_bias.astype(
+            self.admission_controller_bias[...].dtype
+        )
+        self.admission_controller_rate_ema[...] = next_rate_ema
+        self.admission_controller_previous_error[...] = jnp.where(
+            update_enabled,
+            error,
+            old_error,
+        )
+        return {
+            "admission_controller_bias": next_bias,
+            "admission_controller_rate_ema": next_rate_ema,
+            "admission_controller_error": jnp.where(
+                update_enabled,
+                error,
+                0.0,
+            ),
+            "admission_controller_bias_update": applied_delta,
+            "admission_controller_update_enabled": (
+                update_enabled.astype(jnp.float32)
+            ),
+            "admission_controller_saturated": (
+                (
+                    jnp.abs(next_bias)
+                    >= cfg.admission_controller_bias_limit - 1e-6
+                ).astype(jnp.float32)
+            ),
+        }
 
     def __call__(
         self,
@@ -1295,9 +1405,36 @@ class NNXStateLevelScreening(nnx.Module):
             if state.occupancy is None
             else state.occupancy.astype(jnp.float32)
         )
+        screening_input_detach = jnp.zeros((), dtype=jnp.float32)
+        screening_x_seq = x_seq
+        screening_h_base_seq = h_base_seq
+        if (
+            v5_enabled
+            and training_step is not None
+            and cfg.detach_screening_inputs_steps > 0
+        ):
+            detach_progress = (
+                jnp.asarray(training_step, dtype=jnp.float32)
+                - float(cfg.activation_step)
+            )
+            screening_input_detach = jax.lax.stop_gradient(
+                (
+                    (detach_progress >= 0.0)
+                    & (
+                        detach_progress
+                        < float(cfg.detach_screening_inputs_steps)
+                    )
+                ).astype(jnp.float32)
+            )
+            screening_x_seq = x_seq + screening_input_detach * (
+                jax.lax.stop_gradient(x_seq) - x_seq
+            )
+            screening_h_base_seq = h_base_seq + screening_input_detach * (
+                jax.lax.stop_gradient(h_base_seq) - h_base_seq
+            )
         x_ln_seq = _apply_norm_in_float32(
             self.screen_ln,
-            x_seq,
+            screening_x_seq,
             output_dtype=self.compute_dtype,
         )
         q_r_raw = self.q_proj_r(x_ln_seq).astype(jnp.float32)
@@ -1318,7 +1455,7 @@ class NNXStateLevelScreening(nnx.Module):
         if cfg.candidate_rank is None:
             delta_s_seq = _compute_slot_delta(
                 x_ln_seq,
-                h_base_seq.astype(jnp.float32),
+                screening_h_base_seq.astype(jnp.float32),
                 _value(self.slot_embed),
                 _value(self.delta_proj.kernel),
                 _value(self.delta_proj.bias),
@@ -1327,7 +1464,11 @@ class NNXStateLevelScreening(nnx.Module):
             )
         else:
             route_context = jnp.concatenate(
-                [x_ln_seq, h_base_seq.astype(self.compute_dtype)], axis=-1
+                [
+                    x_ln_seq,
+                    screening_h_base_seq.astype(self.compute_dtype),
+                ],
+                axis=-1,
             )
             context_latent = self.delta_context_proj(route_context)
             slot_out_sharding = None
@@ -1393,7 +1534,8 @@ class NNXStateLevelScreening(nnx.Module):
         )
         if uses_write_score:
             q_w_in = jnp.concatenate(
-                [x_ln_seq, h_base_seq.astype(jnp.float32)], axis=-1
+                [x_ln_seq, screening_h_base_seq.astype(jnp.float32)],
+                axis=-1,
             )
             q_w_seq = unit_norm(
                 self.q_proj_w(q_w_in).astype(jnp.float32),
@@ -1427,11 +1569,23 @@ class NNXStateLevelScreening(nnx.Module):
 
         if write_mode == "competitive_novel":
             route_input = jnp.concatenate(
-                [x_ln_seq, h_base_seq.astype(self.compute_dtype)], axis=-1
+                [
+                    x_ln_seq,
+                    screening_h_base_seq.astype(self.compute_dtype),
+                ],
+                axis=-1,
             )
             admission_projection = self.admission_proj(route_input).astype(
                 jnp.float32
             )[..., 0]
+            if cfg.admission_controller_enabled:
+                admission_projection = admission_projection + (
+                    jax.lax.stop_gradient(
+                        _value(self.admission_controller_bias).astype(
+                            jnp.float32
+                        )
+                    )
+                )
             admission_seq = (
                 admission_projection
                 if v5_enabled
@@ -1963,6 +2117,21 @@ class NNXStateLevelScreening(nnx.Module):
                     / math.sqrt(cfg.n_read_tiles),
                     "screening_residual_scale": residual_scale,
                     "screening_activation": training_activation,
+                    "screening_input_detach": screening_input_detach,
+                    "admission_controller_bias": (
+                        _value(self.admission_controller_bias).astype(
+                            jnp.float32
+                        )
+                        if cfg.admission_controller_enabled
+                        else jnp.zeros((), dtype=jnp.float32)
+                    ),
+                    "admission_controller_rate_ema": (
+                        _value(
+                            self.admission_controller_rate_ema
+                        ).astype(jnp.float32)
+                        if cfg.admission_controller_enabled
+                        else jnp.zeros((), dtype=jnp.float32)
+                    ),
                 }
             )
         else:
@@ -2163,6 +2332,38 @@ class NNXScreenedRWKVModel(nnx.Module):
             dtype=_get_model_dtype(config),
             param_dtype=param_dtype,
         )
+
+    def update_screening_admission_controllers(
+        self,
+        metrics,
+        *,
+        update_allowed=1.0,
+    ):
+        """Update every enabled layer controller from global hard-write metrics."""
+
+        controller_metrics = {}
+        aggregate = {}
+        update_allowed = jax.lax.stop_gradient(
+            jnp.asarray(update_allowed, dtype=jnp.float32)
+        )
+        for layer_idx in self.config.screening.screened_layers:
+            layer = getattr(self, f"layer_{layer_idx}")
+            if not layer._has_screening:
+                continue
+            screening = getattr(layer, layer._screening_name)
+            if not screening.config.admission_controller_enabled:
+                continue
+            prefix = f"screening_layer_{layer_idx}_"
+            layer_metrics = screening.update_admission_controller(
+                metrics[prefix + "hard_write_budget_rate"],
+                metrics[prefix + "screening_activation"] * update_allowed,
+            )
+            for key, value in layer_metrics.items():
+                controller_metrics[prefix + key] = value
+                aggregate.setdefault(key, []).append(value)
+        for key, values in aggregate.items():
+            controller_metrics[key] = jnp.mean(jnp.stack(values))
+        return controller_metrics
 
     def compute_recurrent_hidden(
         self,

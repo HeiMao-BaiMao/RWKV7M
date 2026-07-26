@@ -16,6 +16,10 @@ from rwkv7m.cli.train_binidx import build_config
 from rwkv7m.cli.train_binidx_distributed import parse_args
 from rwkv7m.distributed import DTypePolicy, abstract_parameter_summary
 from rwkv7m.train.train_step import train_step
+from rwkv7m.train.nnx_train import (
+    _prepare_gradient_update,
+    _tree_gradient_statistics,
+)
 
 
 def _training_config():
@@ -152,6 +156,89 @@ def test_microbatch_accumulation_matches_full_batch_optimizer_update():
             rtol=2e-5,
             atol=2e-6,
         ), path
+
+
+def test_stable_gradient_statistics_do_not_overflow_for_finite_spike():
+    gradients = {
+        "a": jnp.asarray([1e22, -1e22], dtype=jnp.float32),
+        "b": jnp.asarray([3.0], dtype=jnp.float32),
+    }
+    all_finite, global_norm, max_abs = _tree_gradient_statistics(gradients)
+    assert all_finite == 1.0
+    assert jnp.isfinite(global_norm)
+    assert jnp.allclose(global_norm / 1e22, jnp.sqrt(2.0), rtol=1e-5)
+    assert max_abs == jnp.asarray(1e22, dtype=jnp.float32)
+
+
+def test_gradient_spike_guard_zeroes_update_before_optimizer():
+    gradients = {
+        "a": jnp.asarray([3.0, 4.0], dtype=jnp.float32),
+    }
+    (
+        prepared,
+        all_finite,
+        global_norm,
+        max_abs,
+        clip_scale,
+        spike_detected,
+        update_applied,
+    ) = _prepare_gradient_update(
+        gradients,
+        max_grad_norm=1.0,
+        spike_max_abs=3.5,
+    )
+    assert all_finite == 1.0
+    assert global_norm == 5.0
+    assert max_abs == 4.0
+    assert clip_scale == 0.0
+    assert spike_detected == 1.0
+    assert update_applied == 0.0
+    assert jnp.array_equal(prepared["a"], jnp.zeros((2,), jnp.float32))
+
+
+def test_nnx_train_step_skips_complete_optimizer_update_on_spike():
+    config = _training_config()
+    config.gradient_spike_max_abs = 1e-20
+    runtime, state = create_train_runtime(
+        jax.random.key(0),
+        config,
+        batch_size=4,
+        total_steps=2,
+    )
+    before = {
+        path: jax.device_get(value).copy()
+        for path, value in _parameter_values(state.model).items()
+    }
+    before_optimizer = [
+        jax.device_get(value).copy()
+        for value in jax.tree.leaves(state.opt_state)
+        if hasattr(value, "dtype")
+    ]
+    state, _, _, metrics = train_step(
+        state,
+        _batch(),
+        runtime.initial_rwkv_state,
+        runtime.initial_screen_state,
+    )
+    jax.block_until_ready(state.ready_state())
+    assert metrics["gradient_spike_detected"] == 1.0
+    assert metrics["gradient_update_applied"] == 0.0
+    assert state.step == 0
+    after = _parameter_values(state.model)
+    for path, expected in before.items():
+        assert jnp.array_equal(after[path], expected), path
+    after_optimizer = [
+        value
+        for value in jax.tree.leaves(state.opt_state)
+        if hasattr(value, "dtype")
+    ]
+    assert len(after_optimizer) == len(before_optimizer)
+    for actual, expected in zip(
+        after_optimizer,
+        before_optimizer,
+        strict=True,
+    ):
+        assert jnp.array_equal(actual, expected)
 
 
 def test_tracked_7b_config_is_shared_by_planner_and_distributed_cli():

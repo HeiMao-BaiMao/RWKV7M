@@ -620,3 +620,34 @@ validation、定期checkpoint、長時間のthermal/host変動、障害復旧、
 生成されたJSON/CSVとcheckpointはrepositoryのruntime dependencyにはしない。
 再現可能な設定は追跡対象のexample configと本書へ残し、研究上の採用判断は
 今後のmatched validation matrixに基づいて行う。
+
+## 2026-07-26 delayed-retrieval追試と実装反映
+
+上記MiniPile診断後、document-aligned delayed key/value retrievalを0.185Bで
+実施した。旧tracked profileは`all-write -> empty-memory -> all-write`へ遷移し、
+checkpoint 200ではmemory-on/offのloss、accuracy、logitsが完全に一致した。
+step 262では最大gradient要素がfiniteな`1.4979e22`まで増加し、naiveなFP32
+二乗和だけがoverflowした。したがって旧profileはmemory効果gateを通過していない。
+
+この反証を受け、次のコード変更を行った。
+
+- per-layer hard write率を観測するbounded incremental PI admission controller;
+- controllerとadmission-floor/write-budget gradient lossの同時有効化を拒否;
+- legacy write budgetのutilization hard switchを連続scaleへ変更;
+- activation後2,000 stepのScreening入力stop-gradient;
+- four-tile effective initial residual floorを0.1へ増加;
+- self-index lossをtracked configで無効化;
+- overflow-safe scaled gradient norm;
+- max-absolute-gradient guard超過時のparameter/moment/stepを含む完全update skip;
+- controller bias/EMA/errorのfull-checkpoint round-tripとportable export境界。
+
+tracked target hard write率は0.05、controller初期`admission_init`は0.16、
+max-absolute-gradient guardは1e6である。いずれも初期実験値であり、MI300Xで
+再測定していない。構造修正の詳細と未検証事項は
+[`state_level_screening_v5_design.md`](state_level_screening_v5_design.md)および
+repository rootの`.tmp_report.txt` §28を参照する。
+
+修正後profileについて、現時点で主張できるのは設定・gradient境界・checkpoint
+契約のローカル検証だけである。hard write率の収束、multi-slot利用、read energy、
+memory residual、held-out causal delta、retrieval accuracyの改善は、同一dataset、
+seed、checkpoint評価protocolでのMI300X再実験まで未確認である。

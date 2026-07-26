@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from rwkv7m import load_train_checkpoint_metadata
 from rwkv7m.cli.train_binidx import build_config, parse_args, run_training
@@ -146,6 +147,8 @@ def test_model_config_allows_experiment_only_recovery_overrides(tmp_path):
             "rwkv",
             "--max-grad-norm",
             "0.5",
+            "--gradient-spike-max-abs",
+            "250000",
             "--weight-decay",
             "0.0",
             "--screening-activation-step",
@@ -165,6 +168,7 @@ def test_model_config_allows_experiment_only_recovery_overrides(tmp_path):
     assert config.lr_final == 1e-4
     assert config.lr_schedule == "rwkv"
     assert config.max_grad_norm == 0.5
+    assert config.gradient_spike_max_abs == 250000.0
     assert config.weight_decay == 0.0
     assert config.screening.activation_step == 0
     assert config.screening.activation_warmup_steps == 0
@@ -185,6 +189,7 @@ def test_model_config_preserves_optimizer_settings_without_cli_overrides(tmp_pat
             "lr_final": 2e-5,
             "lr_schedule": "rwkv",
             "max_grad_norm": 0.75,
+            "gradient_spike_max_abs": 123456.0,
             "weight_decay": 0.002,
         }
     )
@@ -207,7 +212,54 @@ def test_model_config_preserves_optimizer_settings_without_cli_overrides(tmp_pat
     assert config.lr_final == 2e-5
     assert config.lr_schedule == "rwkv"
     assert config.max_grad_norm == 0.75
+    assert config.gradient_spike_max_abs == 123456.0
     assert config.weight_decay == 0.002
+
+
+def test_model_config_preserves_admission_controller_settings(tmp_path):
+    config = build_config(
+        parse_args(
+            [
+                "--data-file",
+                "unused",
+                "--ctx-len",
+                "512",
+                "--model-config",
+                "configs/rwkv7m-0.185b-screening-v5-core.json.example",
+                "--screening-admission-controller-target",
+                "0.075",
+                "--screening-admission-controller-kp",
+                "0.2",
+                "--screening-admission-controller-ki",
+                "0.03",
+                "--screening-detach-inputs-steps",
+                "300",
+            ]
+        )
+    )
+    assert config.screening.admission_controller_enabled is True
+    assert config.screening.admission_controller_target == 0.075
+    assert config.screening.admission_controller_kp == 0.2
+    assert config.screening.admission_controller_ki == 0.03
+    assert config.screening.detach_screening_inputs_steps == 300
+
+
+def test_model_config_rejects_invalid_gradient_spike_override():
+    with pytest.raises(ValueError, match="gradient_spike_max_abs"):
+        build_config(
+            parse_args(
+                [
+                    "--data-file",
+                    "unused",
+                    "--ctx-len",
+                    "512",
+                    "--model-config",
+                    "configs/rwkv7m-0.185b-screening-v5-core.json.example",
+                    "--gradient-spike-max-abs",
+                    "0",
+                ]
+            )
+        )
 
 
 def test_model_config_honors_explicit_screening_curriculum_overrides(tmp_path):

@@ -63,6 +63,9 @@ class ModelConfig:
     warmup_steps: int = 10
     lr_schedule: str = "optax_cosine"
     max_grad_norm: float = 1.0
+    # Optional fail-safe for finite but pathological gradient spikes. The NNX
+    # trainer skips the complete optimizer update when this limit is exceeded.
+    gradient_spike_max_abs: float | None = None
     weight_decay: float = 0.001
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -114,6 +117,15 @@ class ModelConfig:
             "pallas_gpu_triton",
         ):
             raise ValueError("unsupported optimizer_backend")
+        if self.max_grad_norm <= 0.0:
+            raise ValueError("max_grad_norm must be positive")
+        if (
+            self.gradient_spike_max_abs is not None
+            and self.gradient_spike_max_abs <= 0.0
+        ):
+            raise ValueError(
+                "gradient_spike_max_abs must be positive when set"
+            )
         self.screening.screened_layers = tuple(self.screening.screened_layers)
         self.screening.bank_ids = tuple(self.screening.bank_ids)
         if not self.use_screening or not self.screening.screened_layers:

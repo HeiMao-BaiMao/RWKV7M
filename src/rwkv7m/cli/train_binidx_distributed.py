@@ -121,6 +121,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default=None)
     parser.add_argument("--max-grad-norm", type=float, default=None)
+    parser.add_argument("--gradient-spike-max-abs", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--adam-beta1", type=float, default=None)
     parser.add_argument("--adam-beta2", type=float, default=None)
@@ -302,12 +303,22 @@ def _metric_record(
         "lambda_screen_floor",
         "screening_residual_scale",
         "screening_activation",
+        "screening_input_detach",
+        "admission_controller_bias",
+        "admission_controller_rate_ema",
+        "admission_controller_error",
+        "admission_controller_bias_update",
+        "admission_controller_update_enabled",
+        "admission_controller_saturated",
         "screening_residual_rms",
         "base_residual_rms",
         "screening_base_rms_ratio",
         "gradient_all_finite",
         "gradient_global_norm",
         "gradient_max_abs",
+        "gradient_clip_scale",
+        "gradient_spike_detected",
+        "gradient_update_applied",
         "parameter_all_finite",
     ):
         record[key] = metrics.get(key)

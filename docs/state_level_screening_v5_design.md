@@ -32,9 +32,11 @@ The portable recurrence implements:
 - an upper write-budget penalty complementary to the empty-capacity floor;
 - versioned semantic golden data for the initial all-empty allocation case.
 
-The tracked 0.185B and 0.3B configs use `edit_mode="tied"` and enable a modest
-redundancy-aware victim weight after the first MI300X runs reached slot cosine
-redundancy 0.919 and 0.987. The portable recurrence contains experimental
+The tracked 0.185B and 0.3B configs use `edit_mode="tied"`, a modest
+redundancy-aware victim weight, a per-layer hard-write controller, and a
+temporary CE-visible residual floor after the first MI300X runs reached slot
+cosine redundancy 0.919 and 0.987 and later retrieval runs oscillated between
+all-write and empty-memory states. The portable recurrence contains experimental
 `capacity_conserving`/`free_edit` and redundancy-aware victim branches, but
 continuous edit modes are not headline-enabled until Phase 1 clears the
 paper's quality gate.
@@ -67,37 +69,53 @@ was enforced. Pure diagnostic norms are detached from the learning graph.
 
 ## Anti-starvation curriculum
 
-An upper write budget cannot prevent the model from choosing never-write.
-The NNX training loss therefore supports an opt-in temporary lower floor:
+The first recovery profile tried to regulate writes through lower/upper
+quadratic losses. MI300X runs found two failures in that contract:
 
 ```text
-target(layer, step) =
-    initial_target
-    * max(1 - step / warmup_steps, 0)
-    * remaining_empty_fraction(layer)
+soft rate satisfied the loss while hard writes collapsed
+hard utilization gating disabled the upper loss in a low-utilization all-write state
+```
 
-realized_rate = soft_rate + stop_gradient(hard_rate - soft_rate)
-loss = mean_layer(
-    weight * relu(target(layer, step) - realized_rate(layer))^2
+The current tracked profile therefore removes write-rate regulation from the
+loss gradient. Every screened layer owns a bounded admission-bias controller.
+After each train step it observes that layer's realized hard accepted-novel
+rate and applies an incremental PI update:
+
+```text
+error_t = target_rate - hard_write_rate_t
+delta_bias_t = clip(
+    kp * (error_t - error_{t-1}) + ki * error_t,
+    -max_step,
+    +max_step,
+)
+bias_{t+1} = clip(
+    bias_t + delta_bias_t,
+    -bias_limit,
+    +bias_limit,
 )
 ```
 
-The loss is zero after warm-up and when the memory is full. It does not impose
-a permanent write quota. The tracked examples use an initial target of 0.05,
-weight 0.1, and 2,000 steps; these are experiment defaults, not validated
-optima. `admission_floor_loss`, `admission_floor_target`, accepted novel rate,
-read/write rates, residual RMS, and memory-on/off causal deltas must be reported
-together. The forward constraint now observes actual hard allocations while
-its gradient follows the continuous novelty/admission path. Applying the
-hinge before the layer reduction prevents one active layer from satisfying the
-floor for a collapsed layer. A nonzero admission rate alone is not evidence
-that memory helps.
+The bias is stop-gradient inside the model loss. Consequently, the controller
+determines how many tokens are admitted while CE gradients remain responsible
+for ranking tokens and learning memory content. The tracked target is 0.05,
+but it is an experiment control point rather than a claim that 5% is optimal.
+The initial admission probability is 0.16: its logit is close to the lower 5%
+tail of a unit-normal route score, which is only an initialization heuristic
+and must be checked on the production shape.
 
-The upper write budget is also evaluated per layer with the same
-hard-forward/soft-backward rate. A configurable occupied-slot threshold keeps
-that upper penalty disabled during empty-memory bootstrap. The tracked
-profiles use 50% utilization; this is an experiment setting, not a validated
-optimum.
+The controller bias is an FP32 model parameter so increments smaller than one
+BF16 ULP are not discarded and portable inference artifacts retain the learned
+operating point. Its rate EMA and previous error are
+non-parameter training state: full checkpoints restore them, while
+safetensors intentionally omit them. The controller is inactive before
+Screening activation and ignores non-finite observed rates.
+
+The legacy admission-floor and write-budget losses remain available for
+ablation, but config validation rejects enabling either alongside the
+controller. The legacy utilization option now scales the upper penalty
+continuously from zero to full strength; it no longer creates a hard off
+region below the utilization threshold.
 
 The tracked profiles now keep Screening recurrence, residual, auxiliary
 losses, and optimizer updates disabled for the first 100 trunk steps. The
@@ -108,11 +126,14 @@ optimizer gate includes AdamW decay, so "disabled" does not silently modify
 Screening kernels through weight decay. Curriculum clocks start at Screening
 activation rather than at global step zero.
 
-During the same 2,000-step interval, the tracked configs keep the effective
-screening residual scale at or above 0.01 (before the read-tile scaling). The
-floor anneals to zero; inference and calls without a training step use the
-learned scale only. This blocks the easiest early escape through
-`lambda_screen -> 0` without imposing a permanent memory contribution.
+During the next 2,000 Screening steps, projections receive stop-gradient
+copies of trunk inputs. The ordinary RWKV residual path still trains from CE,
+but the memory branch cannot destabilize trunk activations through its input
+features while routing and content are bootstrapped. The tracked configs keep
+the pre-tile residual floor at 0.2, which is 0.1 after four-tile scaling at the
+start of the curriculum. The floor anneals to zero; inference and calls
+without a training step use the learned scale only. This creates a direct CE
+signal for the memory output without imposing a permanent memory contribution.
 
 The same interval now performs smooth-forward read screening and anneals to
 the exact hard Trim-and-Square operator. This intentionally changes training
@@ -121,17 +142,18 @@ always hard. The smooth operator is a squared softplus approximation in the
 same normalized relevance coordinate, so weak reads are not normalized to
 unit mass.
 
-Newly admitted candidates receive a temporary self-index objective. The
-selected candidate read key must clear the current read threshold and its
-write key must clear the novelty similarity threshold, each with a small
-margin. Selection and admission are stopped hard decisions for this loss, so
-the objective trains query/key geometry without rewarding admission collapse.
-It anneals to zero after 2,000 steps.
+Temporary self-index supervision remains implemented as an ablation but is
+disabled in the tracked configs. A self-index-only MI300X run produced raw
+gradient L2 up to 5.56e11 and then collapsed toward all-reject. It is therefore
+not used as the default content objective without a redesigned, bounded
+gradient contract.
 
-An independent upper write budget penalizes the per-layer realized hard-write
-surrogate above the configured ceiling. This is required by the 0.3B
-all-novel/all-write observation; the lower admission floor alone cannot
-distinguish healthy writes from saturation.
+Gradient statistics use a scaled norm that does not overflow merely because
+individual finite values are large. The tracked configs additionally set a
+finite max-absolute-gradient guard of 1e6. Exceeding the guard skips the whole
+optimizer update, including moments and optimizer step, and records
+`gradient_spike_detected=1`; non-finite gradients remain fail-closed. This is
+a corruption guard, not evidence that the underlying instability is solved.
 
 ## Deliberately gated paths
 
@@ -165,7 +187,11 @@ the Gaussian-null threshold value, below-threshold smooth-read gradients,
 self-index geometry gradients, the upper write budget, the memory-off residual
 override, hard-forward layerwise budgets, staged recurrence/optimizer
 activation, document-aligned state reset, answer-only loss masks, and the first
-versioned golden vector.
+versioned golden vector. Controller-specific tests cover update direction,
+bounds, inactive steps, full train-step integration, config incompatibilities,
+and full-checkpoint state round-trip. Gradient-guard tests cover finite values
+whose naive FP32 squared norm would overflow and verify that a skipped update
+does not alter parameters, optimizer moments, or optimizer step.
 
 On 2026-07-22, the tracked recovery profile was repeated on one MI300X. The
 0.185B configuration completed all 2,000 curriculum steps (32.77M tokens), and
@@ -194,8 +220,10 @@ accelerator gates must pass before this path is called beneficial or
 production-ready.
 
 The next recovery iteration now exposes and constrains write/read behavior per
-screened layer and bank and bootstraps empty capacity without enabling the
-upper budget prematurely. GPU validation remains pending. Retention, v5
+screened layer and bank, controls hard write rate outside the loss gradient,
+and supplies CE signal through a temporary residual floor without propagating
+the memory-input gradient into the trunk. GPU validation remains pending.
+Retention, v5
 checkpoint reconstruction, and v5 Pallas optimization remain gated until
 multi-slot use and a positive causal counterfactual are demonstrated.
 

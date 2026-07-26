@@ -694,13 +694,13 @@ def test_write_budget_penalizes_only_rates_above_the_ceiling():
     assert gradient > 0.0
 
 
-def test_write_budget_waits_for_per_layer_bootstrap_utilization():
+def test_write_budget_scales_continuously_during_layer_bootstrap():
     config = _v5_screening_config(
         write_budget_target_max=0.1,
         write_budget_weight=0.5,
         write_budget_min_slot_utilization=0.5,
     )
-    waiting, _ = compute_v5_write_budget_loss(
+    partial, _ = compute_v5_write_budget_loss(
         jnp.asarray(0.8),
         config,
         slot_utilization=jnp.asarray(0.25),
@@ -710,8 +710,95 @@ def test_write_budget_waits_for_per_layer_bootstrap_utilization():
         config,
         slot_utilization=jnp.asarray(0.5),
     )
-    assert waiting == 0.0
+    assert partial > 0.0
     assert enabled > 0.0
+    assert jnp.allclose(partial, enabled * 0.5)
+
+
+def test_controller_rejects_competing_rate_losses():
+    with pytest.raises(
+        ValueError,
+        match="controller replaces admission-floor and write-budget",
+    ):
+        _v5_screening_config(
+            admission_controller_enabled=True,
+            write_budget_weight=0.1,
+        )
+
+
+def test_nnx_admission_controller_moves_bias_against_hard_rate():
+    config = _v5_screening_config(
+        admission_init=0.05,
+        admission_controller_enabled=True,
+        admission_controller_target=0.05,
+        admission_controller_rate_ema_decay=0.5,
+        admission_controller_kp=0.1,
+        admission_controller_ki=0.02,
+        admission_controller_max_step=0.1,
+        admission_controller_bias_limit=4.0,
+    )
+    module = NNXStateLevelScreening(
+        config,
+        rngs=nnx.Rngs(0),
+        param_dtype=jnp.bfloat16,
+    )
+    assert module.admission_controller_bias[...].dtype == jnp.float32
+    initial_bias = module.admission_controller_bias[...]
+    high = module.update_admission_controller(
+        jnp.asarray(0.95),
+        jnp.asarray(1.0),
+    )
+    high_bias = module.admission_controller_bias[...]
+    assert high_bias < initial_bias
+    assert high["admission_controller_error"] < 0.0
+    assert high["admission_controller_update_enabled"] == 1.0
+
+    low = module.update_admission_controller(
+        jnp.asarray(0.0),
+        jnp.asarray(1.0),
+    )
+    assert module.admission_controller_bias[...] > high_bias
+    assert low["admission_controller_error"] > 0.0
+    assert 0.0 < low["admission_controller_rate_ema"] < 0.95
+
+    inactive_bias = module.admission_controller_bias[...]
+    inactive = module.update_admission_controller(
+        jnp.asarray(1.0),
+        jnp.asarray(0.0),
+    )
+    assert module.admission_controller_bias[...] == inactive_bias
+    assert inactive["admission_controller_update_enabled"] == 0.0
+
+
+def test_nnx_v5_detached_bootstrap_blocks_only_trunk_input_gradient():
+    config = _v5_screening_config(
+        detach_screening_inputs_steps=10,
+    )
+    module = NNXStateLevelScreening(config, rngs=nnx.Rngs(0))
+    initial = LayerScreenState(
+        slots=jnp.zeros((1, 4, 16), dtype=jnp.float32),
+        ages=jnp.zeros((1, 4), dtype=jnp.float32),
+        usage_ema=jnp.zeros((1, 4), dtype=jnp.float32),
+        occupancy=jnp.zeros((1, 4), dtype=jnp.float32),
+    )
+    h_base = jax.random.normal(jax.random.key(31), (1, 2, 32))
+    x = jax.random.normal(jax.random.key(32), (1, 2, 32))
+
+    def slot_objective(active_x, training_step):
+        _, final_state, _ = module(
+            active_x,
+            h_base,
+            initial,
+            phase="read_write",
+            deterministic=False,
+            training_step=jnp.asarray(training_step),
+        )
+        return jnp.sum(final_state.slots)
+
+    detached_gradient = jax.grad(slot_objective)(x, 0)
+    active_gradient = jax.grad(slot_objective)(x, 10)
+    assert jnp.array_equal(detached_gradient, jnp.zeros_like(x))
+    assert jnp.linalg.norm(active_gradient) > 0.0
 
 
 def test_self_index_curriculum_anneals_without_changing_raw_metric():
@@ -1006,6 +1093,91 @@ def test_nnx_train_step_uses_hard_forward_write_rate_for_auxiliary_losses():
     assert metrics["gradient_global_norm"] > 0.0
     assert jnp.isfinite(metrics["gradient_max_abs"])
     assert metrics["parameter_all_finite"] == 1.0
+
+
+def test_nnx_train_step_updates_controller_outside_loss_gradient():
+    config = tiny_config(
+        vocab_size=16,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        head_size=8,
+    )
+    config.screening = _v5_screening_config(
+        admission_init=0.05,
+        admission_controller_enabled=True,
+        admission_controller_target=0.05,
+        admission_controller_rate_ema_decay=0.5,
+        admission_controller_kp=0.1,
+        admission_controller_ki=0.02,
+        admission_controller_max_step=0.1,
+        admission_controller_bias_limit=4.0,
+    )
+    config.lm_head_init = "variance_scaled"
+    model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(19))
+    controller = model.layer_0.screening_0
+    assert controller.admission_controller_bias[...].dtype == jnp.float32
+    initial_bias = jnp.array(controller.admission_controller_bias[...])
+    train_state = create_nnx_train_state(model, config, total_steps=10)
+    batch = {
+        "input_ids": jnp.asarray([[1, 2]], dtype=jnp.int32),
+        "target_ids": jnp.asarray([[2, 3]], dtype=jnp.int32),
+    }
+    _, _, _, metrics = nnx_train_step(
+        train_state,
+        batch,
+        init_rwkv_state(1, config),
+        init_screen_state(1, config.screening),
+        phase="read_write",
+    )
+    assert metrics["gradient_update_applied"] == 1.0
+    assert metrics["admission_controller_update_enabled"] == 1.0
+    assert metrics["admission_controller_bias"] == (
+        controller.admission_controller_bias[...]
+    )
+    assert not jnp.array_equal(
+        controller.admission_controller_bias[...],
+        initial_bias,
+    )
+    assert metrics["admission_floor_loss"] == 0.0
+    assert metrics["write_budget_loss"] == 0.0
+
+
+def test_nnx_train_step_does_not_update_controller_when_optimizer_is_skipped():
+    config = tiny_config(
+        vocab_size=16,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        head_size=8,
+    )
+    config.screening = _v5_screening_config(
+        admission_init=0.05,
+        admission_controller_enabled=True,
+        admission_controller_bias_limit=4.0,
+    )
+    config.gradient_spike_max_abs = 1e-20
+    config.lm_head_init = "variance_scaled"
+    model = NNXScreenedRWKVModel(config, rngs=nnx.Rngs(23))
+    controller = model.layer_0.screening_0
+    initial_bias = jnp.array(controller.admission_controller_bias[...])
+    train_state = create_nnx_train_state(model, config, total_steps=10)
+    _, _, _, metrics = nnx_train_step(
+        train_state,
+        {
+            "input_ids": jnp.asarray([[1, 2]], dtype=jnp.int32),
+            "target_ids": jnp.asarray([[2, 3]], dtype=jnp.int32),
+        },
+        init_rwkv_state(1, config),
+        init_screen_state(1, config.screening),
+        phase="read_write",
+    )
+    assert metrics["gradient_update_applied"] == 0.0
+    assert metrics["admission_controller_update_enabled"] == 0.0
+    assert jnp.array_equal(
+        controller.admission_controller_bias[...],
+        initial_bias,
+    )
 
 
 def test_nnx_v5_staged_activation_preserves_empty_state_then_ramps():

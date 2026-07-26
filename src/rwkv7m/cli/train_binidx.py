@@ -96,6 +96,7 @@ def build_config(args):
         max_grad_norm=(
             1.0 if args.max_grad_norm is None else args.max_grad_norm
         ),
+        gradient_spike_max_abs=args.gradient_spike_max_abs,
         weight_decay=(
             0.001 if args.weight_decay is None else args.weight_decay
         ),
@@ -189,6 +190,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--lr-schedule", choices=["optax_cosine", "rwkv"], default=None)
     parser.add_argument("--max-grad-norm", type=float, default=None)
+    parser.add_argument("--gradient-spike-max-abs", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--adam-beta1", type=float, default=None)
     parser.add_argument("--adam-beta2", type=float, default=None)

@@ -237,9 +237,51 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         type=float,
         default=None,
         help=(
-            "enable the upper v5 write budget only after each screened "
-            "layer reaches this occupied-slot fraction"
+            "utilization at which the legacy upper v5 write budget reaches "
+            "full strength; lower utilization is scaled continuously"
         ),
+    )
+    parser.add_argument(
+        "--screening-admission-controller",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="control realized hard writes with a bounded per-layer PI actuator",
+    )
+    parser.add_argument(
+        "--screening-admission-controller-target",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-admission-controller-rate-ema-decay",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-admission-controller-kp",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-admission-controller-ki",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-admission-controller-max-step",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-admission-controller-bias-limit",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-detach-inputs-steps",
+        type=int,
+        default=None,
+        help="stop Screening-to-trunk input gradients for early v5 steps",
     )
 
 
@@ -381,6 +423,30 @@ def screening_v2_kwargs(args):
             is None
             else args.screening_write_budget_min_slot_utilization
         ),
+        "admission_controller_enabled": value_or_default(
+            "screening_admission_controller", False
+        ),
+        "admission_controller_target": value_or_default(
+            "screening_admission_controller_target", 0.05
+        ),
+        "admission_controller_rate_ema_decay": value_or_default(
+            "screening_admission_controller_rate_ema_decay", 0.9
+        ),
+        "admission_controller_kp": value_or_default(
+            "screening_admission_controller_kp", 0.1
+        ),
+        "admission_controller_ki": value_or_default(
+            "screening_admission_controller_ki", 0.02
+        ),
+        "admission_controller_max_step": value_or_default(
+            "screening_admission_controller_max_step", 0.1
+        ),
+        "admission_controller_bias_limit": value_or_default(
+            "screening_admission_controller_bias_limit", 6.0
+        ),
+        "detach_screening_inputs_steps": value_or_default(
+            "screening_detach_inputs_steps", 0
+        ),
     }
 
 
@@ -447,6 +513,7 @@ def apply_execution_overrides(config, args):
         ("lr_final", "lr_final"),
         ("lr_schedule", "lr_schedule"),
         ("max_grad_norm", "max_grad_norm"),
+        ("gradient_spike_max_abs", "gradient_spike_max_abs"),
         ("weight_decay", "weight_decay"),
         ("adam_beta1", "adam_beta1"),
         ("adam_beta2", "adam_beta2"),
@@ -484,12 +551,45 @@ def apply_execution_overrides(config, args):
             "screening_write_budget_min_slot_utilization",
             "write_budget_min_slot_utilization",
         ),
+        (
+            "screening_admission_controller",
+            "admission_controller_enabled",
+        ),
+        (
+            "screening_admission_controller_target",
+            "admission_controller_target",
+        ),
+        (
+            "screening_admission_controller_rate_ema_decay",
+            "admission_controller_rate_ema_decay",
+        ),
+        (
+            "screening_admission_controller_kp",
+            "admission_controller_kp",
+        ),
+        (
+            "screening_admission_controller_ki",
+            "admission_controller_ki",
+        ),
+        (
+            "screening_admission_controller_max_step",
+            "admission_controller_max_step",
+        ),
+        (
+            "screening_admission_controller_bias_limit",
+            "admission_controller_bias_limit",
+        ),
+        (
+            "screening_detach_inputs_steps",
+            "detach_screening_inputs_steps",
+        ),
     )
     for argument_name, field_name in screening_overrides:
         value = getattr(args, argument_name, None)
         if value is not None:
             setattr(config.screening, field_name, value)
     config.screening.__post_init__()
+    config.__post_init__()
     return config
 
 

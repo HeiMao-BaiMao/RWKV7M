@@ -24,10 +24,10 @@ screening-v5-retention
 * 補正後v4 recurrenceはTPU v5e-4で実機parityおよび性能測定済み
 * corrected v4 competitive GPU pathの実機検証は未実施
 * v5 coreのPhase 1 portable referenceおよびNNX統合は実装済みである
-* portable v5 coreはMI300X単基で0.185Bの50-step finite runとpost-training gradient gateを通過したが、0.3Bはrun間でNaNが再現せず、数値再現性は未確立である
-* tracked v5 recovery configは`tied` edit、redundancy-aware victim、soft-to-hard read、temporary self-index loss、上下write curriculumを用いる
+* portable v5 coreはMI300X単基で0.185B 2,000-stepと0.3B 400-stepのfinite runを通過したが、memory quality gateは失敗した
+* tracked v5 recovery configは`tied` edit、redundancy-aware victim、soft-to-hard read、hard write率feedback controller、temporary residual floor、およびScreening入力gradient分離を用いる
 * v5 Pallas、v5 checkpoint redesign、v5 retentionは未実装である
-* warm-up限定admission floor、soft read、self-index loss、上限write budgetは実装済みだが、有効性は未実証である
+* warm-up限定admission floor、self-index loss、上限write budgetはablation用に実装済みだが、tracked configではMI300X反証結果に基づき無効化される
 * 短時間MI300X runではmemory residualのcollapseと高いslot redundancyが観測され、v5のmodel quality改善は未実証である
 
 **主張の強さ**:
@@ -1000,57 +1000,73 @@ admission_st_t =
     )
 ```
 
-## 8.2 Write-Budget Regularization
+## 8.2 Hard Write-Rate Feedback Control
 
-admissionが常に1へ飽和することを防ぐため、write budgetを導入する。
+write率をloss gradientで制御すると、soft surrogateだけを満たすGoodhart解、
+hard thresholdによる吸収状態、および急峻な二次penaltyが生じ得る。したがって
+tracked profileでは、write率とcontent selectionの役割を分離する。
 
 ```text
-write_rate =
-    mean_t(
-        admission_soft_t
-        * novel_soft_t
+rate control:
+    per-layer hard accepted-novel rateを観測するfeedback controller
+
+content selection:
+    CE gradientによるtoken rankingとmemory content学習
+```
+
+各screened layerについて、
+
+```text
+e_t = target_rate - hard_write_rate_t
+
+delta_bias_t =
+    clip(
+        kp * (e_t - e_{t-1})
+        + ki * e_t,
+        -max_step,
+        +max_step
+    )
+
+admission_bias_{t+1} =
+    clip(
+        admission_bias_t + delta_bias_t,
+        -bias_limit,
+        +bias_limit
     )
 ```
 
-上限budgetのみを課す場合、
+とする。controller biasはloss内でstop-gradientし、optimizerのgradientや
+Adam momentへ率制御を混入させない。controllerはscreening activation後だけ更新し、
+non-finite観測は無視する。hard実測率を使うため、soft量だけで制約を満たす経路はない。
+
+tracked profileのtargetは0.05であるが、最適値とは主張しない。初期
+`admission_init=0.16`は、route scoreを近似的なunit normalと見たときに5% tailへ
+近いlogit biasを与えるheuristicであり、実shapeでの初期hard率を必ず記録する。
+
+controller biasは小さい制御incrementをBF16丸めで失わないFP32 portable model
+parameterとしてexportする。rate EMAと前回errorは
+学習再開用stateとしてfull checkpointへ保存し、portable safetensorsには含めない。
+
+従来のupper write-budget lossはablation用に残すが、controllerとの同時有効化を
+config validationで拒否する。低utilization時のbudgetはhard disableせず、utilizationに
+比例して連続的にscaleする。
+
+write率だけではmemory利用を証明しない。常に、
 
 ```text
-L_write_budget =
-    lambda_budget
-    * relu(
-        write_rate
-        - target_max_write_rate
-    )^2
+per-layer/bank hard write rate
+slot utilization
+read energy
+residual/base RMS
+memory-on/off causal delta
 ```
 
-とする。
-
-固定target write rateを最適値として主張しない。
-
-以下をablationする。
-
-```text
-no budget
-upper-bound budget
-learned dual budget
-bank-specific budget
-```
-
-never-write collapseは、
-
-```text
-novel rate
-admission mean
-accepted novel rate
-memory branch causal delta
-```
-
-で検出する。
+を併記する。
 
 ## 8.3 Warm-up-Limited Admission Floor
 
 上限write budgetはalways-writeを抑制するが、never-writeには罰則を与えない。
-Phase 1のopt-in curriculumとして、空容量が残る初期期間だけsoft admissionへ下限を置く。
+Phase 1の旧opt-in curriculumとして、空容量が残る初期期間だけsoft admissionへ下限を置く。
 
 ```text
 remaining_empty_fraction_t =
@@ -1083,12 +1099,16 @@ L_admission_floor =
 固定最適write rate、memory利用の証拠として扱わない。headline比較では、floorなし、floorあり、
 およびmemory branch counterfactualを分けて報告する。
 
+MI300Xでは、lower/upper lossが安定した中間hard write率を作らず、soft/hard差と
+layer平均による退化解を許した。従ってtracked profileではfloor/budget weightを0とし、
+§8.2のfeedback controllerを使用する。この節の損失は比較ablationである。
+
 同じwarm-up区間では、`lambda_screen`にもannealする非負下限を設定できる。これは初期に
 residual scaleだけを0へ落とす退化解を抑えるためのcurriculumであり、warm-up終了後はlearned
 scaleだけを使用する。gate biasは飽和初期化せず、read RMS、base RMS、両者の比、learned scale、
 適用中のfloorを記録する。
 
-## 8.4 Temporary Self-Index Curriculum
+## 8.4 Temporary Self-Index Curriculum (Ablation)
 
 empty-first allocationだけでは、書き込まれたcandidate keyが、そのwriteを
 発生させたqueryから再検索可能であることを保証しない。query/key geometryが
@@ -1113,9 +1133,11 @@ query/key/candidate projectionへだけ幾何学習信号を流す。これに�
 ためにadmissionを下げる経路を作らない。係数はwarm-up中にゼロへannealし、
 恒久的な同一query再構成目的にはしない。
 
-tracked recovery profileは同時にupper write budgetを有効化する。lower floorは
-never-writeだけ、upper budgetはall-novel/all-writeだけを抑えるため、両者を
-単一の固定write率として解釈しない。
+ただし、MI300Xのself-index-only runではraw gradient L2が最大5.56e11となり、
+直後にほぼ全拒否へcollapseした。従って現tracked profileではこのlossを無効化する。
+content学習はfeedback controllerが確保したwriteとtemporary residual floorを介する
+CEを主信号とする。self-indexを再採用するには、candidate norm境界を含むbounded
+gradient契約と独立ablationが必要である。
 
 ---
 
@@ -2346,7 +2368,7 @@ v5 benchmark toolingでは、headline commandが必ずmodeを明示する。
 ## 17.1 Recovery profileのMI300X反証結果
 
 2026-07-22のMI300X再測定では、Gaussian-null threshold、soft-to-hard read、
-self-index loss、上下write budget、redundancy-aware victimを含むtracked profileを
+self-index loss、上下write budget、redundancy-aware victimを含む当時のtracked profileを
 評価した。0.185Bは2,000 stepをfinite完走したが、step 500以降のslot利用は
 1 / 16、step 2,000のmemory residual/base RMSは9.42e-6だった。0.3Bも400 stepを
 finite完走したが、2 screened layerのaggregate slot利用は3.125%、residual比は
@@ -2379,6 +2401,56 @@ key/value retrievalとし、学習時は文書全体を同一optimizer step内�
 chunkingする。optimizer stepを跨ぐ単純なstate carryはBPTTを切断し、後段answer
 lossから前段write pathを学習できないためである。streaming評価では文書境界を
 認識した行別state resetを用い、memory-off loss/accuracy deltaを必須とする。
+
+## 17.2 Delayed Retrieval反証と次期tracked profile
+
+2026-07-26に、0.185Bモデルをdocument-aligned delayed key/value retrievalで
+MI300X単基検証した。1 documentを512 tokenとして同一optimizer step内で学習し、
+held-out評価は4 x 128-token chunkをstate carryしながら処理した。
+
+旧tracked profileはstep 102--121にall-writeへ転移し、step 122--248に
+empty-memoryへcollapseした後、step 249以降に再びall-writeへ転移した。
+checkpoint 200のmemory-on/off loss、accuracy、logitsは完全に一致し、
+memory branchがcausally unusedであることを直接確認した。step 262では最大
+gradient要素がfiniteな`1.4979e22`であったにもかかわらずFP32二乗和がoverflowし、
+既存finite gateで停止した。
+
+この結果から、tracked profileを次のように変更する。
+
+```text
+write-rate loss:
+    admission floor = 0
+    upper write budget = 0
+
+per-layer rate control:
+    target hard write rate = 0.05
+    bounded incremental PI admission-bias controller
+
+content signal:
+    temporary pre-tile residual floor = 0.2
+    four-tile effective initial floor = 0.1
+    smooth-to-hard read curriculum
+    self-index loss = 0
+
+gradient isolation:
+    first 2,000 Screening stepsはScreening入力をstop-gradient
+    RWKV base residualのCE経路は維持
+
+corruption guard:
+    overflow-safe scaled global norm
+    max absolute gradient > 1e6ならoptimizer update全体をskip
+```
+
+`admission_init=0.16`はunit-normal route scoreの5% tailに近いbiasを与える
+初期化heuristicであり、controllerの正しさや目標率達成を保証しない。controllerの
+rate EMA/errorはfull checkpointへ保存し、learned biasだけをportable artifactへ
+exportする。
+
+この修正は、rateの吸収状態、aux lossのGoodhart経路、trunkへのauxiliary gradient
+漏出、およびfinite spikeによるoptimizer state汚染を構造的に防ぐ。しかし、
+memory quality改善は未検証である。同一delayed-retrieval protocolで安定した
+multi-slot利用、非ゼロread、positive memory-on/off loss delta、およびaccuracy
+deltaを再現するまで、v5の有効性を主張しない。
 
 ---
 

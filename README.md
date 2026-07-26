@@ -270,12 +270,10 @@ The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
   checkpoint redesign, retention profile, numerical reproducibility, and
   quality claims remain gated. The original MI300X short runs collapsed the
   memory residual and produced high slot redundancy. The tracked recovery
-  configs
-  now replace the overly conservative read tail bound with a Gaussian-null
-  family-wise quantile, use a training-only soft-to-hard read curriculum,
-  bootstrap query/candidate geometry with a temporary self-index loss, cap
-  all-novel writes with an upper budget, and enable redundancy-aware victim
-  selection. A 2026-07-22 MI300X rerun completed 2,000 0.185B steps and 400
+  configs replace the overly conservative read tail bound with a Gaussian-null
+  family-wise quantile, use a training-only soft-to-hard read curriculum, and
+  enable redundancy-aware victim selection. A 2026-07-22 MI300X rerun completed
+  2,000 0.185B steps and 400
   0.3B steps with finite final gradients, but converged to one occupied slot
   per active aggregate and memory-off loss deltas between -5e-6 and +1.6e-5.
   The recovery avoided the previous all-write/high-redundancy state but
@@ -290,8 +288,18 @@ The updated [research paper](RWKV7M.paper.md) calls its legacy and competitive
   full graph rather than v5 recurrence math; AMD WKV training now fails
   closed to a Pallas-forward/reference-VJP hybrid backend pending a
   real-device full-graph gate. On held-out retrieval the memory branch showed
-  its first nonzero causal loss delta (+1.04e-4) but chance accuracy, so the
-  quality gate is still open. See the
+  its first nonzero causal loss delta (+1.04e-4) but chance accuracy.
+  A later document-aligned 0.185B retrieval run moved between all-write,
+  empty-memory, and all-write states; checkpoint 200 had exactly identical
+  memory-on/off logits, and a finite gradient element of 1.50e22 overflowed
+  the naive FP32 norm at step 262. The current tracked configs therefore move
+  hard write-rate control out of auxiliary-loss gradients into a bounded
+  per-layer admission-bias controller, detach Screening inputs from the trunk
+  for the first 2,000 Screening steps, raise the temporary four-tile effective
+  residual floor to 0.1, disable the empirically unstable self-index objective,
+  and skip complete optimizer updates above a max-absolute-gradient guard.
+  These are structural corrections; their retrieval benefit has not yet been
+  measured, so the quality gate is still open. See the
   [Screening v5 implementation contract](docs/state_level_screening_v5_design.md).
   Screening v2 adds value-space gating, a factorized
 candidate, confidence-preserving competitive writes,

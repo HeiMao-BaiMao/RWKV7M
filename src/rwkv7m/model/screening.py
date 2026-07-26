@@ -500,9 +500,21 @@ class ScreeningConfig:
     activation_warmup_steps: int = 0
     # Independent optimizer update multiplier for Screening parameters.
     optimizer_lr_multiplier: float = 1.0
-    # Delay the upper write budget until each screened layer has bootstrapped
-    # this occupied-slot fraction.
+    # Legacy auxiliary-loss control. Values above zero now scale the budget
+    # continuously by utilization instead of hard-enabling it at a threshold.
     write_budget_min_slot_utilization: float = 0.0
+    # Keep the admission rate out of the loss gradient. The NNX trainer uses
+    # hard realized writes to update a bounded per-layer admission bias.
+    admission_controller_enabled: bool = False
+    admission_controller_target: float = 0.05
+    admission_controller_rate_ema_decay: float = 0.9
+    admission_controller_kp: float = 0.1
+    admission_controller_ki: float = 0.02
+    admission_controller_max_step: float = 0.1
+    admission_controller_bias_limit: float = 6.0
+    # During early v5 bootstrapping, Screening projections may learn from the
+    # trunk representation without sending their auxiliary gradient into it.
+    detach_screening_inputs_steps: int = 0
 
     def __post_init__(self):
         self.screened_layers = tuple(self.screened_layers)
@@ -692,6 +704,48 @@ class ScreeningConfig:
             raise ValueError(
                 "write_budget_min_slot_utilization must be in [0, 1]"
             )
+        if not 0.0 < self.admission_controller_target < 1.0:
+            raise ValueError("admission_controller_target must be in (0, 1)")
+        if not 0.0 <= self.admission_controller_rate_ema_decay < 1.0:
+            raise ValueError(
+                "admission_controller_rate_ema_decay must be in [0, 1)"
+            )
+        if self.admission_controller_kp < 0.0:
+            raise ValueError("admission_controller_kp must be non-negative")
+        if self.admission_controller_ki < 0.0:
+            raise ValueError("admission_controller_ki must be non-negative")
+        if (
+            self.admission_controller_enabled
+            and self.admission_controller_kp == 0.0
+            and self.admission_controller_ki == 0.0
+        ):
+            raise ValueError(
+                "an enabled admission controller requires kp or ki > 0"
+            )
+        if self.admission_controller_max_step <= 0.0:
+            raise ValueError(
+                "admission_controller_max_step must be positive"
+            )
+        if self.admission_controller_bias_limit <= 0.0:
+            raise ValueError(
+                "admission_controller_bias_limit must be positive"
+            )
+        initial_admission_logit = math.log(
+            self.admission_init / (1.0 - self.admission_init)
+        )
+        if (
+            self.admission_controller_enabled
+            and abs(initial_admission_logit)
+            > self.admission_controller_bias_limit
+        ):
+            raise ValueError(
+                "admission_controller_bias_limit must contain the initial "
+                "admission logit"
+            )
+        if self.detach_screening_inputs_steps < 0:
+            raise ValueError(
+                "detach_screening_inputs_steps must be non-negative"
+            )
         if semantics_version in {"screening-v5-core", "screening-v5-retention"}:
             if len(self.bank_ids) != self.n_slots:
                 raise ValueError("v5 semantics requires explicit bank_ids")
@@ -714,6 +768,15 @@ class ScreeningConfig:
                     "v5 checkpoint redesign is not implemented; "
                     "checkpoint_interval must be None"
                 )
+            if self.admission_controller_enabled and (
+                self.admission_floor_weight > 0.0
+                or self.write_budget_weight > 0.0
+                or self.write_budget_min_slot_utilization > 0.0
+            ):
+                raise ValueError(
+                    "the admission controller replaces admission-floor and "
+                    "write-budget gradient losses"
+                )
         elif (
             self.admission_floor_target_initial > 0.0
             or self.admission_floor_weight > 0.0
@@ -730,6 +793,8 @@ class ScreeningConfig:
             or self.activation_warmup_steps > 0
             or self.optimizer_lr_multiplier != 1.0
             or self.write_budget_min_slot_utilization > 0.0
+            or self.admission_controller_enabled
+            or self.detach_screening_inputs_steps > 0
         ):
             raise ValueError(
                 "anti-starvation curricula are defined only for v5 semantics"
