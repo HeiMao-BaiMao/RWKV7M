@@ -14,6 +14,7 @@ from rwkv7m.model.nnx_model import (
     NNXScreenedRWKVModel,
     NNXShardingConfig,
     NNXStateLevelScreening,
+    _sequence_admission_quota_mask,
 )
 from rwkv7m.model.screened_rwkv import cross_entropy_loss
 from rwkv7m.model.screening import (
@@ -718,11 +719,54 @@ def test_write_budget_scales_continuously_during_layer_bootstrap():
 def test_controller_rejects_competing_rate_losses():
     with pytest.raises(
         ValueError,
-        match="controller replaces admission-floor and write-budget",
+        match="admission rate control replaces admission-floor",
     ):
         _v5_screening_config(
             admission_controller_enabled=True,
             write_budget_weight=0.1,
+        )
+
+
+def test_admission_quota_selects_stable_per_window_top_fraction():
+    scores = jnp.asarray(
+        [
+            [4.0, 4.0, 1.0, 0.0, 8.0, 7.0, 6.0, 5.0],
+            [jnp.nan, 3.0, 2.0, 1.0, 0.0, 9.0, 8.0, 7.0],
+        ],
+        dtype=jnp.float32,
+    )
+
+    mask = _sequence_admission_quota_mask(
+        scores,
+        target=0.25,
+        window_size=4,
+    )
+
+    assert jnp.array_equal(jnp.sum(mask, axis=-1), jnp.asarray([2.0, 2.0]))
+    assert jnp.array_equal(
+        mask,
+        jnp.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_admission_quota_rejects_controller_and_rate_losses():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _v5_screening_config(
+            admission_controller_enabled=True,
+            admission_quota_enabled=True,
+        )
+    with pytest.raises(
+        ValueError,
+        match="admission rate control replaces admission-floor",
+    ):
+        _v5_screening_config(
+            admission_quota_enabled=True,
+            admission_floor_weight=0.1,
         )
 
 

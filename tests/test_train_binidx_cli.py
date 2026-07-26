@@ -226,6 +226,8 @@ def test_model_config_preserves_admission_controller_settings(tmp_path):
                 "512",
                 "--model-config",
                 "configs/rwkv7m-0.185b-screening-v5-core.json.example",
+                "--screening-admission-controller",
+                "--no-screening-admission-quota",
                 "--screening-admission-controller-target",
                 "0.075",
                 "--screening-admission-controller-kp",

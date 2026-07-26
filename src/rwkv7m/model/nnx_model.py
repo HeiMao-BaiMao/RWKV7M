@@ -246,6 +246,37 @@ def _standardize_last_axis(x, *, eps):
     return centered * jax.lax.rsqrt(variance + eps)
 
 
+def _sequence_admission_quota_mask(scores, *, target, window_size):
+    """Select a stable top fraction independently for each batch lane."""
+
+    if scores.ndim != 2:
+        raise ValueError("admission quota scores must have shape [B, T]")
+    batch, token_count = scores.shape
+    masks = []
+    for start in range(0, token_count, window_size):
+        stop = min(start + window_size, token_count)
+        window = scores[:, start:stop]
+        width = stop - start
+        quota = min(width, max(1, math.ceil(width * target)))
+        finite = jnp.isfinite(window)
+        sortable = jnp.where(finite, window, -jnp.inf)
+        order = jnp.argsort(
+            sortable,
+            axis=-1,
+            stable=True,
+            descending=True,
+        )
+        selected_indices = order[:, :quota]
+        selected = jnp.zeros_like(window, dtype=jnp.float32).at[
+            jnp.arange(batch, dtype=jnp.int32)[:, None],
+            selected_indices,
+        ].set(1.0)
+        masks.append(selected * finite.astype(jnp.float32))
+    return jax.lax.stop_gradient(
+        masks[0] if len(masks) == 1 else jnp.concatenate(masks, axis=1)
+    )
+
+
 def _constrain_hidden(x, sharding: NNXShardingConfig | None):
     if sharding is None:
         return x
@@ -1585,7 +1616,10 @@ class NNXStateLevelScreening(nnx.Module):
                 axis=-1,
             )
             admission_input = route_input
-            if v5_enabled and cfg.admission_controller_enabled:
+            if v5_enabled and (
+                cfg.admission_controller_enabled
+                or cfg.admission_quota_enabled
+            ):
                 # The controller bias assumes a stable score distribution.
                 # x_ln_seq already satisfies that contract, while the raw
                 # trunk residual changes scale and offset sharply during
@@ -1618,6 +1652,13 @@ class NNXStateLevelScreening(nnx.Module):
                 if v5_enabled
                 else jax.nn.sigmoid(admission_projection)
             )
+            admission_quota_mask = None
+            if v5_enabled and cfg.admission_quota_enabled:
+                admission_quota_mask = _sequence_admission_quota_mask(
+                    admission_projection,
+                    target=cfg.admission_quota_target,
+                    window_size=cfg.admission_quota_window,
+                )
             bank_logits_seq = self.bank_route_proj(route_input).astype(
                 jnp.float32
             )
@@ -1650,6 +1691,7 @@ class NNXStateLevelScreening(nnx.Module):
                 novel_write_logits = jnp.zeros_like(novel_erase_logits)
         else:
             admission_seq = jnp.zeros(q_r_seq.shape[:2], dtype=jnp.float32)
+            admission_quota_mask = None
             bank_logits_seq = jnp.zeros(
                 (*q_r_seq.shape[:2], 3), dtype=jnp.float32
             )
@@ -1786,6 +1828,11 @@ class NNXStateLevelScreening(nnx.Module):
                 tau_r,
                 tau_w,
                 v5_config,
+                admission_hard_mask=(
+                    None
+                    if admission_quota_mask is None
+                    else jnp.swapaxes(admission_quota_mask, 0, 1)
+                ),
             )
             (
                 u_time,

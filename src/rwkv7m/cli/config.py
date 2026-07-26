@@ -278,6 +278,25 @@ def add_screening_v2_args(parser: argparse.ArgumentParser):
         default=None,
     )
     parser.add_argument(
+        "--screening-admission-quota",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "select a stable per-window hard-forward admission quota while "
+            "retaining soft admission gradients"
+        ),
+    )
+    parser.add_argument(
+        "--screening-admission-quota-target",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--screening-admission-quota-window",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
         "--screening-detach-inputs-steps",
         type=int,
         default=None,
@@ -444,6 +463,15 @@ def screening_v2_kwargs(args):
         "admission_controller_bias_limit": value_or_default(
             "screening_admission_controller_bias_limit", 6.0
         ),
+        "admission_quota_enabled": value_or_default(
+            "screening_admission_quota", False
+        ),
+        "admission_quota_target": value_or_default(
+            "screening_admission_quota_target", 0.05
+        ),
+        "admission_quota_window": value_or_default(
+            "screening_admission_quota_window", 128
+        ),
         "detach_screening_inputs_steps": value_or_default(
             "screening_detach_inputs_steps", 0
         ),
@@ -578,6 +606,18 @@ def apply_execution_overrides(config, args):
         (
             "screening_admission_controller_bias_limit",
             "admission_controller_bias_limit",
+        ),
+        (
+            "screening_admission_quota",
+            "admission_quota_enabled",
+        ),
+        (
+            "screening_admission_quota_target",
+            "admission_quota_target",
+        ),
+        (
+            "screening_admission_quota_window",
+            "admission_quota_window",
         ),
         (
             "screening_detach_inputs_steps",

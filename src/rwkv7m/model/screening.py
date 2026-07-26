@@ -512,6 +512,12 @@ class ScreeningConfig:
     admission_controller_ki: float = 0.02
     admission_controller_max_step: float = 0.1
     admission_controller_bias_limit: float = 6.0
+    # Hard-forward admission can instead use a stable per-sequence-window
+    # quota. This controls realized candidates without a shared threshold
+    # cliff while retaining the soft admission score for backward ranking.
+    admission_quota_enabled: bool = False
+    admission_quota_target: float = 0.05
+    admission_quota_window: int = 128
     # During early v5 bootstrapping, Screening projections may learn from the
     # trunk representation without sending their auxiliary gradient into it.
     detach_screening_inputs_steps: int = 0
@@ -730,6 +736,18 @@ class ScreeningConfig:
             raise ValueError(
                 "admission_controller_bias_limit must be positive"
             )
+        if not 0.0 < self.admission_quota_target <= 1.0:
+            raise ValueError("admission_quota_target must be in (0, 1]")
+        if self.admission_quota_window <= 0:
+            raise ValueError("admission_quota_window must be positive")
+        if (
+            self.admission_controller_enabled
+            and self.admission_quota_enabled
+        ):
+            raise ValueError(
+                "admission controller and admission quota are mutually "
+                "exclusive"
+            )
         initial_admission_logit = math.log(
             self.admission_init / (1.0 - self.admission_init)
         )
@@ -768,13 +786,16 @@ class ScreeningConfig:
                     "v5 checkpoint redesign is not implemented; "
                     "checkpoint_interval must be None"
                 )
-            if self.admission_controller_enabled and (
+            if (
+                self.admission_controller_enabled
+                or self.admission_quota_enabled
+            ) and (
                 self.admission_floor_weight > 0.0
                 or self.write_budget_weight > 0.0
                 or self.write_budget_min_slot_utilization > 0.0
             ):
                 raise ValueError(
-                    "the admission controller replaces admission-floor and "
+                    "admission rate control replaces admission-floor and "
                     "write-budget gradient losses"
                 )
         elif (
@@ -794,6 +815,7 @@ class ScreeningConfig:
             or self.optimizer_lr_multiplier != 1.0
             or self.write_budget_min_slot_utilization > 0.0
             or self.admission_controller_enabled
+            or self.admission_quota_enabled
             or self.detach_screening_inputs_steps > 0
         ):
             raise ValueError(

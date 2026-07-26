@@ -406,6 +406,8 @@ def screening_v5_recurrence_reference(
     tau_read_offset,
     tau_write_offset,
     config: ScreeningV5RecurrenceConfig,
+    *,
+    admission_hard_mask=None,
 ):
     """Execute the complete v5-core recurrence with portable JAX."""
 
@@ -442,6 +444,19 @@ def screening_v5_recurrence_reference(
         tau_write_offset,
     )
     _validate_inputs(*inputs, config=config)
+    has_admission_hard_mask = admission_hard_mask is not None
+    if admission_hard_mask is None:
+        admission_hard_mask = jnp.zeros_like(
+            admission_context_logits,
+            dtype=jnp.float32,
+        )
+    elif admission_hard_mask.shape != admission_context_logits.shape:
+        raise ValueError(
+            "admission_hard_mask must match admission_context_logits shape"
+        )
+    admission_hard_mask = jax.lax.stop_gradient(
+        admission_hard_mask.astype(jnp.float32)
+    )
     bank_ids = jnp.asarray(config.bank_ids, dtype=jnp.int32)
     slot_count = initial_slots.shape[1]
     key_size = q_read.shape[-1]
@@ -511,6 +526,7 @@ def screening_v5_recurrence_reference(
             delta_read_keys_t,
             delta_values_t,
             delta_write_keys_t,
+            admission_hard_t,
         ) = token_inputs
         training_activation = jnp.clip(
             jnp.asarray(config.training_activation, dtype=jnp.float32),
@@ -675,8 +691,12 @@ def screening_v5_recurrence_reference(
         )
         admission_soft = jax.nn.sigmoid(admission_logit)
         admission_hard = (
-            admission_soft >= config.admission_threshold
-        ).astype(jnp.float32)
+            admission_hard_t
+            if has_admission_hard_mask
+            else (
+                admission_soft >= config.admission_threshold
+            ).astype(jnp.float32)
+        )
         admission_st = admission_soft + jax.lax.stop_gradient(
             admission_hard - admission_soft
         )
@@ -1005,6 +1025,7 @@ def screening_v5_recurrence_reference(
         delta_read_keys,
         delta_values,
         delta_write_keys,
+        admission_hard_mask,
     )
     final_carry, (u, statistics, update_squared) = jax.lax.scan(
         step,

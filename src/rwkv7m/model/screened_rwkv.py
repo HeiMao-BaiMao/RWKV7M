@@ -130,6 +130,18 @@ class ModelConfig:
         self.screening.bank_ids = tuple(self.screening.bank_ids)
         if not self.use_screening or not self.screening.screened_layers:
             return
+        if (
+            self.screening.admission_quota_enabled
+            and self.sequence_chunk_size is not None
+            and self.sequence_chunk_size
+            % self.screening.admission_quota_window
+            != 0
+        ):
+            raise ValueError(
+                "sequence_chunk_size must be a multiple of "
+                "screening.admission_quota_window when quota admission is "
+                "enabled"
+            )
         if self.screening.d_model != self.d_model:
             raise ValueError("screening.d_model must equal model.d_model")
         if len(self.screening.bank_ids) != self.screening.n_slots:
